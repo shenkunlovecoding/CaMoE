@@ -104,4 +104,3 @@ python benchmark.py #多样本平均测试
 - 感谢 Bo Peng 创造了 RWKV，为线性 Attention 奠定了基础。
 - 感谢 Polymarket 的预测市场机制带来的灵感。
 - 感谢 TinyStories 提供的高质量验证数据集。
-```
