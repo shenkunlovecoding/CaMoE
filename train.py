@@ -1,5 +1,5 @@
 """
-CaMoE v11.0 训练脚本
+CaMoE v12.0 训练脚本
 支持: 断点续训 / 自动步数识别 / 混合精度 / 显存优化
 """
 
@@ -96,17 +96,29 @@ def get_phase(step: int, config: dict) -> str:
 
 
 def apply_phase(model, optimizer, phase: str, config: dict):
-    # ... (保持原样) ...
+    # 根据 config 获取专家数量
+    num_rwkv = config.get('num_rwkv_experts', 2)
+    num_trans = config.get('num_trans_experts', 1)
+    
     if phase == "prewarm":
+        # 算出哪些专家是 Transformer (例如: num_rwkv=2, num_trans=2 -> target=['2', '3'])
+        trans_indices = [str(i) for i in range(num_rwkv, num_rwkv + num_trans)]
+        
         for n, p in model.named_parameters():
+            # 逻辑：如果是 Bridge、Critic、Capital 或者 任何一个 Transformer 专家，则训练
+            # 判断参数名是否包含 "experts.2." 或 "experts.3." 等
+            is_trans_expert = any(f'experts.{idx}.' in n for idx in trans_indices)
+            
             should_train = any([
-                'experts.' + str(model.num_rwkv_experts) in n,
+                is_trans_expert,
                 'bridge' in n,
                 'critic' in n,
                 'capital' in n
             ])
             p.requires_grad = should_train
+            
         lr = config.get('lr_prewarm', 1e-4)
+        
     elif phase == "warmup":
         for p in model.parameters():
             p.requires_grad = True
@@ -219,7 +231,7 @@ def main():
                 model.load_state_dict(checkpoint, strict=False)
                 print("⚠️ Loaded weights only (Old format). Optimizer reset.")
                 
-                # 尝试从文件名解析步数 (例如 v10_step1500.pth)
+                # 尝试从文件名解析步数 (例如 v12_step1500.pth)
                 match = re.search(r'step(\d+)', args.resume)
                 if match:
                     start_step = int(match.group(1)) + 1
@@ -305,7 +317,7 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             print("🧹 Cache cleared")
-            path = os.path.join(config['save_dir'], f"v10_step{step}.pth")
+            path = os.path.join(config['save_dir'], f"v12_step{step}.pth")
             
             # 保存完整状态
             checkpoint = {
@@ -318,7 +330,7 @@ def main():
             print(f"💾 Saved Checkpoint: {path}")
     
     # Final save
-    final_path = os.path.join(config['save_dir'], "v10_final.pth")
+    final_path = os.path.join(config['save_dir'], "v12_final.pth")
     torch.save({'model': model.state_dict(), 'step': config['total_steps']}, final_path)
     print("🎉 Done!")
 

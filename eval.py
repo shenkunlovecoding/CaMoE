@@ -1,5 +1,6 @@
 """
-CaMoE 可视化深度评测脚本 (Sherlock Edition)
+CaMoE v12.0 可视化深度评测脚本 (Sherlock Edition)
+适配: 2 RWKV + 2 Trans 架构
 功能：
 1. 生成带颜色高亮的故事 (人类看)
 2. 生成 Token 级的详细层级路由日志 (AI 分析用)
@@ -17,7 +18,10 @@ from config import CONFIG_01B, CONFIG_04B
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
 # ================= 配置 =================
-MODEL_PATH = "checkpoints/v10_final.pth"  
+# [请确认] 模型路径是否正确
+MODEL_PATH = "checkpoints/v12_step10000.pth" 
+# 或者用最新的 step: "checkpoints/v12/v12_step10000.pth"
+
 SCALE = "0.1b"
 DEVICE = "cuda"
 ctx_len = 512
@@ -26,33 +30,45 @@ CHUNK_LEN = 16
 # ================= 加载逻辑 =================
 config = CONFIG_01B if SCALE == "0.1b" else CONFIG_04B
 
-# [重要] 这里必须和训练时意外覆盖的参数一致！
-# 如果你训练时 num_rwkv_experts=3 (意味着总共4专家: 3R+1T)，这里就得填3
-config['num_rwkv_experts'] = 1  
-config['micro_batch_size'] = 1
+# [重要] 必须匹配 v12 训练配置！
+config['num_rwkv_experts'] = 3
+config['num_trans_experts'] = 1
+config['micro_batch_size'] = 1 # 推理时 BS=1
 
 print(f"🔄 Loading model from {MODEL_PATH}...")
-print(f"⚙️ Config: {config['num_rwkv_experts']} RWKV Experts + 1 Linear Trans")
+print(f"⚙️ Config: {config['num_rwkv_experts']} RWKV + {config['num_trans_experts']} Trans Experts")
 
 model = CaMoE_System(config).to(DEVICE)
 
-# 尝试加载，容忍一些形状不匹配（如果是专家数导致的）
-checkpoint = torch.load(MODEL_PATH, map_location='cpu')
-state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+# 尝试加载
+if os.path.exists(MODEL_PATH):
+    checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
 
-try:
-    model.load_state_dict(state_dict, strict=True)
-    print("✅ Full strict load success.")
-except Exception as e:
-    print(f"⚠️ Strict load failed, trying non-strict... ({str(e)[:100]}...)")
-    model.load_state_dict(state_dict, strict=False)
-    print("✅ Non-strict load success (Ignore this if generation works).")
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print("✅ Full strict load success.")
+    except Exception as e:
+        print(f"⚠️ Strict load failed, trying non-strict... ({str(e)[:100]}...)")
+        model.load_state_dict(state_dict, strict=False)
+        print("✅ Non-strict load success.")
+else:
+    print(f"❌ Checkpoint not found: {MODEL_PATH}")
+    exit()
 
 model.eval()
-tokenizer = TRIE_TOKENIZER(config['vocab_file'])
+# 如果没有 Tokenizer 文件，会报错，请确保文件存在
+if os.path.exists(config['vocab_file']):
+    tokenizer = TRIE_TOKENIZER(config['vocab_file'])
+else:
+    print("❌ Tokenizer vocab file not found.")
+    exit()
 
 # ================= 辅助函数 =================
 def sample_top_p(probs, p, temperature):
+    if temperature == 0:
+        return torch.argmax(probs, dim=-1).unsqueeze(0)
+    
     probs = probs.pow(1.0/temperature)
     probs = probs / probs.sum()
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -122,6 +138,7 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             
             # Forward
             # step=30000 确保 Eureka 关闭，完全看 Router
+            # phase="normal" 开启 Market
             logits, info = model(x_padded, step=30000, phase="normal") 
             
             # Sampling
@@ -131,31 +148,32 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             next_token = sample_top_p(probs, top_p, temperature)
             
             # 路由统计
-            transformer_id = config['num_rwkv_experts'] # 最后一个 ID 是 Trans
             active_layers = []
+            rwkv_boundary = config['num_rwkv_experts']
             
             for layer_idx, layer_winners in enumerate(info["winners"]):
                 # layer_winners: [B, T]
-                # 注意：如果使用了 Padding，target_idx 应该是不含 padding 的索引
-                # 但因为我们只取最后一个生成的，这里取 target_idx 即可
-                # (如果 forward 内部做了 padding 处理，这里可能需要对齐，
-                # 但根据你的代码，info返回的是对齐后的，通常取最后一个有效位)
-                
-                # 简单起见，我们取 info['winners'] 的对应位置
-                # 如果 padding 了，info 的长度是 T_padded
-                # 我们的 target_idx 是 T_actual - 1
-                
+                # 取生成位置的胜者
                 winner_id = layer_winners[0, target_idx].item()
-                if winner_id == transformer_id:
+                
+                # [v12 适配] ID >= num_rwkv_experts 的都是 Trans
+                if winner_id >= rwkv_boundary:
                     layer_trans_counts[layer_idx] += 1
                     active_layers.append(layer_idx)
             
-            # 可视化颜色
-            if len(active_layers) > 0:
-                global_trans_count += 1
-                color = 'red'
+            trans_layer_count = len(active_layers)
+            
+            # [升级版颜色逻辑]
+            if trans_layer_count == 0:
+                color = 'blue'       # 纯直觉流
+            elif trans_layer_count <= 3:
+                color = 'cyan'       # 轻量级混合
+            elif trans_layer_count <= 5:
+                color = 'green'      # v13 标准三明治 (支柱层介入)
+            elif trans_layer_count <= 8:
+                color = 'yellow'     # 逻辑强化 (中间层也介入了)
             else:
-                color = 'cyan'
+                color = 'red'        # 高强度推理 (全线重兵压境)
             
             total_generated += 1
             
@@ -189,26 +207,16 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             bar = "█" * bar_len + "░" * (20 - bar_len)
             print(f" L{i:02d} | {pct:.1%} | {bar}")
 
-        # === 这里的输出发给我 ===
         analyze_token_preferences(analysis_log)
         
-        print("\n📋 Raw Token Dump (Copy this to Analysis):")
-        print("[")
-        for i, item in enumerate(analysis_log):
-            # 只打印有 Trans 介入的，或者每隔几个打印一下，防止太长
-            # 这里打印详细信息
-            clean_token = repr(item['token'])
-            layers = item['trans_layers']
-            if len(layers) > 0:
-                print(f"  {{'t': {clean_token:<10}, 'L': {layers}}},")
-            else:
-                pass # 纯 RWKV 的就不打印了，省空间，除非你想看上下文
-        print("]")
+        # 可选：打印详细日志
+        # print(json.dumps(analysis_log, indent=2, ensure_ascii=False))
 
 # ================= 测试 =================
 prompts = [
     "Once upon a time, there was a little girl named Lily.",
     "The king was very sad because he lost his crown.",
+    "In a small village, there lived a brave knight who",
 ]
 
 for p in prompts:

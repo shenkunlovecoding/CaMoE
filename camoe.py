@@ -105,11 +105,11 @@ class CaMoE_Block(nn.Module):
         # 4. Bridge 持续学习 (Invisible Training)
         # 无论谁胜出，Bridge 都要尝试重构输入，保持活性
         # 即使这一层全是 RWKV 专家赢了，Bridge 依然在训练，为 Transformer 随时上线做准备
-        _, recon_loss = self.bridge(h, rwkv_state, return_loss=True)
-
-        # 5. 专家稀疏执行 (Scatter - Compute - Gather)
         flat_h = h.reshape(-1, C)
         flat_state = rwkv_state.reshape(-1, C)
+        _, recon_loss = self.bridge(flat_h, flat_state, return_loss=True)
+
+        # 5. 专家稀疏执行 (Scatter - Compute - Gather)
         flat_winners = winners.reshape(-1)
         
         # 梯度直通
@@ -230,8 +230,8 @@ class CaMoE_System(nn.Module):
             
             all_info["winners"].append(info["winners"].detach())
             all_info["costs"].append(info["costs"].detach())
-            all_info["difficulties"].append(info["difficulty"])
-            all_info["affinities"].append(info["affinity"])
+            all_info["difficulties"].append(info["difficulty"].detach())
+            all_info["affinities"].append(info["affinity"].detach())
             all_info["recon_losses"].append(info["recon_loss"])
         
         logits = self.head(self.ln_out(x))
@@ -259,10 +259,12 @@ class CaMoE_System(nn.Module):
         # Bridge Reconstruction Loss
         bridge_loss = 0.0
         recon_losses = all_info.get("recon_losses", [])
-        if len(recon_losses) > 0:
-            bridge_loss = torch.stack(recon_losses).mean()
-        
-        # 0.1 权重系数
+        if recon_losses:
+            valid_losses = [l for l in recon_losses if isinstance(l, torch.Tensor)]
+            if valid_losses:
+                # [修复] 用 sum 代替 stack，更省显存
+                bridge_loss = sum(valid_losses) / len(valid_losses)
+
         total_loss = main_loss + 0.1 * critic_loss + 0.1 * bridge_loss
         
         return total_loss, token_losses, main_loss, critic_loss, bridge_loss
