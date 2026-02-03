@@ -27,6 +27,64 @@ try:
 except ImportError:
     TRIE_TOKENIZER = None
 
+def load_backbone(model, path):
+    """从 RWKV 底模加载权重"""
+    if not os.path.exists(path):
+        print(f"⚠️ Weights not found: {path} (Starting from scratch)")
+        return
+    
+    print(f"📦 Loading backbone from {path}...")
+    official = torch.load(path, map_location='cpu', weights_only=True)
+    my_dict = model.state_dict()
+    loaded = 0
+    
+    for k, v in official.items():
+        # 1. 直接匹配的层 (LN, Embedding, Head)
+        if k in my_dict and my_dict[k].shape == v.shape:
+            my_dict[k].copy_(v)
+            loaded += 1
+            continue
+        
+        # 2. Expert 映射 (把 RWKV Block 里的 FFN 权重复制给 RWKV 专家)
+        # RWKV-6/7 Block 通常包含: att (TimeMix) 和 ffn (ChannelMix)
+        if 'blocks' in k:
+            try:
+                # k 例子: blocks.0.ffn.key.weight
+                parts = k.split('.')
+                lid = int(parts[1])
+                layer_type = parts[2] # att or ffn
+                
+                # Backbone (TimeMix) 直接加载
+                if layer_type == 'att':
+                    # 重新组装名字: blocks.0.att.xxx
+                    target_name = f"blocks.{lid}.att.{'.'.join(parts[3:])}"
+                    if target_name in my_dict and my_dict[target_name].shape == v.shape:
+                        my_dict[target_name].copy_(v)
+                        loaded += 1
+                
+                # FFN -> 复制给所有 RWKV Experts
+                elif layer_type == 'ffn':
+                    # parts[3] 可能是 key.weight, value.weight, receptance.weight
+                    param_name = '.'.join(parts[3:])
+                    
+                    # 遍历所有 RWKV 专家
+                    for i in range(model.num_rwkv_experts):
+                        # 构造目标名字: blocks.0.experts.0.key.weight
+                        # 注意：RWKV7 FFN 专家里可能叫 key/value，底模里可能叫 key/receptance
+                        # 这里做一个简单的映射尝试
+                        target = f"blocks.{lid}.experts.{i}.{param_name}"
+                        
+                        if target in my_dict and my_dict[target].shape == v.shape:
+                            # 加上微小噪声，让专家初始状态略有不同
+                            noise = torch.randn_like(v) * 0.01
+                            my_dict[target].copy_(v + noise)
+                            # 只计数一次，避免打印太多
+                            if i == 0: loaded += 1
+            except Exception as e:
+                pass
+    
+    model.load_state_dict(my_dict, strict=False)
+    print(f"✅ Loaded matching tensors (~{loaded})")
 
 def get_phase(step: int, config: dict) -> str:
     if step < config.get('prewarm_steps', 100):
@@ -61,8 +119,6 @@ def apply_phase(model, optimizer, phase: str, config: dict):
         pg['lr'] = lr
 
 
-from train_old import load_weights as load_backbone
-
 
 def log_gpu():
     if torch.cuda.is_available():
@@ -86,11 +142,11 @@ def main():
     
     config = CONFIG_01B if args.scale == "0.1b" else CONFIG_04B
     
-    # 强制覆盖
-    config['num_rwkv_experts'] = 3
-    config['micro_batch_size'] = 6
-    config['grad_accum'] = 8
-    config['total_steps'] = 20000
+    #不再强制覆盖，害死我了
+    #config['num_rwkv_experts'] = 1
+    #config['micro_batch_size'] = 6
+    #config['grad_accum'] = 8
+    #config['total_steps'] = 20000
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_float32_matmul_precision('high')

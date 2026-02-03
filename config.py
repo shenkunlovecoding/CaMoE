@@ -1,6 +1,6 @@
 CONFIG_01B = {
     "project": "CaMoE-v10",
-    "run_name": "v10-0.1b-g1d-final-1R-1T",
+    "run_name": "v10-0.1b-g1d-final-1R-1T-fix",
     
     # 模型 (需要check_weights确认)
     "n_embd": 768,
@@ -19,7 +19,7 @@ CONFIG_01B = {
     "tax_rate": 0.15,
     
     # 训练
-    "batch_size": 8,
+    "micro_batch_size": 8,
     "ctx_len": 1024,
     "grad_accum": 8,
     "total_steps": 10000,
