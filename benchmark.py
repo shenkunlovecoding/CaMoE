@@ -62,7 +62,7 @@ def main():
     # 1. Load Model
     config = CONFIG_01B if SCALE == "0.1b" else CONFIG_04B
     # 强制覆盖配置以匹配训练设定
-    config['num_rwkv_experts'] = 3
+    config['num_rwkv_experts'] = 1
     config['ctx_len'] = CTX_LEN
     
     print(f"🏗️ Loading model from {MODEL_PATH}...")

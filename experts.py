@@ -49,7 +49,7 @@ class LinearTransformerExpert(nn.Module):
             nn.GELU(), nn.Linear(64, 1), nn.Sigmoid()
         )
         
-        # [优化] 初始化：防止初期梯度爆炸
+        # Init: 抑制输出，防止梯度爆炸
         nn.init.orthogonal_(self.o.weight, gain=0.1)
 
     def get_confidence(self, x):
@@ -59,17 +59,16 @@ class LinearTransformerExpert(nn.Module):
         N, C = x.shape
         H, D = self.n_head, self.head_dim
         
-        # 1. Bridge
-        prefix, recon_loss = self.bridge(x, rwkv_state, return_loss=True)
+        # 1. Bridge: 只拿结果，不计算 Loss (Block 已经算过了)
+        # return_loss=False, 所以拿到 (prefix, 0.0)
+        prefix, _ = self.bridge(x, rwkv_state, return_loss=False)
         P = prefix.shape[1]
         
         # 2. Linear Attention
-        # reshape 必须用，防止不连续报错
         q = self.q(x).reshape(N, 1, H, D)
         k = self.k(prefix).reshape(N, P, H, D)
         v = self.v(prefix).reshape(N, P, H, D)
         
-        # 3. SDPA (Memory Efficient)
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2), # [N, H, 1, D]
             k.transpose(1, 2), # [N, H, P, D]
@@ -83,4 +82,4 @@ class LinearTransformerExpert(nn.Module):
         g = torch.sigmoid(self.gate(x))
         out = self.o(out) * g
         
-        return out, recon_loss
+        return out, 0.0

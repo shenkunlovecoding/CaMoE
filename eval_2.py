@@ -36,7 +36,7 @@ KNOWN_CONSTANTS = {
 }
 
 # ================= 配置 =================
-MODEL_PATH = "checkpoints/v10_step10000.pth"  
+MODEL_PATH = "checkpoints/v10_final.pth"  
 SCALE = "0.1b"
 DEVICE = "cuda"
 ctx_len = 512
@@ -44,7 +44,7 @@ CHUNK_LEN = 16  # RWKV-7 Kernel 约束
 
 # ================= 加载 =================
 config = CONFIG_01B if SCALE == "0.1b" else CONFIG_04B
-config['num_rwkv_experts'] = 3
+config['num_rwkv_experts'] = 1
 config['micro_batch_size'] = 1
 
 print(f"🔄 Loading model from {MODEL_PATH}...")

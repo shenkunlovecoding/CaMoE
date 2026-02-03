@@ -4,6 +4,7 @@ CaMoE v11.0 训练脚本
 """
 
 import os
+import gc
 import time
 import argparse
 import re  # 用于解析文件名里的步数
@@ -150,7 +151,7 @@ def main():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_float32_matmul_precision('high')
-    
+    last_mem = 0
     # 1. Tokenizer
     if TRIE_TOKENIZER and os.path.exists(config['vocab_file']):
         tokenizer = TRIE_TOKENIZER(config['vocab_file'])
@@ -246,6 +247,7 @@ def main():
     # 5. Training Loop
     # 注意：这里 range 从 start_step 开始
     for step in range(start_step, config['total_steps']):
+        torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         
         phase = get_phase(step, config)
@@ -264,9 +266,10 @@ def main():
         
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, info = model(x, step=step, phase=phase)
-            total_loss, token_losses, main_loss, critic_loss = model.compute_losses(logits, y, info)
+            total_loss, token_losses, main_loss, critic_loss ,bridge_loss = model.compute_losses(logits, y, info)
             loss_to_backward = total_loss / config['grad_accum']
-        
+
+
         loss_to_backward.backward()
         
         if (step + 1) % config['grad_accum'] == 0:
@@ -276,7 +279,7 @@ def main():
             
             if phase == "normal" and step > 100:
                 model.update_market(info, token_losses, step)
-        
+                
         if step % 10 == 0:
             dt = time.time() - t0
             stats = model.log_market_health()
@@ -292,12 +295,16 @@ def main():
                 swanlab.log({
                     "Loss/Main": main_loss.item(),
                     "Loss/Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
+                    "Loss/Bridge" : bridge_loss.item() if isinstance(bridge_loss, torch.Tensor) else bridge_loss,
                     "Speed/TPS": tps,
                     **stats
                 })
         
         # [修改] 保存完整 Checkpoint
         if step > 0 and step % 1000 == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("🧹 Cache cleared")
             path = os.path.join(config['save_dir'], f"v10_step{step}.pth")
             
             # 保存完整状态

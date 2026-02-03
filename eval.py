@@ -17,7 +17,7 @@ from config import CONFIG_01B, CONFIG_04B
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
 # ================= 配置 =================
-MODEL_PATH = "checkpoints/v10_step10000.pth"  
+MODEL_PATH = "checkpoints/v10_final.pth"  
 SCALE = "0.1b"
 DEVICE = "cuda"
 ctx_len = 512
@@ -28,7 +28,7 @@ config = CONFIG_01B if SCALE == "0.1b" else CONFIG_04B
 
 # [重要] 这里必须和训练时意外覆盖的参数一致！
 # 如果你训练时 num_rwkv_experts=3 (意味着总共4专家: 3R+1T)，这里就得填3
-config['num_rwkv_experts'] = 3  
+config['num_rwkv_experts'] = 1  
 config['micro_batch_size'] = 1
 
 print(f"🔄 Loading model from {MODEL_PATH}...")

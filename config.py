@@ -10,7 +10,8 @@ CONFIG_01B = {
     
     # CaMoE
     "prefix_len": 64,
-    "num_rwkv_experts": 1,  # 1 RWKV + 1 Trans = 2专家
+    'num_trans_experts': 2,
+    "num_rwkv_experts": 2,  # 2 RWKV + 2 Trans = 4专家
     
     # Market
     "total_capital": 10000.0,
@@ -19,9 +20,9 @@ CONFIG_01B = {
     "tax_rate": 0.15,
     
     # 训练
-    "micro_batch_size": 8,
+    "micro_batch_size": 4,
     "ctx_len": 1024,
-    "grad_accum": 8,
+    "grad_accum": 16,
     "total_steps": 10000,
     
     # 阶段

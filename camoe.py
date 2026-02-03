@@ -1,13 +1,16 @@
 """
-CaMoE v10.0 主系统
-稀疏激活版 - 只让胜者计算FFN
+CaMoE v12.0 主系统
+特性：
+1. 混合架构支持：动态配置 RWKV 专家数和 Transformer 专家数 (如 2+2)
+2. 共享 Bridge：所有 Transformer 专家共享同一个 Bridge 实例，节省显存并集中训练
+3. 持续学习：Bridge 在每一步都计算重构 Loss，无论胜者是谁
+4. Eureka 下放：优化计算效率
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, List
-import torch.utils.checkpoint as checkpoint
 from backbone import RWKV7_TimeMix
 from bridge import UltimateBridge
 from experts import SparseRWKVFFN, LinearTransformerExpert
@@ -17,29 +20,44 @@ from market import CapitalManager, SparseRouter, EurekaController
 
 class CaMoE_Block(nn.Module):
     """
-    单个CaMoE块 (稀疏激活)
+    单个CaMoE块 (支持 N个RWKV + M个Trans 混合架构)
     """
     
     def __init__(self, n_embd: int, n_layer: int, layer_id: int, 
-                 head_size: int, num_rwkv_experts: int, n_state):
+                 head_size: int, config: Dict, bridge: nn.Module):
         super().__init__()
         
         self.layer_id = layer_id
-        self.num_experts = num_rwkv_experts + 1  # +1 for Trans
+        
+        # [架构升级] 动态读取专家数量
+        self.num_rwkv = config.get('num_rwkv_experts', 2)
+        self.num_trans = config.get('num_trans_experts', 1) # 默认为1，兼容旧配置
+        self.num_experts = self.num_rwkv + self.num_trans
+        
         self.n_embd = n_embd
-        self.bridge = UltimateBridge(n_embd, max_prefix_len=64)
+        self.bridge = bridge # 接收共享的 Bridge
+        
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-        # RWKV-7 TimeMix
+        # RWKV-7 TimeMix (System 1 永远在线)
         self.att = RWKV7_TimeMix(n_embd, n_layer, layer_id, head_size)
         
-        # 专家组
+        # 专家组构建
         self.experts = nn.ModuleList()
-        for _ in range(num_rwkv_experts):
-            self.experts.append(SparseRWKVFFN(n_embd))
-        self.experts.append(LinearTransformerExpert(n_embd, n_head=n_embd//head_size, bridge=self.bridge))
         
-        # Critic
+        # 1. System 1: RWKV FFN Experts
+        for _ in range(self.num_rwkv):
+            self.experts.append(SparseRWKVFFN(n_embd))
+            
+        # 2. System 2: Transformer Experts (共享同一个 Bridge)
+        for _ in range(self.num_trans):
+            self.experts.append(LinearTransformerExpert(
+                n_embd, 
+                n_head=n_embd//head_size, 
+                bridge=self.bridge 
+            ))
+        
+        # Critic 负责预测总专家数的难度和亲和力
         self.critic = CriticVC(n_embd, self.num_experts)
     
     def forward(self, 
@@ -47,92 +65,82 @@ class CaMoE_Block(nn.Module):
                 v_first: torch.Tensor,
                 capital_shares: torch.Tensor,
                 router: SparseRouter,
+                eureka: EurekaController,
+                step: int,
+                warmup_steps: int,
                 use_market: bool = True,
-                eureka_override: torch.Tensor = None,
                 training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         
         B, T, C = x.shape
         
-        # TimeMix
-        att_out, v_first,rwkv_state = self.att(self.ln1(x), v_first)
+        # 1. TimeMix (Backbone)
+        att_out, v_first, rwkv_state = self.att(self.ln1(x), v_first)
         x = x + att_out
         h = self.ln2(x)
         
+        # 2. Confidence Calculation (一次性计算所有专家的信心)
+        # 注意：LinearTransformerExpert.get_confidence 也只需要 h，不需要 state
+        conf_list = [exp.get_confidence(h) for exp in self.experts]
+        confidences = torch.stack(conf_list, dim=-1) # [B, T, E]
+        
+        # 3. Market / Routing
         if not use_market:
-            # Warmup: 随机路由
+            # Inference / No Market: 随机或基于规则，这里保持随机
             winners = torch.randint(0, self.num_experts, (B, T), device=x.device)
             costs = torch.zeros(B, T, device=x.device)
             difficulty = torch.ones(B, T, 1, device=x.device)
             affinity = torch.zeros(B, T, self.num_experts, device=x.device)
-            confidences = torch.ones(B, T, self.num_experts, device=x.device)
         else:
-            # ===== 第一步: 所有专家报价 =====
-            # [修改点] List 改名，防止混淆
-            conf_list = [] 
-            for exp in self.experts:
-                # 传入 rwkv_state (如果专家需要的话，FFN 不需要但 Trans 需要，这里 h 是输入)
-                # 注意：Confidence 只基于 h 计算
-                conf = exp.get_confidence(h) 
-                conf_list.append(conf)
-            
-            # [修改点] Stack 后的 Tensor 命名为 confidences
-            confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
-            
-            # Critic预测
             difficulty, affinity = self.critic(h)
+            critic_subsidy = self.critic.apply_to_bids(torch.zeros_like(confidences), affinity)
+            winners, costs, bids = router.route(confidences, capital_shares, difficulty, critic_subsidy, training)
             
-            # 路由决策
-            # [修改点] 这里用 confidences (Tensor)
-            critic_subsidy = self.critic.apply_to_bids(
-                torch.zeros_like(confidences), affinity
-            )
-            winners, costs, bids = router.route(
-                confidences, capital_shares, difficulty, critic_subsidy, training
-            )
-            
-            # Eureka覆盖
-            if eureka_override is not None:
+            # Eureka (扶贫机制)
+            if training:
+                trigger = eureka.should_trigger(confidences, step, warmup_steps)
+                eureka_override = eureka.select_underdog(capital_shares, trigger)
                 valid = eureka_override >= 0
                 winners = torch.where(valid, eureka_override, winners)
-        flat_h = h.reshape(-1, C)              # [N_total, C]
-        flat_state = rwkv_state.reshape(-1, C) # [N_total, C]
-        flat_winners = winners.reshape(-1)     # [N_total]
         
-        # 3. 梯度直通 (STE / Confidence Scaling)
-        # 取出每个 token 对应的胜者 confidence
-        flat_conf = confidences.view(-1, self.num_experts) # [N_total, E]
+        # 4. Bridge 持续学习 (Invisible Training)
+        # 无论谁胜出，Bridge 都要尝试重构输入，保持活性
+        # 即使这一层全是 RWKV 专家赢了，Bridge 依然在训练，为 Transformer 随时上线做准备
+        _, recon_loss = self.bridge(h, rwkv_state, return_loss=True)
+
+        # 5. 专家稀疏执行 (Scatter - Compute - Gather)
+        flat_h = h.reshape(-1, C)
+        flat_state = rwkv_state.reshape(-1, C)
+        flat_winners = winners.reshape(-1)
+        
+        # 梯度直通
+        flat_conf = confidences.view(-1, self.num_experts)
         row_idx = torch.arange(flat_h.shape[0], device=x.device)
-        winning_bids = flat_conf[row_idx, flat_winners].unsqueeze(-1) # [N_total, 1]
+        winning_conf = flat_conf[row_idx, flat_winners].unsqueeze(-1)
+        scale_factor = winning_conf / (winning_conf.detach() + 1e-6)
         
-        # Scaling Factor: 数值为 1，但携带梯度
-        scale_factor = winning_bids / (winning_bids.detach() + 1e-6)
-        
-        # 4. 稀疏循环 & Gather/Scatter
         final_out = torch.zeros_like(flat_h)
-        total_recon_loss = 0.0
         
         for e in range(self.num_experts):
-            # Find tokens for this expert
             mask_indices = (flat_winners == e).nonzero(as_tuple=True)[0]
-            if mask_indices.numel() == 0:
-                continue
+            if mask_indices.numel() == 0: continue
             
             # Gather
             selected_h = flat_h[mask_indices]
-            selected_state = flat_state[mask_indices]
             selected_scale = scale_factor[mask_indices]
             
-            # Forward
-            if e == self.num_experts - 1: # Transformer
-                expert_out, recon_loss = self.experts[e](selected_h, selected_state)
-                total_recon_loss += recon_loss
-            else: # RWKV FFN
+            # [关键逻辑] 根据索引判断专家类型
+            if e >= self.num_rwkv: 
+                # System 2: Transformer Experts (需要 State 通过 Bridge)
+                selected_state = flat_state[mask_indices]
+                # Expert 内部不再计算 Bridge Loss，只使用 Bridge 输出
                 expert_out, _ = self.experts[e](selected_h, selected_state)
+            else: 
+                # System 1: RWKV FFN Experts (不需要 State)
+                expert_out, _ = self.experts[e](selected_h, None)
             
-            # Apply Gradient Scaling
+            # Apply Gradient Scaling & Scatter
             expert_out_scaled = expert_out * selected_scale
             expert_out_scaled = expert_out_scaled.to(dtype=final_out.dtype)
-            # Scatter
             final_out.index_copy_(0, mask_indices, expert_out_scaled)
             
         out = final_out.reshape(B, T, C)
@@ -143,27 +151,30 @@ class CaMoE_Block(nn.Module):
             "costs": costs,
             "difficulty": difficulty,
             "affinity": affinity,
-            "recon_loss": total_recon_loss # 把 Bridge Loss 传出去
+            "recon_loss": recon_loss # 全局重构 Loss
         }
-        
         return x, v_first, info
 
 
 class CaMoE_System(nn.Module):
     """
-    CaMoE v10.0 完整系统
+    CaMoE v12.0 完整系统
     """
-    
     def __init__(self, config: Dict):
         super().__init__()
         self.config = config
         self.n_embd = config['n_embd']
         self.n_layer = config['n_layer']
-        self.num_rwkv_experts = config.get('num_rwkv_experts', 2)
-        self.num_experts = self.num_rwkv_experts + 1
+        
+        # [架构升级] 计算总专家数
+        num_rwkv = config.get('num_rwkv_experts', 2)
+        num_trans = config.get('num_trans_experts', 1)
+        self.num_experts = num_rwkv + num_trans
+        
         self.vocab_size = config['vocab_size']
-        self.gradient_checkpointing = False
         self.emb = nn.Embedding(self.vocab_size, self.n_embd)
+        
+        # 共享 Bridge (在 System 层初始化，分发给所有 Block)
         self.bridge = UltimateBridge(self.n_embd, config.get('prefix_len', 16))
         
         self.blocks = nn.ModuleList()
@@ -173,16 +184,16 @@ class CaMoE_System(nn.Module):
                 self.n_layer,
                 i,
                 config['head_size'],
-                self.num_rwkv_experts,
-                self.bridge
+                config, # 传入完整 config 供 Block 读取专家配比
+                bridge=self.bridge 
             ))
         
         self.ln_out = nn.LayerNorm(self.n_embd)
         self.head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
         
-        # Market
+        # Market 初始化
         self.capital_manager = CapitalManager(
-            self.n_layer, self.num_experts,
+            self.n_layer, self.num_experts, # 注意：传总专家数
             total_capital=config.get('total_capital', 10000.0),
             min_share=config.get('min_capital_share', 0.05),
             tax_threshold=config.get('tax_threshold', 1.5),
@@ -190,9 +201,6 @@ class CaMoE_System(nn.Module):
         )
         self.router = SparseRouter()
         self.eureka = EurekaController()
-
-    def gradient_checkpointing_enable(self):
-        self.gradient_checkpointing = True
 
     def to(self, device):
         super().to(device)
@@ -203,66 +211,35 @@ class CaMoE_System(nn.Module):
                 phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
         x = self.emb(idx)
         v_first = None
-        
         use_market = (phase == "normal")
-        all_info = {"winners": [], "costs": [], "difficulties": [], "affinities": [],"infos":[]}
         
+        all_info = {
+            "winners": [], "costs": [], "difficulties": [], 
+            "affinities": [], "recon_losses": []
+        }
+        warmup_steps = self.config.get('warmup_steps', 2000)
+
         for i, block in enumerate(self.blocks):
             shares = self.capital_manager.get_shares(i)
             
-            # Eureka
-            eureka_override = None
-            if use_market and self.training:
-                with torch.no_grad():
-                    dummy_confs = torch.stack([
-                        exp.get_confidence(block.ln2(x)) 
-                        for exp in block.experts
-                    ], dim=-1)
-                    trigger = self.eureka.should_trigger(
-                        dummy_confs, step, self.config.get('warmup_steps', 2000)
-                    )
-                    eureka_override = self.eureka.select_underdog(shares, trigger)
+            # 调用 Block
+            x, v_first, info = block(
+                x, v_first, shares, self.router, self.eureka, 
+                step, warmup_steps, use_market, self.training
+            )
             
-            if self.gradient_checkpointing and self.training:
-                # 这一行是告诉 PyTorch: "这一层的中间结果别存了，反向传播时再算一遍"
-                # block 是你的 CaMoE_Block 实例
-                
-                # 注意：checkpoint 要求输入必须有 requires_grad=True 的 Tensor
-                # x 通常是有梯度的。但如果 Embedding 被冻结可能没有，这里 x 应该是有的。
-                
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs)
-                    return custom_forward
-
-                # 调用 checkpoint
-                # 注意参数顺序要和 CaMoE_Block.forward 完全一致
-                x, v_first, info = checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, 
-                    v_first, 
-                    shares, 
-                    self.router, 
-                    use_market, 
-                    eureka_override, 
-                    self.training,
-                    use_reentrant=False # 推荐设置为 False
-                )
-            else:
-                # 正常的前向传播
-                x, v_first, info = block(
-                    x, v_first, shares, self.router, use_market, eureka_override, self.training)
-            
-            all_info["winners"].append(info["winners"])
-            all_info["costs"].append(info["costs"])
+            all_info["winners"].append(info["winners"].detach())
+            all_info["costs"].append(info["costs"].detach())
             all_info["difficulties"].append(info["difficulty"])
             all_info["affinities"].append(info["affinity"])
+            all_info["recon_losses"].append(info["recon_loss"])
         
         logits = self.head(self.ln_out(x))
         return logits, all_info
     
     def compute_losses(self, logits, targets, all_info):
         B, T = targets.shape
+        
         main_loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
         
         with torch.no_grad():
@@ -279,54 +256,53 @@ class CaMoE_System(nn.Module):
         if len(all_info.get("difficulties", [])) > 0:
             critic_loss /= len(all_info["difficulties"])
 
+        # Bridge Reconstruction Loss
         bridge_loss = 0.0
-        count = 0
-
-        for info in all_info.get("infos", []): # 假设 forward 返回了这个
-             if "recon_loss" in info and isinstance(info["recon_loss"], torch.Tensor):
-                 bridge_loss += info["recon_loss"]
-                 count += 1
+        recon_losses = all_info.get("recon_losses", [])
+        if len(recon_losses) > 0:
+            bridge_loss = torch.stack(recon_losses).mean()
         
-        if count > 0:
-            bridge_loss /= count
-
-        total_loss = main_loss + 0.1 * critic_loss + 0.05 * bridge_loss
-        return total_loss, token_losses, main_loss, critic_loss
+        # 0.1 权重系数
+        total_loss = main_loss + 0.1 * critic_loss + 0.1 * bridge_loss
+        
+        return total_loss, token_losses, main_loss, critic_loss, bridge_loss
     
+    # update_market 和 log_market_health 保持不变...
     def update_market(self, all_info, token_losses, step):
         with torch.no_grad():
             for i in range(self.n_layer):
-                if i >= len(all_info.get("winners", [])):
-                    continue
-                
+                if i >= len(all_info.get("winners", [])): continue
                 self.capital_manager.update(
-                    i,
-                    all_info["winners"][i],
-                    token_losses,
-                    all_info["costs"][i],
-                    all_info["difficulties"][i]
+                    i, all_info["winners"][i], token_losses,
+                    all_info["costs"][i], all_info["difficulties"][i]
                 )
-                
                 baseline = self.capital_manager.baseline_losses[i].item()
                 self.blocks[i].critic.settle(
-                    all_info["affinities"][i],
-                    all_info["winners"][i],
-                    token_losses,
-                    baseline
+                    all_info["affinities"][i], all_info["winners"][i],
+                    token_losses, baseline
                 )
     
     def log_market_health(self) -> Dict:
         metrics = {}
-        for i in [0, self.n_layer // 2, self.n_layer - 1]:
+        check_layers = [0, self.n_layer // 2, self.n_layer - 1]
+        check_layers = sorted(list(set([i for i in check_layers if i < self.n_layer])))
+
+        for i in check_layers:
             caps = self.capital_manager.capitals[i]
+            # 计算最后两个专家（假设是 Transformer）的份额
+            # 如果 num_trans=2, 这里取最后两个
+            # 通用写法：
             shares = caps / caps.sum() * 100
             
+            # Gini
             sorted_caps, _ = torch.sort(caps)
             n = self.num_experts
             idx = torch.arange(1, n + 1, device=caps.device, dtype=caps.dtype)
             gini = ((2 * idx - n - 1) * sorted_caps).sum() / (n * caps.sum() + 1e-6)
             
-            metrics[f"L{i}/TransShare"] = shares[-1].item()
+            # Log Transformer Total Share
+            # 假设 config 还没传进来，这里暂时只打印最后一个作为参考，或者全打
+            metrics[f"L{i}/LastExpShare"] = shares[-1].item()
             metrics[f"L{i}/Gini"] = gini.item()
             metrics[f"L{i}/CriticCap"] = self.blocks[i].critic.capital.item()
         
