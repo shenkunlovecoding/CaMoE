@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE & Environment
+.vscode/
+.idea/
+*.swp
+.env
+
+# Large Files (Models & Checkpoints)
+checkpoints/
+model/
+*.pth
+*.bin
+*.pt
+
+# Data
+data/*.txt
+*.arrow
+*.json
+*.parquet
+
+# Logs & Visualization
+swanlog/
+logs/
+*.log
+
+# Cuda compiled objects (if any)
+build/
+dist/
+*.so
