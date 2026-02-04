@@ -1,0 +1,57 @@
+============================================================
+CaMoE v12.0 Routing Analysis Report
+============================================================
+Prompt: In a small village, there lived a brave knight who...
+Total Tokens Generated: 26
+
+[Expert Type Distribution]
+  Pure RWKV Tokens:    11.5 (44.2%)
+  Pure Trans Tokens:   0 (0.0%)
+  Mixed/Balanced:      3 (11.5%)
+
+[Per-Layer Expert Utilization]
+  Layer 00:
+    Expert 0 (RWKV): 11.5% ██░░░░░░░░░░░░░░░░░░
+    Expert 1 (RWKV): 19.2% ███░░░░░░░░░░░░░░░░░
+    Expert 2 (RWKV): 3.8% ░░░░░░░░░░░░░░░░░░░░
+    Expert 3 (Trans): 65.4% █████████████░░░░░░░
+  Layer 01:
+    Expert 1 (RWKV): 30.8% ██████░░░░░░░░░░░░░░
+    Expert 2 (RWKV): 69.2% █████████████░░░░░░░
+  Layer 02:
+    Expert 0 (RWKV): 61.5% ████████████░░░░░░░░
+    Expert 2 (RWKV): 11.5% ██░░░░░░░░░░░░░░░░░░
+    Expert 3 (Trans): 26.9% █████░░░░░░░░░░░░░░░
+  Layer 03:
+    Expert 0 (RWKV): 92.3% ██████████████████░░
+    Expert 3 (Trans): 7.7% █░░░░░░░░░░░░░░░░░░░
+  Layer 04:
+    Expert 0 (RWKV): 19.2% ███░░░░░░░░░░░░░░░░░
+    Expert 1 (RWKV): 3.8% ░░░░░░░░░░░░░░░░░░░░
+    Expert 2 (RWKV): 7.7% █░░░░░░░░░░░░░░░░░░░
+    Expert 3 (Trans): 69.2% █████████████░░░░░░░
+  Layer 05:
+    Expert 1 (RWKV): 88.5% █████████████████░░░
+    Expert 2 (RWKV): 11.5% ██░░░░░░░░░░░░░░░░░░
+  Layer 06:
+    Expert 0 (RWKV): 80.8% ████████████████░░░░
+    Expert 1 (RWKV): 15.4% ███░░░░░░░░░░░░░░░░░
+    Expert 2 (RWKV): 3.8% ░░░░░░░░░░░░░░░░░░░░
+  Layer 07:
+    Expert 0 (RWKV): 7.7% █░░░░░░░░░░░░░░░░░░░
+    Expert 1 (RWKV): 42.3% ████████░░░░░░░░░░░░
+    Expert 2 (RWKV): 23.1% ████░░░░░░░░░░░░░░░░
+    Expert 3 (Trans): 26.9% █████░░░░░░░░░░░░░░░
+  Layer 08:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 09:
+    Expert 0 (RWKV): 84.6% ████████████████░░░░
+    Expert 3 (Trans): 15.4% ███░░░░░░░░░░░░░░░░░
+  Layer 10:
+    Expert 3 (Trans): 100.0% ████████████████████
+  Layer 11:
+    Expert 0 (RWKV): 7.7% █░░░░░░░░░░░░░░░░░░░
+    Expert 2 (RWKV): 3.8% ░░░░░░░░░░░░░░░░░░░░
+    Expert 3 (Trans): 88.5% █████████████████░░░
+
+[Routing Stability] 78.33% (higher is more stable across tokens)

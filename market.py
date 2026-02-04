@@ -5,12 +5,13 @@
 
 import torch
 from typing import Tuple, Dict, List
+from torch import nn
 
-
-class CapitalManager:
+class CapitalManager(nn.Module):  # 改成继承 nn.Module
     def __init__(self, num_layers: int, num_experts: int, 
                  total_capital: float = 10000.0, min_share: float = 0.05,
                  tax_threshold: float = 1.5, tax_rate: float = 0.15):
+        super().__init__()  # 添加这行
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.total_capital = total_capital
@@ -19,15 +20,13 @@ class CapitalManager:
         self.tax_rate = tax_rate
         
         init_cap = total_capital / num_experts
-        self.capitals = torch.ones(num_layers, num_experts) * init_cap
-        self.baseline_losses = torch.ones(num_layers) * 5.0
-        self.device = 'cpu'
+        
+        # [关键改动] 用 register_buffer 代替普通属性
+        self.register_buffer('capitals', torch.ones(num_layers, num_experts) * init_cap)
+        self.register_buffer('baseline_losses', torch.ones(num_layers) * 5.0)
     
-    def to(self, device):
-        self.device = device
-        self.capitals = self.capitals.to(device)
-        self.baseline_losses = self.baseline_losses.to(device)
-        return self
+    # 删除 to() 方法，nn.Module 会自动处理
+    # def to(self, device): ...  ← 删掉这个
     
     def get_shares(self, layer_idx: int) -> torch.Tensor:
         caps = self.capitals[layer_idx]
@@ -56,18 +55,15 @@ class CapitalManager:
                 profit = revenue - expense
                 caps[e] += profit.sum().item()
             
-            # 累进税
             avg_cap = caps.mean()
             for e in range(self.num_experts):
                 if caps[e] > avg_cap * self.tax_threshold:
                     excess = caps[e] - avg_cap * self.tax_threshold
                     caps[e] -= excess * self.tax_rate
             
-            # 央行兜底
             min_cap = self.total_capital * self.min_share / self.num_experts
             caps = torch.clamp(caps, min=min_cap)
             
-            # 软归一化
             total = caps.sum()
             if total > self.total_capital * 1.5:
                 caps *= 0.95

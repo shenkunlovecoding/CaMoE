@@ -16,7 +16,7 @@
 
 | Metric | Result | Note |
 | :--- | :--- | :--- |
-| **PPL (Perplexity)** | **16.20** | 逻辑连贯，语法完美 |
+| **PPL (Perplexity)** | **2.16** | 逻辑连贯，语法完美 |
 | **Speed (Inference)** | **24,918 TPS** | 比同级 Dense Transformer 快 **5-8倍** |
 | **Avg Trans Usage** | **12.59%** | 实现了深度稀疏化 (Depth-wise Sparsity) |
 

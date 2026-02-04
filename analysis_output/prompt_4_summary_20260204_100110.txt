@@ -1,0 +1,37 @@
+============================================================
+CaMoE v12.0 Routing Analysis Report
+============================================================
+Prompt: def calculate_factorial(n):
+    if n == 0:...
+Total Tokens Generated: 1
+
+[Expert Type Distribution]
+  Pure RWKV Tokens:    0.5 (50.0%)
+  Pure Trans Tokens:   0 (0.0%)
+  Mixed/Balanced:      0 (0.0%)
+
+[Per-Layer Expert Utilization]
+  Layer 00:
+    Expert 3 (Trans): 100.0% ████████████████████
+  Layer 01:
+    Expert 2 (RWKV): 100.0% ████████████████████
+  Layer 02:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 03:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 04:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 05:
+    Expert 1 (RWKV): 100.0% ████████████████████
+  Layer 06:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 07:
+    Expert 2 (RWKV): 100.0% ████████████████████
+  Layer 08:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 09:
+    Expert 0 (RWKV): 100.0% ████████████████████
+  Layer 10:
+    Expert 3 (Trans): 100.0% ████████████████████
+  Layer 11:
+    Expert 3 (Trans): 100.0% ████████████████████

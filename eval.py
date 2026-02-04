@@ -14,12 +14,12 @@ import json
 from termcolor import colored
 from collections import Counter
 from camoe import CaMoE_System
-from config import CONFIG_01B, CONFIG_04B
+from config import *
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
 # ================= 配置 =================
 # [请确认] 模型路径是否正确
-MODEL_PATH = "checkpoints/v12_step10000.pth" 
+MODEL_PATH = "checkpoints/babylm/v12_step24000.pth" 
 # 或者用最新的 step: "checkpoints/v12/v12_step10000.pth"
 
 SCALE = "0.1b"
@@ -28,7 +28,7 @@ ctx_len = 512
 CHUNK_LEN = 16  
 
 # ================= 加载逻辑 =================
-config = CONFIG_01B if SCALE == "0.1b" else CONFIG_04B
+config = CONFIG_BABYLM if SCALE == "0.1b" else CONFIG_04B
 
 # [重要] 必须匹配 v12 训练配置！
 config['num_rwkv_experts'] = 3
@@ -107,7 +107,7 @@ def analyze_token_preferences(history_log):
     print("\n🧐 [AI Analysis] Transformer's Favorite Tokens (Top 10):")
     print(f"这些词最容易触发 Trans: {heavy_counts}")
 
-def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.85):
+def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0.9):
     input_ids = tokenizer.encode(prompt)
     x = torch.tensor([input_ids], dtype=torch.long).to(DEVICE)
     
@@ -122,7 +122,6 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
     layer_trans_counts = {i: 0 for i in range(config['n_layer'])}
     
     # AI 分析日志列表
-    analysis_log = []
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
@@ -167,13 +166,17 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             if trans_layer_count == 0:
                 color = 'blue'       # 纯直觉流
             elif trans_layer_count <= 3:
-                color = 'cyan'       # 轻量级混合
+                color = 'cyan'
+                global_trans_count += 0.3       # 轻量级混合
             elif trans_layer_count <= 5:
-                color = 'green'      # v13 标准三明治 (支柱层介入)
+                color = 'green'
+                global_trans_count += 0.5      # v13 标准三明治 (支柱层介入)
             elif trans_layer_count <= 8:
-                color = 'yellow'     # 逻辑强化 (中间层也介入了)
+                color = 'yellow'
+                global_trans_count += 0.8     # 逻辑强化 (中间层也介入了)
             else:
                 color = 'red'        # 高强度推理 (全线重兵压境)
+                global_trans_count += 1
             
             total_generated += 1
             
@@ -185,10 +188,6 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             print(colored(word, color), end="", flush=True)
             
             # 记录到日志
-            analysis_log.append({
-                "token": word,
-                "trans_layers": active_layers
-            })
             
             x = torch.cat([x, next_token.view(1, 1)], dim=1)
             if next_token.item() == 0: break
@@ -207,16 +206,41 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.
             bar = "█" * bar_len + "░" * (20 - bar_len)
             print(f" L{i:02d} | {pct:.1%} | {bar}")
 
-        analyze_token_preferences(analysis_log)
         
         # 可选：打印详细日志
         # print(json.dumps(analysis_log, indent=2, ensure_ascii=False))
 
 # ================= 测试 =================
 prompts = [
-    "Once upon a time, there was a little girl named Lily.",
-    "The king was very sad because he lost his crown.",
-    "In a small village, there lived a brave knight who",
+    # ===== 1. 儿童对话 (CHILDES 风格) =====
+    "Mommy, can I have some",
+    "Look at the big dog! It is",
+    "I want to play with my",
+    
+    # ===== 2. 童书故事 (Gutenberg 风格) =====
+    "Once upon a time, there was a little rabbit who",
+    "The princess looked at the castle and said,",
+    "In the deep forest, a small bird",
+    
+    # ===== 3. 简单对话 (Switchboard 风格) =====
+    "Hi, how are you doing today?",
+    "What do you think about",
+    "I really like it when",
+    
+    # ===== 4. 简单维基 (SimpleWiki 风格) =====
+    "The sun is a star that",
+    "Water is important because",
+    "Dogs are animals that",
+    
+    # ===== 5. 电影字幕 (OpenSubtitles 风格) =====
+    "I can't believe you did that!",
+    "We need to go now before",
+    "She looked at him and whispered,",
+    
+    # ===== 6. 口语表达 (BNC Spoken 风格) =====
+    "Well, I think the problem is",
+    "You know what I mean?",
+    "Actually, it's quite interesting that",
 ]
 
 for p in prompts:

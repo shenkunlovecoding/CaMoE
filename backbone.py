@@ -43,7 +43,7 @@ def init_rwkv7_cuda():
             name="wind_backstepping", 
             sources=[cu_file, cpp_file], 
             is_python_module=False, 
-            verbose=False, 
+            verbose=True, 
             extra_cuda_cflags=flags
         )
         
@@ -96,7 +96,6 @@ def init_rwkv7_cuda():
         print("   Using fallback (slower)")
 
 
-init_rwkv7_cuda()
 
 
 # ==================== RWKV-7 TimeMix ====================

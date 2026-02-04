@@ -1,122 +1,234 @@
+# analyze_checkpoints.py
+import os
+import glob
 import torch
-import torch.nn as nn
-from camoe import CaMoE_System
+from config import CONFIG_BABYLM
 
-# ==========================================
-# 1. 你的配置 (手动填入你 train.py 里用的 config)
-# ==========================================
-# 我根据 0.1B RWKV 的标准配置填了一个默认的，
-# 如果你改过 train.py 里的 config，请在这里修改！
-config = {
-    'n_embd': 768,       # 0.1B 标准是 768
-    'n_layer': 12,       # 0.1B 标准是 12
-    'head_size': 64,
-    'vocab_size': 65536, # 或者 50277
-    
-    # 关键嫌疑人：专家数量
-    'num_rwkv_experts': 3, # 如果这里很大，参数会爆炸
-    
-    # 其他
-    'ctx_len': 1024,
-    'total_capital': 10000.0,
-}
-
-def analyze():
-    print(f"🔍 正在分析 CaMoE 模型配置...")
-    print(f"📋 Config: {config}")
-    
-    # 实例化模型 (不加载权重，只看骨架)
-    model = CaMoE_System(config)
-    
-    # 1. 统计总参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print(f"\n" + "="*40)
-    print(f"📊 参数量统计")
-    print(f"="*40)
-    print(f"Total Params:     {total_params / 1e6:.2f} M ({total_params / 1e9:.3f} B)")
-    print(f"Trainable Params: {trainable_params / 1e6:.2f} M")
-    
-    # 2. 显存估算 (静态)
-    # BF16 = 2 bytes
-    model_mem_gb = total_params * 2 / (1024**3)
-    # AdamW 优化器状态 (m, v) = 8 bytes (FP32) 或者 2 bytes (8-bit)
-    optim_mem_8bit = total_params * 2 / (1024**3) # state + weight copy
-    grad_mem = total_params * 2 / (1024**3) # gradients (BF16)
-    
-    print(f"\n💾 静态显存需求估算 (不含激活值)")
-    print(f"--------------------------------")
-    print(f"Model Weights (BF16): {model_mem_gb:.2f} GB")
-    print(f"Gradients     (BF16): {grad_mem:.2f} GB")
-    print(f"Optimizer (8-bit):    {optim_mem_8bit:.2f} GB")
-    print(f"--------------------------------")
-    print(f"🔥 仅启动就需要:      {model_mem_gb + grad_mem + optim_mem_8bit:.2f} GB")
-    print(f"   (如果这是 1.7B 模型，启动就要 10GB+，还没开始跑数据)")
-
-    # 3. 参数分布分析 (谁是胖子？)
-    print(f"\n🥩 参数分布解剖")
-    print(f"--------------------------------")
-    
-    backbone_params = 0
-    experts_params = 0
-    bridge_params = 0
-    
-    for name, module in model.named_modules():
-        # 统计 Block 里的具体分布
-        if isinstance(module, nn.ModuleList) and name == 'blocks':
-            first_block = module[0]
-            
-            # 统计 Attn (Backbone)
-            attn_p = sum(p.numel() for p in first_block.att.parameters())
-            print(f"Layer 0 - RWKV TimeMix: {attn_p/1e6:.2f} M")
-            
-            # 统计 Experts
-            exp_p_total = 0
-            for i, exp in enumerate(first_block.experts):
-                this_exp_p = sum(p.numel() for p in exp.parameters())
-                if i < len(first_block.experts) - 1:
-                    print(f"   ├─ RWKV Expert {i}:  {this_exp_p/1e6:.2f} M")
-                else:
-                    print(f"   └─ Trans Expert:    {this_exp_p/1e6:.2f} M")
-                exp_p_total += this_exp_p
-            
-            print(f"Layer 0 - Total Experts: {exp_p_total/1e6:.2f} M")
-            
-            # 统计 Bridge
-            bridge_p = sum(p.numel() for p in first_block.bridge.parameters())
-            print(f"Layer 0 - Bridge:        {bridge_p/1e6:.2f} M")
-            
-            # 宏观推算
-            total_experts_all_layers = exp_p_total * config['n_layer']
-            print(f"\n👉 结论：全模型 Expert 参数总和 ≈ {total_experts_all_layers/1e6:.2f} M")
-            if total_experts_all_layers > total_params * 0.8:
-                print("⚠️ 警告：绝大部分参数都在专家层！")
-                print("   MoE 极大地膨胀了显存需求，虽然计算量(FLOPs)没变，但显存必须存下所有专家。")
-            break
-
-    # 4. 模拟一次前向传播 (检查是否会瞬间 OOM)
-    print(f"\n🧪 正在尝试 Dummy Forward (检查中间激活)...")
+def analyze_checkpoint(ckpt_path):
+    """分析单个 checkpoint 的市场状态"""
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)
-        # 模拟一个 Batch
-        x = torch.randint(0, config['vocab_size'], (4, config['ctx_len'])).to(device) # Batch=4
-        
-        torch.cuda.reset_peak_memory_stats()
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, info = model(x)
-            
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
-        print(f"✅ Forward 成功！")
-        print(f"📈 峰值显存 (Batch=4, ctx={config['ctx_len']}): {peak_mem:.2f} GB")
-        
-        # 检查有没有 Broadcasting 炸裂
-        print(f"   如果这里没报错，说明 [Batch, Batch] 的 Bug 修好了。")
-        
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     except Exception as e:
-        print(f"❌ Forward 失败: {e}")
-        print("   可能是显存不足，或者维度不匹配。")
+        return None
+    
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        state_dict = ckpt['model']
+        step = ckpt.get('step', '?')
+    else:
+        state_dict = ckpt
+        # 从文件名猜步数
+        import re
+        match = re.search(r'step(\d+)', ckpt_path)
+        step = int(match.group(1)) if match else '?'
+    
+    # 找 capitals
+    capitals_key = None
+    for k in state_dict.keys():
+        if 'capitals' in k and 'capital_manager' in k:
+            capitals_key = k
+            break
+    
+    if capitals_key is None:
+        return {'step': step, 'error': 'capitals not found'}
+    
+    capitals = state_dict[capitals_key]  # [n_layer, n_experts]
+    n_layers, n_experts = capitals.shape
+    
+    result = {
+        'step': step,
+        'path': os.path.basename(ckpt_path),
+        'n_layers': n_layers,
+        'n_experts': n_experts,
+        'layers': {}
+    }
+    
+    for layer_idx in range(n_layers):
+        caps = capitals[layer_idx]
+        
+        # 计算各种指标
+        shares = caps / (caps.sum() + 1e-6) * 100  # 百分比
+        
+        # Gini
+        sorted_caps, _ = torch.sort(caps)
+        n = n_experts
+        idx = torch.arange(1, n + 1, dtype=caps.dtype)
+        gini = ((2 * idx - n - 1) * sorted_caps).sum() / (n * caps.sum() + 1e-6)
+        
+        # 最大/最小专家
+        max_idx = caps.argmax().item()
+        min_idx = caps.argmin().item()
+        
+        result['layers'][layer_idx] = {
+            'gini': gini.item(),
+            'shares': shares.tolist(),
+            'max_expert': max_idx,
+            'max_share': shares[max_idx].item(),
+            'min_expert': min_idx,
+            'min_share': shares[min_idx].item(),
+            'capitals': caps.tolist(),
+        }
+    
+    return result
+
+
+def print_analysis(results):
+    """打印分析结果"""
+    print("\n" + "=" * 80)
+    print("📊 CHECKPOINT ANALYSIS REPORT")
+    print("=" * 80)
+    
+    for r in results:
+        if r is None:
+            continue
+        if 'error' in r:
+            print(f"\n❌ {r['path']}: {r['error']}")
+            continue
+        
+        print(f"\n{'='*80}")
+        print(f"📦 {r['path']} (Step {r['step']})")
+        print(f"   Layers: {r['n_layers']}, Experts: {r['n_experts']}")
+        print("-" * 80)
+        
+        # 表头
+        print(f"{'Layer':>6} | {'Gini':>6} | {'Expert Shares (%)':^40} | {'Winner':>8}")
+        print("-" * 80)
+        
+        for layer_idx, data in r['layers'].items():
+            shares_str = " ".join([f"E{i}:{s:5.1f}" for i, s in enumerate(data['shares'])])
+            winner = f"E{data['max_expert']}({data['max_share']:.1f}%)"
+            
+            # Gini 颜色标记
+            gini = data['gini']
+            if gini < 0.1:
+                gini_mark = "⚪"  # 太平均
+            elif gini < 0.3:
+                gini_mark = "🟢"  # 健康
+            elif gini < 0.5:
+                gini_mark = "🟡"  # 有分化
+            else:
+                gini_mark = "🔴"  # 高度不平等
+            
+            print(f"  L{layer_idx:>3} | {gini:>5.3f}{gini_mark} | {shares_str} | {winner}")
+        
+        # 汇总
+        avg_gini = sum(d['gini'] for d in r['layers'].values()) / len(r['layers'])
+        print("-" * 80)
+        print(f"  平均 Gini: {avg_gini:.3f}")
+        
+        # 检查 Transformer 专家（假设是最后几个）
+        num_rwkv = CONFIG_BABYLM.get('num_rwkv_experts', 2)
+        num_trans = CONFIG_BABYLM.get('num_trans_experts', 1)
+        
+        trans_shares = []
+        for layer_idx, data in r['layers'].items():
+            shares = data['shares']
+            trans_total = sum(shares[num_rwkv:])  # Transformer 专家总份额
+            trans_shares.append(trans_total)
+        
+        avg_trans = sum(trans_shares) / len(trans_shares)
+        print(f"  Transformer 专家平均份额: {avg_trans:.1f}%")
+
+
+def recommend_checkpoints(results):
+    """推荐重点测试的 checkpoint"""
+    print("\n" + "=" * 80)
+    print("🎯 推荐测试的 CHECKPOINT")
+    print("=" * 80)
+    
+    valid_results = [r for r in results if r and 'error' not in r]
+    
+    if not valid_results:
+        print("没有有效的 checkpoint!")
+        return
+    
+    # 按步数排序
+    valid_results.sort(key=lambda x: x['step'] if isinstance(x['step'], int) else 0)
+    
+    recommendations = []
+    
+    # 1. 最新的
+    latest = valid_results[-1]
+    recommendations.append(('📍 最新', latest))
+    
+    # 2. Gini 最健康的（0.2-0.4 之间）
+    def gini_health(r):
+        avg_gini = sum(d['gini'] for d in r['layers'].values()) / len(r['layers'])
+        return abs(avg_gini - 0.3)  # 越接近 0.3 越好
+    
+    healthiest = min(valid_results, key=gini_health)
+    if healthiest != latest:
+        recommendations.append(('🏥 Gini 最健康', healthiest))
+    
+    # 3. Transformer 份额最高的
+    num_rwkv = CONFIG_BABYLM.get('num_rwkv_experts', 2)
+    def trans_share(r):
+        total = 0
+        for data in r['layers'].values():
+            total += sum(data['shares'][num_rwkv:])
+        return total / len(r['layers'])
+    
+    highest_trans = max(valid_results, key=trans_share)
+    if highest_trans not in [r[1] for r in recommendations]:
+        recommendations.append(('🤖 Transformer 最活跃', highest_trans))
+    
+    # 4. 中间点
+    if len(valid_results) >= 3:
+        mid = valid_results[len(valid_results) // 2]
+        if mid not in [r[1] for r in recommendations]:
+            recommendations.append(('📊 中间点', mid))
+    
+    # 打印推荐
+    for label, r in recommendations:
+        avg_gini = sum(d['gini'] for d in r['layers'].values()) / len(r['layers'])
+        avg_trans = trans_share(r)
+        print(f"\n{label}:")
+        print(f"  📦 {r['path']} (Step {r['step']})")
+        print(f"  📈 平均 Gini: {avg_gini:.3f}")
+        print(f"  🤖 Transformer 份额: {avg_trans:.1f}%")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir", "-d", default="checkpoints/babylm", help="Checkpoint 目录")
+    parser.add_argument("--pattern", "-p", default="*.pth", help="文件匹配模式")
+    args = parser.parse_args()
+    
+    # 找所有 checkpoint
+    pattern = os.path.join(args.dir, args.pattern)
+    ckpt_files = sorted(glob.glob(pattern))
+    
+    if not ckpt_files:
+        print(f"❌ 没找到 checkpoint: {pattern}")
+        return
+    
+    print(f"🔍 找到 {len(ckpt_files)} 个 checkpoint")
+    
+    # 分析每个
+    results = []
+    for path in ckpt_files:
+        print(f"  分析: {os.path.basename(path)}...")
+        result = analyze_checkpoint(path)
+        results.append(result)
+    
+    # 打印分析
+    print_analysis(results)
+    
+    # 推荐
+    recommend_checkpoints(results)
+    
+    # 输出简洁版本供复制
+    print("\n" + "=" * 80)
+    print("📋 快速复制 (用于评测)")
+    print("=" * 80)
+    
+    valid = [r for r in results if r and 'error' not in r]
+    valid.sort(key=lambda x: x['step'] if isinstance(x['step'], int) else 0)
+    
+    for r in valid:
+        avg_gini = sum(d['gini'] for d in r['layers'].values()) / len(r['layers'])
+        print(f"Step {r['step']:>6} | Gini {avg_gini:.3f} | {r['path']}")
+
 
 if __name__ == "__main__":
-    analyze()
+    main()

@@ -157,9 +157,6 @@ class CaMoE_Block(nn.Module):
 
 
 class CaMoE_System(nn.Module):
-    """
-    CaMoE v12.0 完整系统
-    """
     def __init__(self, config: Dict):
         super().__init__()
         self.config = config
@@ -174,7 +171,7 @@ class CaMoE_System(nn.Module):
         self.vocab_size = config['vocab_size']
         self.emb = nn.Embedding(self.vocab_size, self.n_embd)
         
-        # 共享 Bridge (在 System 层初始化，分发给所有 Block)
+        # 共享 Bridge
         self.bridge = UltimateBridge(self.n_embd, config.get('prefix_len', 16))
         
         self.blocks = nn.ModuleList()
@@ -184,28 +181,30 @@ class CaMoE_System(nn.Module):
                 self.n_layer,
                 i,
                 config['head_size'],
-                config, # 传入完整 config 供 Block 读取专家配比
+                config,
                 bridge=self.bridge 
             ))
         
         self.ln_out = nn.LayerNorm(self.n_embd)
         self.head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
         
-        # Market 初始化
+        # [关键修复] CapitalManager 现在是 nn.Module，直接作为子模块
+        # 它的 buffer 会自动包含在 state_dict() 中
         self.capital_manager = CapitalManager(
-            self.n_layer, self.num_experts, # 注意：传总专家数
+            self.n_layer, self.num_experts,
             total_capital=config.get('total_capital', 10000.0),
             min_share=config.get('min_capital_share', 0.05),
             tax_threshold=config.get('tax_threshold', 1.5),
             tax_rate=config.get('tax_rate', 0.15)
         )
+        
+        # 删掉这几行，不需要了！
+        # self.register_buffer("market_capitals", ...)
+        # self.register_buffer("market_baselines", ...)
+        # self.capital_manager.capitals = ...
+        
         self.router = SparseRouter()
         self.eureka = EurekaController()
-
-    def to(self, device):
-        super().to(device)
-        self.capital_manager.to(device)
-        return self
     
     def forward(self, idx: torch.Tensor, step: int = 0, 
                 phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
@@ -271,6 +270,7 @@ class CaMoE_System(nn.Module):
     
     # update_market 和 log_market_health 保持不变...
     def update_market(self, all_info, token_losses, step):
+        print('debug:market on')
         with torch.no_grad():
             for i in range(self.n_layer):
                 if i >= len(all_info.get("winners", [])): continue

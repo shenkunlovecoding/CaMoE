@@ -18,7 +18,9 @@ model/
 *.pt
 
 # Data
-data/*.txt
+data/*/*.txt
+*.dev
+*.train
 *.arrow
 *.json
 *.parquet
