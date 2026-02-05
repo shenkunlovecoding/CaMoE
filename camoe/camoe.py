@@ -11,11 +11,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, List
-from backbone import RWKV7_TimeMix
-from bridge import UltimateBridge
-from experts import SparseRWKVFFN, LinearTransformerExpert
-from critic import CriticVC
-from market import CapitalManager, SparseRouter, EurekaController
+from camoe.backbone import RWKV7_TimeMix
+from camoe.bridge import UltimateBridge
+from camoe.experts import SparseRWKVFFN, LinearTransformerExpert
+from camoe.critic import CriticVC
+from camoe.market import CapitalManager, SparseRouter, EurekaController
 
 
 class CaMoE_Block(nn.Module):
@@ -270,19 +270,30 @@ class CaMoE_System(nn.Module):
     
     # update_market 和 log_market_health 保持不变...
     def update_market(self, all_info, token_losses, step):
-        print('debug:market on')
         with torch.no_grad():
             for i in range(self.n_layer):
                 if i >= len(all_info.get("winners", [])): continue
+                
+                # 1. 更新专家资本 (市场机制)
                 self.capital_manager.update(
                     i, all_info["winners"][i], token_losses,
                     all_info["costs"][i], all_info["difficulties"][i]
                 )
+                
+                # 2. 更新 Critic 资本 (宏观调控)
                 baseline = self.capital_manager.baseline_losses[i].item()
                 self.blocks[i].critic.settle(
                     all_info["affinities"][i], all_info["winners"][i],
                     token_losses, baseline
                 )
+
+                # [新增] 央行救市 (Bailout) 逻辑
+                # 如果 Critic 资本低于 200 (意味着无法有效发放补贴)，强行注入 2000
+                if self.blocks[i].critic.capital < 200:
+                    self.blocks[i].critic.capital.fill_(2000.0)
+                    # 每 100 步打印一次，防止刷屏
+                    if step % 100 == 0:
+                        print(f"🏛️  Layer {i}: Critic Bailout Triggered (Step {step})")
     
     def log_market_health(self) -> Dict:
         metrics = {}

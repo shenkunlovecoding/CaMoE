@@ -2,7 +2,7 @@
 import os
 import glob
 import torch
-from config import CONFIG_BABYLM
+from camoe.config import CONFIG_MINIPILE
 
 def analyze_checkpoint(ckpt_path):
     """分析单个 checkpoint 的市场状态"""
@@ -116,8 +116,8 @@ def print_analysis(results):
         print(f"  平均 Gini: {avg_gini:.3f}")
         
         # 检查 Transformer 专家（假设是最后几个）
-        num_rwkv = CONFIG_BABYLM.get('num_rwkv_experts', 2)
-        num_trans = CONFIG_BABYLM.get('num_trans_experts', 1)
+        num_rwkv = CONFIG_MINIPILE.get('num_rwkv_experts', 2)
+        num_trans = CONFIG_MINIPILE.get('num_trans_experts', 1)
         
         trans_shares = []
         for layer_idx, data in r['layers'].items():
@@ -160,7 +160,7 @@ def recommend_checkpoints(results):
         recommendations.append(('🏥 Gini 最健康', healthiest))
     
     # 3. Transformer 份额最高的
-    num_rwkv = CONFIG_BABYLM.get('num_rwkv_experts', 2)
+    num_rwkv = CONFIG_MINIPILE.get('num_rwkv_experts', 2)
     def trans_share(r):
         total = 0
         for data in r['layers'].values():
@@ -190,7 +190,7 @@ def recommend_checkpoints(results):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", "-d", default="checkpoints/babylm", help="Checkpoint 目录")
+    parser.add_argument("--dir", "-d", default="checkpoints/minipile", help="Checkpoint 目录")
     parser.add_argument("--pattern", "-p", default="*.pth", help="文件匹配模式")
     args = parser.parse_args()
     

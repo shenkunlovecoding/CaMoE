@@ -1,6 +1,6 @@
-CONFIG_BABYLM = {
-    "project": "CaMoE-v12",
-    "run_name": "babylm-0.1b-3R1T-final",
+CONFIG_MINIPILE = {
+    "project": "CaMoE-v16",
+    "run_name": "MiniPile-0.1b-3R1T-first",
     
     # ===== 模型结构 (和 TinyStories 一样) =====
     "n_embd": 768,
@@ -16,29 +16,29 @@ CONFIG_BABYLM = {
     # ===== Market 参数 =====
     "total_capital": 10000.0,
     "min_capital_share": 0.05,
-    "tax_threshold": 1.5,
-    "tax_rate": 0.15,
+    "tax_threshold": 2.0,
+    "tax_rate": 0.1,
     
     # ===== 训练参数 (5080 16GB) =====
-    "micro_batch_size": 4,
-    "ctx_len": 512,      # BabyLM 句子较短
-    "grad_accum": 12,     # 有效 batch = 48
-    "total_steps": 25000,  # 见下方计算
+    "micro_batch_size": 3,
+    "ctx_len": 768,      
+    "grad_accum": 16,     # 有效 batch = 48
+    "total_steps": 20000,  # 见下方计算
     
     # ===== 阶段控制 =====
-    "prewarm_steps": 500,
-    "warmup_steps": 2500,
+    "prewarm_steps": 0,
+    "warmup_steps": 1000,
     
     # ===== 学习率 =====
-    "lr_prewarm": 3e-4,
-    "lr_warmup": 1.5e-4,
-    "lr_normal": 5e-5,
+    "lr_prewarm": 1e-4,
+    "lr_warmup": 2e-4,
+    "lr_normal": 1.5e-4,
     
     # ===== 路径 =====
-    "data_path": "./data/babylm_100M_processed",
+    "data_path": "./data/minipile_processed",
     "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
-    "save_dir": "checkpoints/babylm",
+    "save_dir": "checkpoints/minipile",
 }
 
 CONFIG_04B = {

@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from datasets import load_from_disk, Dataset, DatasetDict
 import bitsandbytes as bnb
-
+from camoe.backbone import init_rwkv7_cuda
 try:
     import swanlab
     HAS_SWANLAB = True
@@ -21,7 +21,7 @@ except ImportError:
     HAS_SWANLAB = False
 
 from camoe import CaMoE_System
-from config import *
+from camoe.config import *
 
 try:
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
@@ -115,15 +115,16 @@ def infinite_loader(loader):
             yield batch
 
 def main():
+    init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", default="0.1b", choices=["0.1b", "0.4b"])
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
-    config = CONFIG_BABYLM
+    config = CONFIG_MINIPILE
     
     # 强制设置 Eval 频率
-    eval_interval = config.get('eval_interval', 500)  # 每500步评测一次
+    eval_interval = config.get('eval_interval', 1000)  # 每500步评测一次
     eval_iters = config.get('eval_iters', 50)         # 每次评测跑50个batch
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -208,26 +209,61 @@ def main():
     # ==========================================
     # 断点续训逻辑
     # ==========================================
+        # ==========================================
+    # 权重加载逻辑 (适配 MiniPile Init)
+    # ==========================================
     start_step = 0
-    if args.resume:
-        if os.path.exists(args.resume):
-            print(f"🔄 Resuming from {args.resume}...")
-            checkpoint = torch.load(args.resume, map_location='cpu')
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                model.load_state_dict(checkpoint['model'], strict=False)
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                start_step = checkpoint['step'] + 1
-                print(f"✅ Full state restored. Resuming from step {start_step}")
+    
+    # 1. 优先检查是否有显式指定的 Resume 路径
+    resume_path = args.resume
+    
+    # 2. 如果没指定 resume，检查是否有 MiniPile 初始化权重 (清洗版)
+    if not resume_path:
+        # 假设你把清洗后的权重放在这里，名字固定
+        minipile_init_path = "checkpoints/minipile/v12_minipile_init.pth"
+        if os.path.exists(minipile_init_path):
+            print(f"✨ Found MiniPile init checkpoint: {minipile_init_path}")
+            resume_path = minipile_init_path
+    
+    if resume_path and os.path.exists(resume_path):
+        print(f"📦 Loading checkpoint from {resume_path}...")
+        checkpoint = torch.load(resume_path, map_location='cpu')
+        
+        # 加载模型权重
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            # strict=False 允许一些微小的 key 差异，但主要权重必须匹配
+            model.load_state_dict(checkpoint['model'], strict=False)
+            print("✅ Model weights loaded.")
+            
+            # 尝试加载优化器 (如果有)
+            if 'optimizer' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    print("✅ Optimizer state restored.")
+                except Exception as e:
+                    print(f"⚠️ Optimizer load failed (expected for init weights): {e}")
             else:
-                model.load_state_dict(checkpoint, strict=False)
-                print("⚠️ Loaded weights only.")
-                match = re.search(r'step(\d+)', args.resume)
-                if match:
-                    start_step = int(match.group(1)) + 1
+                print("ℹ️ No optimizer state found (Fresh start).")
+            
+            # 尝试恢复步数 (如果是 init 权重，step 应该是 0)
+            if 'step' in checkpoint:
+                start_step = checkpoint['step']
+                # 如果是 step 40000 这种结束点，我们要强行重置为 0
+                # 只有当它是中间存档时才继续
+                if "init" in resume_path or start_step >= config['total_steps']:
+                    print(f"🔄 Resetting step from {start_step} to 0 for new training phase.")
+                    start_step = 0
+                else:
+                    start_step += 1
+                    print(f"🔄 Resuming from step {start_step}")
         else:
-            print(f"❌ Checkpoint {args.resume} not found!")
-            return
+            # 旧格式
+            model.load_state_dict(checkpoint, strict=False)
+            print("⚠️ Loaded weights only (Legacy format).")
+            
     else:
+        # 3. 既没 Resume 也没 Init，才去加载 RWKV 底模
+        print("🌱 No checkpoint found. Loading RWKV backbone...")
         load_backbone(model, config['weights_path'])
     
     # ==========================================

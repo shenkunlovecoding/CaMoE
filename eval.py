@@ -14,12 +14,12 @@ import json
 from termcolor import colored
 from collections import Counter
 from camoe import CaMoE_System
-from config import *
+from camoe.config import *
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
 # ================= 配置 =================
 # [请确认] 模型路径是否正确
-MODEL_PATH = "checkpoints/babylm/v12_step24000.pth" 
+MODEL_PATH = "checkpoints/minipile/v12_final.pth" 
 # 或者用最新的 step: "checkpoints/v12/v12_step10000.pth"
 
 SCALE = "0.1b"
@@ -28,7 +28,7 @@ ctx_len = 512
 CHUNK_LEN = 16  
 
 # ================= 加载逻辑 =================
-config = CONFIG_BABYLM if SCALE == "0.1b" else CONFIG_04B
+config = CONFIG_MINIPILE if SCALE == "0.1b" else CONFIG_04B
 
 # [重要] 必须匹配 v12 训练配置！
 config['num_rwkv_experts'] = 3
@@ -212,15 +212,6 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
 
 # ================= 测试 =================
 prompts = [
-    # ===== 1. 儿童对话 (CHILDES 风格) =====
-    "Mommy, can I have some",
-    "Look at the big dog! It is",
-    "I want to play with my",
-    
-    # ===== 2. 童书故事 (Gutenberg 风格) =====
-    "Once upon a time, there was a little rabbit who",
-    "The princess looked at the castle and said,",
-    "In the deep forest, a small bird",
     
     # ===== 3. 简单对话 (Switchboard 风格) =====
     "Hi, how are you doing today?",
@@ -241,6 +232,21 @@ prompts = [
     "Well, I think the problem is",
     "You know what I mean?",
     "Actually, it's quite interesting that",
+    # A. 事实检索 (看 ARC 提升)
+    "The Earth is the third planet from the",
+    
+    # B. 逻辑推理 (看 0.7B 数据后的逻辑脑)
+    "If you mix blue and yellow paint, you get",
+    
+    # C. 代码能力 (MiniPile 的特殊加成)
+    "def calculate_average(numbers):",
+    
+    # D. 结构化表达 (看是否还在说 'of the following' 废话)
+    "The three main benefits of exercise are:",
+    
+    # E. 遗忘测试 (看 BabyLM 的老本还在不在)
+    "Once upon a time, a little girl lived in a"
+
 ]
 
 for p in prompts:
