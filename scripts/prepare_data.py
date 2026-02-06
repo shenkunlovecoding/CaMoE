@@ -8,8 +8,8 @@ import pyrwkv_tokenizer # Rust 加速版
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="JeanKaddour/minipile")
-    parser.add_argument("--save_path", type=str, default="./data/minipile_rwkv_processed")
+    parser.add_argument("--dataset", type=str, default="roneneldan/TinyStories")
+    parser.add_argument("--save_path", type=str, default="./data/TinyStories_rwkv_processed")
     parser.add_argument("--ctx_len", type=int, default=1024)
     parser.add_argument("--num_proc", type=int, default=16) # Rust本身有多线程，这里Python进程数可以少点
     return parser.parse_args()

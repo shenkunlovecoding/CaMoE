@@ -2,7 +2,7 @@
 CaMoE v18 配置文件
 使用 version 字段自动生成路径
 """
-
+from .config_pilot import CONFIG_PILOT
 # ==========================================
 # 版本控制
 # ==========================================
@@ -138,7 +138,7 @@ def get_config(scale: str = "0.4b"):
     if scale == "0.4b":
         return CONFIG_04B
     elif scale == "0.1b":
-        return CONFIG_01B
+        return CONFIG_PILOT
     else:
         raise ValueError(f"Unknown scale: {scale}")
 

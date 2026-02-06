@@ -113,7 +113,7 @@ def infinite_loader(loader):
 def main():
     init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", default="0.1b", choices=["0.1b", "0.4b"])
+    parser.add_argument("--scale", default="0.1b")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     

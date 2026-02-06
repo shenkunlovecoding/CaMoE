@@ -7,13 +7,13 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from CaMoE.system import CaMoE_System
-from CaMoE.config import CONFIG_04B, CONFIG_01B # 导入 v18 配置
+from CaMoE.config import * # 导入 v18 配置
 
 def profile_vram(scale="0.4b"):
     print(f"\n🚀 Profiling CaMoE v18 [{scale.upper()}] ...")
     
     # 选择配置
-    base_config = CONFIG_04B if scale == "0.4b" else CONFIG_01B
+    base_config = CONFIG_PILOT if scale == "0.4b" else CONFIG_01B
     config = base_config.copy()
     
     # 强制修改一些可能影响显存的参数以进行压力测试
