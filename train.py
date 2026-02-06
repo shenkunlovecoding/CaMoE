@@ -13,20 +13,16 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from datasets import load_from_disk, Dataset, DatasetDict
 import bitsandbytes as bnb
-from camoe.backbone import init_rwkv7_cuda
+from CaMoE.backbone import init_rwkv7_cuda
 try:
     import swanlab
     HAS_SWANLAB = True
 except ImportError:
     HAS_SWANLAB = False
 
-from camoe import CaMoE_System
-from camoe.config import *
+from CaMoE.system import CaMoE_System
+from CaMoE.config import *
 
-try:
-    from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
-except ImportError:
-    TRIE_TOKENIZER = None
 
 def load_backbone(model, path):
     """从 RWKV 底模加载权重"""
@@ -121,7 +117,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
-    config = CONFIG_MINIPILE
+    config = get_config(args.scale)
     
     # 强制设置 Eval 频率
     eval_interval = config.get('eval_interval', 1000)  # 每500步评测一次
@@ -129,12 +125,6 @@ def main():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_float32_matmul_precision('high')
-
-    # 1. Tokenizer
-    if TRIE_TOKENIZER and os.path.exists(config['vocab_file']):
-        tokenizer = TRIE_TOKENIZER(config['vocab_file'])
-    else:
-        tokenizer = None
 
     # 2. Dataset & Split
     print("🚀 Loading dataset...")
@@ -220,9 +210,9 @@ def main():
     # 2. 如果没指定 resume，检查是否有 MiniPile 初始化权重 (清洗版)
     if not resume_path:
         # 假设你把清洗后的权重放在这里，名字固定
-        minipile_init_path = "checkpoints/minipile/v12_minipile_init.pth"
+        minipile_init_path = f"checkpoints/{config['version']}_{config['scale']}/init.pth"
         if os.path.exists(minipile_init_path):
-            print(f"✨ Found MiniPile init checkpoint: {minipile_init_path}")
+            print(f"✨ Found init checkpoint: {minipile_init_path}")
             resume_path = minipile_init_path
     
     if resume_path and os.path.exists(resume_path):
@@ -382,16 +372,17 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             print("🧹 Cache cleared")
-            path = os.path.join(config['save_dir'], f"v12_step{step}.pth")
-            
-            checkpoint = {
+            path = os.path.join(config['save_dir'], f"{config['version']}_step{step}.pth")
+        
+            checkpoint_data = {
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
-                'config': config
+                'config': config,
+                'version': config['version']  # 额外记录版本
             }
-            torch.save(checkpoint, path)
-            print(f"💾 Saved Checkpoint: {path}")
+            torch.save(checkpoint_data, path)
+            print(f"💾 Saved: {path}")
     
     final_path = os.path.join(config['save_dir'], "v12_final.pth")
     torch.save({'model': model.state_dict(), 'step': config['total_steps']}, final_path)

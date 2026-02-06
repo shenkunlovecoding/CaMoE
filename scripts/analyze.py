@@ -2,7 +2,7 @@
 import os
 import glob
 import torch
-from camoe.config import CONFIG_MINIPILE
+from CaMoE.config import CONFIG_MINIPILE
 
 def analyze_checkpoint(ckpt_path):
     """分析单个 checkpoint 的市场状态"""

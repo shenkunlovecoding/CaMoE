@@ -1,6 +1,6 @@
 """
-Critic 2.0 (VC模式)
-完整做多/做空实现
+CaMoE v18 Critic (VC Mode)
+做多/做空实现，适配 Top-2
 """
 
 import torch
@@ -51,6 +51,9 @@ class CriticVC(nn.Module):
     
     def settle(self, affinity: torch.Tensor, winners: torch.Tensor, 
                token_losses: torch.Tensor, baseline: float) -> Dict:
+        """
+        winners: [B, T, 2] - Top-2 中标者
+        """
         with torch.no_grad():
             B, T, E = affinity.shape
             
@@ -63,7 +66,8 @@ class CriticVC(nn.Module):
             total = 0
             
             for e in range(E):
-                won = (winners == e)
+                # Top-2 中任一位置选中，即算 won
+                won = (winners == e).any(dim=-1)  # [B, T]
                 lost = ~won
                 
                 amt = amounts[:, :, e]

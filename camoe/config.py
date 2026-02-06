@@ -1,17 +1,44 @@
-CONFIG_MINIPILE = {
-    "project": "CaMoE-v16",
-    "run_name": "MiniPile-0.1b-3R1T-first",
+"""
+CaMoE v18 配置文件
+使用 version 字段自动生成路径
+"""
+
+# ==========================================
+# 版本控制
+# ==========================================
+VERSION = "v18"
+SCALE = "0.4b"  # "0.1b" or "0.4b"
+VARIANT = "6R2T-Top2"  # 架构变体描述
+
+# ==========================================
+# 自动生成的标识符
+# ==========================================
+RUN_ID = f"MiniPile-{SCALE}-{VARIANT}-{VERSION}"
+
+# ==========================================
+# 0.4B 规模配置 (v18 主力)
+# ==========================================
+CONFIG_04B = {
+    # ===== 元信息 =====
+    "version": VERSION,
+    "scale": SCALE,
+    "variant": VARIANT,
+    "project": f"CaMoE-{VERSION}",
+    "run_name": RUN_ID,
     
-    # ===== 模型结构 (和 TinyStories 一样) =====
-    "n_embd": 768,
-    "n_layer": 12,
+    # ===== 模型结构 =====
+    "n_embd": 1024,
+    "n_layer": 16,  # 比 0.1b 的 12 层多
     "head_size": 64,
-    "vocab_size": 65536,
+    "vocab_size": 65536,  # 削减词表
+    "tied_embeddings": True,  # 共享 Input/Output Embedding
     
-    # ===== CaMoE 专家配置 =====
-    "num_rwkv_experts": 3,
-    "num_trans_experts": 1,
-    "prefix_len": 16,
+    # ===== CaMoE 专家配置 (6R2T) =====
+    "num_rwkv_experts": 6,
+    "num_trans_experts": 2,
+    "top_k": 2,  # Top-2 路由
+    "prefix_len": 64,
+    "low_rank_dim": 64,  # Bridge 低秩维度
     
     # ===== Market 参数 =====
     "total_capital": 10000.0,
@@ -19,60 +46,101 @@ CONFIG_MINIPILE = {
     "tax_threshold": 2.0,
     "tax_rate": 0.1,
     
-    # ===== 训练参数 (5080 16GB) =====
-    "micro_batch_size": 3,
-    "ctx_len": 768,      
-    "grad_accum": 16,     # 有效 batch = 48
-    "total_steps": 20000,  # 见下方计算
+    # ===== 训练参数 (RTX 5090 32GB) =====
+    "micro_batch_size": 6,
+    "ctx_len": 1024,
+    "grad_accum": 8,  # 有效 batch = 48
+    "total_steps": 100000,
     
-    # ===== 阶段控制 =====
-    "prewarm_steps": 0,
-    "warmup_steps": 1000,
+    # ===== 阶段控制 (超长预热) =====
+    "prewarm_steps": 4000,   # 冻结 RWKV，只训 Bridge/Trans
+    "warmup_steps": 10000,   # 全参数热身
     
     # ===== 学习率 =====
     "lr_prewarm": 1e-4,
     "lr_warmup": 2e-4,
-    "lr_normal": 1.5e-4,
+    "lr_normal": 3e-4,
+    
+    # ===== 日志与评估 =====
+    "log_interval": 10,
+    "eval_interval": 1000,
+    "eval_iters": 50,
+    
+    # ===== 路径 (f-string 自动生成) =====
+    "data_path": "./data/minipile_processed",
+    "weights_path": f"model/rwkv7-0.4b-base.pth",
+    "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
+    "save_dir": f"checkpoints/{VERSION}_{SCALE}",
+}
+
+# ==========================================
+# 0.1B 规模配置 (测试/对照组)
+# ==========================================
+CONFIG_01B = {
+    # ===== 元信息 =====
+    "version": VERSION,
+    "scale": "0.1b",
+    "variant": "3R1T-Top2",
+    "project": f"CaMoE-{VERSION}",
+    "run_name": f"MiniPile-0.1b-3R1T-Top2-{VERSION}",
+    
+    # ===== 模型结构 =====
+    "n_embd": 768,
+    "n_layer": 12,
+    "head_size": 64,
+    "vocab_size": 32000,
+    "tied_embeddings": True,
+    
+    # ===== CaMoE 专家配置 (3R1T) =====
+    "num_rwkv_experts": 3,
+    "num_trans_experts": 1,
+    "top_k": 2,
+    "prefix_len": 64,
+    "low_rank_dim": 64,
+    
+    # ===== Market 参数 =====
+    "total_capital": 10000.0,
+    "min_capital_share": 0.05,
+    "tax_threshold": 2.0,
+    "tax_rate": 0.1,
+    
+    # ===== 训练参数 =====
+    "micro_batch_size": 4,
+    "ctx_len": 768,
+    "grad_accum": 12,
+    "total_steps": 40000,
+    
+    # ===== 阶段控制 =====
+    "prewarm_steps": 2000,
+    "warmup_steps": 6000,
+    
+    # ===== 学习率 =====
+    "lr_prewarm": 1e-4,
+    "lr_warmup": 2e-4,
+    "lr_normal": 3e-4,
+    
+    # ===== 日志与评估 =====
+    "log_interval": 10,
+    "eval_interval": 1000,
+    "eval_iters": 50,
     
     # ===== 路径 =====
     "data_path": "./data/minipile_processed",
     "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
-    "save_dir": "checkpoints/minipile",
+    "save_dir": f"checkpoints/{VERSION}_0.1b",
 }
 
-CONFIG_04B = {
-    "project": "CaMoE-v10",
-    "run_name": "v10-0.4b-g1a",
-    
-    "n_embd": 1024,
-    "n_layer": 24,
-    "head_size": 64,
-    "vocab_size": 65536,
-    
-    "prefix_len": 16,
-    "num_rwkv_experts": 2,
-    
-    "total_capital": 10000.0,
-    "min_capital_share": 0.05,
-    "tax_threshold": 1.5,
-    "tax_rate": 0.15,
-    
-    "batch_size": 4,
-    "ctx_len": 1024,
-    "grad_accum": 8,
-    "total_steps": 30000,
-    
-    "prewarm_steps": 500,
-    "warmup_steps": 2000,
-    "rewarm_interval": 5000,
-    "rewarm_duration": 500,
-    
-    "lr_prewarm": 5e-4,
-    "lr_warmup": 2e-4,
-    "lr_normal": 5e-5,
-    
-    "weights_path": "model/rwkv7-g1a-0.4b-20250905-ctx4096.pth",
-    "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
-    "save_dir": "checkpoints",
-}
+# ==========================================
+# 默认配置选择
+# ==========================================
+def get_config(scale: str = "0.4b"):
+    if scale == "0.4b":
+        return CONFIG_04B
+    elif scale == "0.1b":
+        return CONFIG_01B
+    else:
+        raise ValueError(f"Unknown scale: {scale}")
+
+# 向后兼容
+CONFIG_MINIPILE = CONFIG_04B

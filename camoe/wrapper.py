@@ -15,9 +15,9 @@ from lm_eval.api.instance import Instance
 
 
 # 你的项目导入
-from camoe import CaMoE_System
-from camoe.backbone import init_rwkv7_cuda
-from camoe.config import CONFIG_MINIPILE
+from .system import CaMoE_System
+from .backbone import init_rwkv7_cuda
+from .config import CONFIG_MINIPILE
 
 try:
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER

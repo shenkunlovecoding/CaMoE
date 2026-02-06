@@ -13,13 +13,13 @@ import os
 import json
 from termcolor import colored
 from collections import Counter
-from camoe import CaMoE_System
-from camoe.config import *
+from CaMoE.system import CaMoE_System
+from CaMoE.config import *
 from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
 # ================= 配置 =================
 # [请确认] 模型路径是否正确
-MODEL_PATH = "checkpoints/minipile/v12_final.pth" 
+MODEL_PATH = "checkpoints/minipile/v16_step12000.pth" 
 # 或者用最新的 step: "checkpoints/v12/v12_step10000.pth"
 
 SCALE = "0.1b"
@@ -214,39 +214,12 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
 prompts = [
     
     # ===== 3. 简单对话 (Switchboard 风格) =====
-    "Hi, how are you doing today?",
-    "What do you think about",
-    "I really like it when",
-    
-    # ===== 4. 简单维基 (SimpleWiki 风格) =====
-    "The sun is a star that",
-    "Water is important because",
-    "Dogs are animals that",
-    
-    # ===== 5. 电影字幕 (OpenSubtitles 风格) =====
-    "I can't believe you did that!",
-    "We need to go now before",
-    "She looked at him and whispered,",
-    
-    # ===== 6. 口语表达 (BNC Spoken 风格) =====
-    "Well, I think the problem is",
-    "You know what I mean?",
-    "Actually, it's quite interesting that",
-    # A. 事实检索 (看 ARC 提升)
-    "The Earth is the third planet from the",
-    
-    # B. 逻辑推理 (看 0.7B 数据后的逻辑脑)
-    "If you mix blue and yellow paint, you get",
-    
-    # C. 代码能力 (MiniPile 的特殊加成)
-    "def calculate_average(numbers):",
-    
-    # D. 结构化表达 (看是否还在说 'of the following' 废话)
-    "The three main benefits of exercise are:",
-    
-    # E. 遗忘测试 (看 BabyLM 的老本还在不在)
-    "Once upon a time, a little girl lived in a"
-
+    "The three main steps to cook rice are: 1. Wash the rice; 2.",
+    "The capital of France is Paris, but the capital of Japan is",
+    "If x = 5 and y = 3, then x + y equals",
+    "The three main steps to cook rice are: 1. Wash the rice; 2.",
+    "Although the weather was very cold and the wind was blowing hard, the small bird decided to",
+    "Based on the above mentioned analysis, we can conclude that"
 ]
 
 for p in prompts:
