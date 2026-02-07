@@ -17,7 +17,7 @@ from lm_eval.api.instance import Instance
 # 你的项目导入
 from .system import CaMoE_System
 from .backbone import init_rwkv7_cuda
-from .config import CONFIG_MINIPILE
+from .config import get_config
 
 try:
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
@@ -33,41 +33,51 @@ class CaMoELM(LM):
     def __init__(
         self,
         pretrained: str = None,
+        scale: str = "0.4b",
         vocab_file: str = None,
         device: str = "cuda",
         batch_size: int = 1,
-        max_length: int = 1024,
+        max_length: int = None,
         dtype: str = "bfloat16",
         **kwargs,
     ):
         super().__init__()
         
-        # 1. 基础配置
-        self.config = CONFIG_MINIPILE.copy()
+        # 1. 配置：优先从 checkpoint 恢复以匹配架构，否则用 get_config(scale)
+        checkpoint = None
+        if pretrained and os.path.exists(pretrained):
+            checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
+        if checkpoint is not None and isinstance(checkpoint, dict) and checkpoint.get("config"):
+            self.config = checkpoint['config'].copy()
+            print(f"📋 Using config from checkpoint: {self.config.get('version', '?')} / {self.config.get('scale', '?')}")
+        else:
+            self.config = get_config(scale).copy()
+            print(f"📋 Using config from scale: {scale}")
+        
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
         self._batch_size = int(batch_size)
-        self._max_length = int(max_length)
+        self._max_length = int(max_length) if max_length is not None else self.config.get('ctx_len', 1024)
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
-        self.CHUNK_LEN = 16 # RWKV-7 Kernel 要求
+        self.CHUNK_LEN = 16  # RWKV-7 Kernel 要求
         
         # 2. 初始化 CUDA Kernel (防止 JIT 死锁)
         print("⏳ Init RWKV-7 CUDA Kernel...")
         init_rwkv7_cuda()
         
-        # 3. 加载模型
-        print(f"🏗️ Building CaMoE model...")
+        # 3. 构建并加载模型
+        print("🏗️ Building CaMoE model...")
         self.model = CaMoE_System(self.config)
         
         if pretrained and os.path.exists(pretrained):
+            ckpt = checkpoint if checkpoint is not None else torch.load(pretrained, map_location='cpu', weights_only=False)
             print(f"📦 Loading weights from {pretrained}...")
-            checkpoint = torch.load(pretrained, map_location='cpu', weights_only=False)
-            if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                self.model.load_state_dict(checkpoint['model'], strict=False)
+            if isinstance(ckpt, dict) and 'model' in ckpt:
+                self.model.load_state_dict(ckpt['model'], strict=False)
             else:
-                self.model.load_state_dict(checkpoint, strict=False)
+                self.model.load_state_dict(ckpt, strict=False)
             print("✅ Weights loaded!")
         else:
-            print(f"⚠️ No pretrained weights found at {pretrained}, using random init")
+            print("⚠️ No pretrained path or file not found, using random init")
         
         self.model.to(self._device)
         self.model.eval()

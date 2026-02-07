@@ -1,50 +1,62 @@
 """
-CaMoE v12.0 可视化深度评测脚本 (Sherlock Edition)
-适配: 2 RWKV + 2 Trans 架构
+CaMoE v18 可视化深度评测脚本 (Sherlock Edition)
+适配: 6 RWKV + 2 Trans (Top-2) 架构
 功能：
 1. 生成带颜色高亮的故事 (人类看)
-2. 生成 Token 级的详细层级路由日志 (AI 分析用)
-3. 自动统计 Transformer 的“口味偏好”
+2. 自动识别 Top-2 路由状态 (双R / 混动 / 双T)
+3. 统计层级 Transformer 渗透率
 """
 
 import torch
 import torch.nn.functional as F
 import os
-import json
+import sys
 from termcolor import colored
 from collections import Counter
+
+# 确保能导入 CaMoE 模块
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from CaMoE.system import CaMoE_System
-from CaMoE.config import *
-from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
+from CaMoE.config import get_config # 使用 config.py 的 getter
+
+# 尝试导入 Rust Tokenizer，没有就用 Python 版
+try:
+    import pyrwkv_tokenizer
+    RUST_TOKENIZER = True
+except ImportError:
+    from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
+    RUST_TOKENIZER = False
 
 # ================= 配置 =================
-# [请确认] 模型路径是否正确
-MODEL_PATH = "checkpoints/minipile/v16_step12000.pth" 
-# 或者用最新的 step: "checkpoints/v12/v12_step10000.pth"
-
-SCALE = "0.1b"
+# [请确认] 模型路径
+MODEL_PATH = "checkpoints/v18-pilot-1/v12_final.pth" # 你的 Pilot 路径
+SCALE = "0.1b"  # "0.4b" or "pilot" or "0.1b"
 DEVICE = "cuda"
-ctx_len = 512
-CHUNK_LEN = 16  
 
 # ================= 加载逻辑 =================
-config = CONFIG_MINIPILE if SCALE == "0.1b" else CONFIG_04B
+config = get_config(SCALE).copy()
 
-# [重要] 必须匹配 v12 训练配置！
-config['num_rwkv_experts'] = 3
-config['num_trans_experts'] = 1
-config['micro_batch_size'] = 1 # 推理时 BS=1
+# 强制推理配置
+config['micro_batch_size'] = 1 
+config['ctx_len'] = 1024 # 推理长度
+config['dropout'] = 0.0
 
 print(f"🔄 Loading model from {MODEL_PATH}...")
-print(f"⚙️ Config: {config['num_rwkv_experts']} RWKV + {config['num_trans_experts']} Trans Experts")
+print(f"⚙️ Config: {config['num_rwkv_experts']}R + {config['num_trans_experts']}T (Top-{config.get('top_k', 2)})")
 
 model = CaMoE_System(config).to(DEVICE)
 
-# 尝试加载
+# 加载权重
 if os.path.exists(MODEL_PATH):
     checkpoint = torch.load(MODEL_PATH, map_location='cpu')
-    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
-
+    # 兼容不同的保存格式
+    if isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+            
     try:
         model.load_state_dict(state_dict, strict=True)
         print("✅ Full strict load success.")
@@ -57,9 +69,16 @@ else:
     exit()
 
 model.eval()
-# 如果没有 Tokenizer 文件，会报错，请确保文件存在
-if os.path.exists(config['vocab_file']):
+
+# 加载 Tokenizer
+print("🔤 Loading Tokenizer...")
+if RUST_TOKENIZER:
+    # Rust 版不需要 vocab 文件路径，内置
+    tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
+    print("✅ Rust Tokenizer loaded.")
+elif os.path.exists(config['vocab_file']):
     tokenizer = TRIE_TOKENIZER(config['vocab_file'])
+    print("✅ Python Trie Tokenizer loaded.")
 else:
     print("❌ Tokenizer vocab file not found.")
     exit()
@@ -84,31 +103,13 @@ def sample_top_p(probs, p, temperature):
     
     return torch.multinomial(probs, 1)
 
-def analyze_token_preferences(history_log):
-    """
-    分析 Transformer 到底喜欢吃什么词
-    """
-    trans_heavy_tokens = []
-    trans_light_tokens = []
-    
-    for item in history_log:
-        token = item['token'].strip()
-        if not token: continue
-        
-        # 统计用了 Trans 的层数
-        trans_layers = len(item['trans_layers'])
-        if trans_layers >= 2: # 只要有2层以上用了 Trans
-            trans_heavy_tokens.append(token)
-        else:
-            trans_light_tokens.append(token)
-            
-    heavy_counts = Counter(trans_heavy_tokens).most_common(10)
-    
-    print("\n🧐 [AI Analysis] Transformer's Favorite Tokens (Top 10):")
-    print(f"这些词最容易触发 Trans: {heavy_counts}")
-
 def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0.9):
-    input_ids = tokenizer.encode(prompt)
+    # Tokenize
+    if RUST_TOKENIZER:
+        input_ids = tokenizer.encode(prompt)
+    else:
+        input_ids = tokenizer.encode(prompt)
+        
     x = torch.tensor([input_ids], dtype=torch.long).to(DEVICE)
     
     print("\n" + "="*20 + " GENERATION START " + "="*20)
@@ -118,68 +119,73 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
     
     # 统计数据
     total_generated = 0
-    global_trans_count = 0
+    
+    # 统计每一层 Transformer 的激活次数 (Top-2 中任一激活算一次)
     layer_trans_counts = {i: 0 for i in range(config['n_layer'])}
     
-    # AI 分析日志列表
+    # 统计全局状态：
+    # 0: Pure RWKV (Blue)
+    # 1: Mixed (Yellow)
+    # 2: Pure Trans (Red)
+    state_counts = {0: 0, 1: 0, 2: 0}
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            # Padding
-            curr_ctx = x[:, -config['ctx_len']:]
-            B, T_actual = curr_ctx.shape
-            remainder = T_actual % CHUNK_LEN
-            if remainder != 0:
-                pad_len = CHUNK_LEN - remainder
-                x_padded = F.pad(curr_ctx, (0, pad_len), value=0)
-            else:
-                x_padded = curr_ctx
+            # v18 不再强制 padding，除非使用 CUDA Kernel 优化
+            # 简单起见，这里直接输入
+            curr_x = x[:, -config['ctx_len']:]
             
             # Forward
             # step=30000 确保 Eureka 关闭，完全看 Router
             # phase="normal" 开启 Market
-            logits, info = model(x_padded, step=30000, phase="normal") 
+            # 开启 AMP 以匹配训练时的精度 (BF16)
+            with torch.amp.autocast(device_type=DEVICE, dtype=torch.bfloat16):
+                logits, info = model(curr_x, step=30000, phase="normal") 
             
             # Sampling
-            target_idx = T_actual - 1
+            target_idx = curr_x.shape[1] - 1
             next_token_logits = logits[:, target_idx, :]
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = sample_top_p(probs, top_p, temperature)
             
-            # 路由统计
-            active_layers = []
-            rwkv_boundary = config['num_rwkv_experts']
+            # === Top-2 路由分析 ===
+            rwkv_boundary = config['num_rwkv_experts'] # e.g. 6
+            
+            # 当前 Token 在所有层的 Transformer 激活数
+            token_trans_intensity = 0 
             
             for layer_idx, layer_winners in enumerate(info["winners"]):
-                # layer_winners: [B, T]
-                # 取生成位置的胜者
-                winner_id = layer_winners[0, target_idx].item()
+                # layer_winners: [B, T, 2] -> 取当前位置 [2]
+                winners = layer_winners[0, target_idx] # tensor([idx1, idx2])
                 
-                # [v12 适配] ID >= num_rwkv_experts 的都是 Trans
-                if winner_id >= rwkv_boundary:
+                # 检查 Top-2 中有几个是 Transformer
+                # ID >= rwkv_boundary (6) 的是 Trans
+                is_trans = (winners >= rwkv_boundary).long().sum().item()
+                
+                if is_trans > 0:
                     layer_trans_counts[layer_idx] += 1
-                    active_layers.append(layer_idx)
+                    token_trans_intensity += is_trans # 这一层贡献了 1 或 2 个 Trans 强度
             
-            trans_layer_count = len(active_layers)
+            # === 颜色逻辑 ===
+            # 总共有 16 层，每层最多 2 个 Trans，满分 32 分
+            # 我们根据强度定色
             
-            # [升级版颜色逻辑]
-            if trans_layer_count == 0:
-                color = 'blue'       # 纯直觉流
-            elif trans_layer_count <= 3:
-                color = 'cyan'
-                global_trans_count += 0.3       # 轻量级混合
-            elif trans_layer_count <= 5:
-                color = 'green'
-                global_trans_count += 0.5      # v13 标准三明治 (支柱层介入)
-            elif trans_layer_count <= 8:
-                color = 'yellow'
-                global_trans_count += 0.8     # 逻辑强化 (中间层也介入了)
+            if token_trans_intensity == 0:
+                color = 'blue'       # 纯直觉 (全 RWKV)
+                state_counts[0] += 1
+            elif token_trans_intensity <= 5:
+                color = 'cyan'       # 轻微思考
+                state_counts[1] += 1
+            elif token_trans_intensity <= 12:
+                color = 'yellow'     # 混合模式
+                state_counts[1] += 1
             else:
-                color = 'red'        # 高强度推理 (全线重兵压境)
-                global_trans_count += 1
+                color = 'red'        # 深度思考 (大量 Transformer 介入)
+                state_counts[2] += 1
             
             total_generated += 1
             
+            # Decode
             try:
                 word = tokenizer.decode([next_token.item()])
             except:
@@ -187,40 +193,35 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
                 
             print(colored(word, color), end="", flush=True)
             
-            # 记录到日志
-            
             x = torch.cat([x, next_token.view(1, 1)], dim=1)
-            if next_token.item() == 0: break
+            if next_token.item() == 0: break # EOS
     
     print("\n" + "-" * 50)
     
     if total_generated > 0:
         print(f"\n📊 Global Stats: {total_generated} tokens")
-        print(f"🔵 RWKV Token: {total_generated - global_trans_count}")
-        print(f"🔴 Trans Token: {global_trans_count} ({global_trans_count/total_generated:.1%})")
+        print(f"🔵 Pure RWKV: {state_counts[0]} ({state_counts[0]/total_generated:.1%})")
+        print(f"🟡 Mixed:      {state_counts[1]} ({state_counts[1]/total_generated:.1%})")
+        print(f"🔴 Deep Trans: {state_counts[2]} ({state_counts[2]/total_generated:.1%})")
         
-        print("\n🔍 Layer-wise Transformer Usage:")
+        print("\n🔍 Layer-wise Transformer Usage (Top-2 Hit Rate):")
         for i in range(config['n_layer']):
+            # 这一层在 Top-2 中命中 Trans 的概率
             pct = layer_trans_counts[i] / total_generated
             bar_len = int(pct * 20)
             bar = "█" * bar_len + "░" * (20 - bar_len)
             print(f" L{i:02d} | {pct:.1%} | {bar}")
 
-        
-        # 可选：打印详细日志
-        # print(json.dumps(analysis_log, indent=2, ensure_ascii=False))
-
 # ================= 测试 =================
 prompts = [
-    
-    # ===== 3. 简单对话 (Switchboard 风格) =====
-    "The three main steps to cook rice are: 1. Wash the rice; 2.",
+    "Once upon a time, there was a little girl named Lily. She loved to",
     "The capital of France is Paris, but the capital of Japan is",
     "If x = 5 and y = 3, then x + y equals",
-    "The three main steps to cook rice are: 1. Wash the rice; 2.",
-    "Although the weather was very cold and the wind was blowing hard, the small bird decided to",
-    "Based on the above mentioned analysis, we can conclude that"
+    "To make a sandwich, first you need bread. Then, you put",
+    "Alice: Hello, how are you? Bob: I am fine, thank you. Alice:",
+    "One day, a big lion saw a small mouse. The lion wanted to eat the mouse, but the mouse said,",
 ]
 
-for p in prompts:
-    generate_and_visualize(p)
+if __name__ == "__main__":
+    for p in prompts:
+        generate_and_visualize(p)

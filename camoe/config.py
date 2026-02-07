@@ -30,7 +30,7 @@ CONFIG_04B = {
     "n_embd": 1024,
     "n_layer": 16,  # 比 0.1b 的 12 层多
     "head_size": 64,
-    "vocab_size": 65536,  # 削减词表
+    "vocab_size": 65536,  
     "tied_embeddings": True,  # 共享 Input/Output Embedding
     
     # ===== CaMoE 专家配置 (6R2T) =====
@@ -67,8 +67,23 @@ CONFIG_04B = {
     "eval_iters": 50,
     
     # ===== 路径 (f-string 自动生成) =====
+    # 单数据集时使用 data_path；混合时使用 data_roots + mix（课程学习手动 Resume 换阶段）
     "data_path": "./data/minipile_processed",
-    "weights_path": f"model/rwkv7-0.4b-base.pth",
+    "data_roots": {
+        "tinystories": "./data/tinystories_rwkv_processed",
+        "dialog": "./data/dailydialog_rwkv_processed",
+        "chat": "./data/ultrachat_rwkv_processed",
+        "minipile": "./data/minipile_rwkv_processed",
+    },
+    # 混合比例：配置好后训练，到下一阶段改比例并 Resume 即可
+    # 不配置 mix 则使用 data_path 单数据集
+    "mix": {
+        "tinystories": 0.6,
+        "dialog": 0.2,
+        "chat" : 0.2,
+        "minipile": 0.0,
+    },
+    "weights_path": f"model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
     "save_dir": f"checkpoints/{VERSION}_{SCALE}",
 }
@@ -126,6 +141,12 @@ CONFIG_01B = {
     
     # ===== 路径 =====
     "data_path": "./data/minipile_processed",
+    "data_roots": {
+        "tinystories": "./data/tinystories_rwkv_processed",
+        "dialog": "./data/dialog_rwkv_processed",
+        "minipile": "./data/minipile_rwkv_processed",
+    },
+    "mix": None,  # 0.1b 默认单数据集，需要时配置 mix
     "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
     "save_dir": f"checkpoints/{VERSION}_0.1b",

@@ -11,7 +11,7 @@ import re
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from datasets import load_from_disk, Dataset, DatasetDict
+from datasets import load_from_disk, Dataset, DatasetDict, interleave_datasets
 import bitsandbytes as bnb
 from CaMoE.backbone import init_rwkv7_cuda
 try:
@@ -21,7 +21,7 @@ except ImportError:
     HAS_SWANLAB = False
 
 from CaMoE.system import CaMoE_System
-from CaMoE.config import *
+from CaMoE.config import get_config, VERSION
 
 
 def load_backbone(model, path):
@@ -113,7 +113,7 @@ def infinite_loader(loader):
 def main():
     init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", default="0.1b")
+    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
@@ -126,36 +126,76 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_float32_matmul_precision('high')
 
-    # 2. Dataset & Split
-    print("🚀 Loading dataset...")
+    # ==========================================
+    # 2. Dataset & Split（支持多数据集混合，手动 Resume 换阶段）
+    # ==========================================
+    print("🚀 Loading datasets...")
     try:
-        raw_dataset = load_from_disk(config.get('data_path'))
-        
-        # [修改] 自动划分 训练集/验证集
-        if isinstance(raw_dataset, DatasetDict):
-            if 'validation' in raw_dataset:
-                train_data = raw_dataset['train']
-                val_data = raw_dataset['validation']
-            elif 'test' in raw_dataset:
-                train_data = raw_dataset['train']
-                val_data = raw_dataset['test']
-            else:
-                # 只有 train，手动切分
-                split = raw_dataset['train'].train_test_split(test_size=0.05, seed=42)
-                train_data = split['train']
-                val_data = split['test']
-        elif isinstance(raw_dataset, Dataset):
-            # 单个 Dataset，手动切分
-            split = raw_dataset.train_test_split(test_size=0.05, seed=42)
-            train_data = split['train']
-            val_data = split['test']
-        else:
-            raise ValueError("Unknown dataset type")
+        mix = config.get("mix")
+        data_roots = config.get("data_roots") or {}
 
-        train_data.set_format(type="torch", columns=["input_ids"])
-        val_data.set_format(type="torch", columns=["input_ids"])
-        
-        print(f"📊 Dataset Split: Train={len(train_data)}, Val={len(val_data)}")
+        if mix and data_roots:
+            # 混合模式：按 mix 比例 interleave，课程学习时改 config + Resume 即可
+            train_datasets = []
+            val_datasets = []
+            probs = []
+            loaded_names = []
+
+            for name, prob in mix.items():
+                if prob <= 0:
+                    continue
+                path = data_roots.get(name)
+                if not path or not os.path.exists(path):
+                    print(f"⚠️ Dataset not found: {path}, skipping {name}.")
+                    continue
+
+                ds = load_from_disk(path)
+                if isinstance(ds, DatasetDict):
+                    tr = ds["train"]
+                    va = ds.get("validation") or ds.get("test")
+                    if va is None:
+                        split = tr.train_test_split(test_size=0.01, seed=42)
+                        tr, va = split["train"], split["test"]
+                else:
+                    split = ds.train_test_split(test_size=0.01, seed=42)
+                    tr, va = split["train"], split["test"]
+
+                tr.set_format(type="torch", columns=["input_ids"])
+                va.set_format(type="torch", columns=["input_ids"])
+                train_datasets.append(tr)
+                val_datasets.append(va)
+                probs.append(prob)
+                loaded_names.append(name)
+                print(f"  - {name}: train={len(tr)}, val={len(va)} (prob={prob})")
+
+            if not train_datasets:
+                raise ValueError("No valid datasets in mix (paths missing or prob=0).")
+
+            total_p = sum(probs)
+            probs = [p / total_p for p in probs]
+            train_data = interleave_datasets(train_datasets, probabilities=probs, seed=42,stopping_strategy="all_exhausted")
+            val_data = interleave_datasets(val_datasets, probabilities=probs, seed=42,stopping_strategy="all_exhausted")
+            print(f"📊 Mix: {dict(zip(loaded_names, probs))} → Train={len(train_data)}, Val={len(val_data)}")
+        else:
+            # 单数据集
+            raw_dataset = load_from_disk(config.get("data_path"))
+            if isinstance(raw_dataset, DatasetDict):
+                if "validation" in raw_dataset:
+                    train_data, val_data = raw_dataset["train"], raw_dataset["validation"]
+                elif "test" in raw_dataset:
+                    train_data, val_data = raw_dataset["train"], raw_dataset["test"]
+                else:
+                    split = raw_dataset["train"].train_test_split(test_size=0.05, seed=42)
+                    train_data, val_data = split["train"], split["test"]
+            elif isinstance(raw_dataset, Dataset):
+                split = raw_dataset.train_test_split(test_size=0.05, seed=42)
+                train_data, val_data = split["train"], split["test"]
+            else:
+                raise ValueError("Unknown dataset type")
+
+            train_data.set_format(type="torch", columns=["input_ids"])
+            val_data.set_format(type="torch", columns=["input_ids"])
+            print(f"📊 Dataset Split: Train={len(train_data)}, Val={len(val_data)}")
 
     except Exception as e:
         print(f"❌ Error loading dataset: {e}")
@@ -215,6 +255,7 @@ def main():
             print(f"✨ Found init checkpoint: {minipile_init_path}")
             resume_path = minipile_init_path
     
+    checkpoint = None
     if resume_path and os.path.exists(resume_path):
         print(f"📦 Loading checkpoint from {resume_path}...")
         checkpoint = torch.load(resume_path, map_location='cpu')
@@ -290,12 +331,37 @@ def main():
 
     print(f"📊 Model params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     
+    # ==========================================
+    # SwanLab 初始化 (带图表续接功能)
+    # ==========================================
+    current_run_id = None
+    run_id = None
+    
+    # 1. 如果是 Resume，尝试从 checkpoint 找 run_id
+    if args.resume and isinstance(checkpoint, dict) and 'swanlab_run_id' in checkpoint:
+        run_id = checkpoint['swanlab_run_id']
+        print(f"🔄 Resuming SwanLab run: {run_id}")
+    
+    # 2. 初始化 SwanLab
     if HAS_SWANLAB:
-        swanlab.init(project=config['project'], name=config['run_name'], config=config)
+        experiment = swanlab.init(
+            project=config['project'],
+            name=config['run_name'],
+            config=config,
+            id=run_id,
+            resume="allow"
+        )
+        # 获取当前的 run_id (如果是新的，这里会生成新的)
+        current_run_id = experiment.run.id
     
     os.makedirs(config['save_dir'], exist_ok=True)
     
     print(f"🚀 Training start from step {start_step}...")
+    
+    # ==========================================
+    # Logging 逻辑 (回滚到瞬时值 + 修复Step显示)
+    # ==========================================
+    log_interval = config.get('log_interval', 10)
     
     # 5. Training Loop
     for step in range(start_step, config['total_steps']):
@@ -332,7 +398,7 @@ def main():
                 model.update_market(info, token_losses, step)
         
         # [修改] 日志与评估逻辑
-        if step % 10 == 0:
+        if step % log_interval == 0:
             dt = time.time() - t0
             tps = config['micro_batch_size'] * x.shape[1] / dt
             
@@ -347,14 +413,14 @@ def main():
             trans_share = stats.get("L0/TransShare", 0)
             if isinstance(trans_share, torch.Tensor): trans_share = trans_share.item()
             
-            # 打印
-            log_str = f"Step {step} | TrainLoss: {main_loss.item():.3f}"
+            # 打印 (瞬时 Loss)
+            log_str = f"Step {step} | Loss: {main_loss.item():.3f}"
             if val_loss:
                 log_str += f" | ValLoss: {val_loss:.3f}"
             log_str += f" | Trans%: {trans_share:.1f} | TPS: {tps:.0f} | [{phase.upper()}]"
             print(log_str)
             
-            # SwanLab
+            # SwanLab Log (关键修正：传入 step 参数)
             if HAS_SWANLAB:
                 logs = {
                     "Loss/Train_Main": main_loss.item(),
@@ -365,9 +431,11 @@ def main():
                 }
                 if val_loss:
                     logs["Loss/Validation"] = val_loss
-                swanlab.log(logs)
+                
+                # [关键] 显式指定 step，这样 step 1000 就会画在 X=1000 处
+                swanlab.log(logs, step=step)
         
-        # 保存完整 Checkpoint
+        # 保存完整 Checkpoint (顺便保存 run_id)
         if step > 0 and step % 2000 == 0:
             gc.collect()
             torch.cuda.empty_cache()
@@ -379,13 +447,23 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'step': step,
                 'config': config,
+                'swanlab_run_id': current_run_id,
                 'version': config['version']  # 额外记录版本
             }
             torch.save(checkpoint_data, path)
             print(f"💾 Saved: {path}")
     
-    final_path = os.path.join(config['save_dir'], "v12_final.pth")
-    torch.save({'model': model.state_dict(), 'step': config['total_steps']}, final_path)
+    final_path = os.path.join(config['save_dir'], f"{config['version']}_final.pth")
+    torch.save(
+        {
+            'model': model.state_dict(),
+            'step': config['total_steps'],
+            'config': config,
+            'swanlab_run_id': current_run_id,
+            'version': config['version'],
+        },
+        final_path
+    )
     print("🎉 Done!")
 
 if __name__ == "__main__":

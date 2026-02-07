@@ -1,41 +1,59 @@
 """
 Preprocess Script for CaMoE v18 (Rust RWKV Tokenizer)
+支持本地文件 (json/txt/csv) 和 HF 在线数据集
 """
 import os
 import argparse
 from datasets import load_dataset
-import pyrwkv_tokenizer # Rust 加速版
+import pyrwkv_tokenizer 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="roneneldan/TinyStories")
-    parser.add_argument("--save_path", type=str, default="./data/TinyStories_rwkv_processed")
+    # 支持本地路径或 HF ID
+    parser.add_argument("--dataset", type=str, required=True, 
+                        help="Path to local file (.json/.txt) or HF Dataset ID")
+    parser.add_argument("--save_path", type=str, required=True)
     parser.add_argument("--ctx_len", type=int, default=1024)
-    parser.add_argument("--num_proc", type=int, default=16) # Rust本身有多线程，这里Python进程数可以少点
+    parser.add_argument("--num_proc", type=int, default=16)
+    
+    # 显式指定文本列名 (可选)
+    parser.add_argument("--text_col", type=str, default=None)
     return parser.parse_args()
 
-def process_batch(batch):
-    # Rust Tokenizer 初始化极快，直接在函数里搞
+def process_batch(batch, text_col=None):
     tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
     
-    texts = batch["text"]
-    # 批量编码 (Rust 内部自带多线程优化)
-    # 注意：pyrwkv_tokenizer 的 encode_batch 返回的是 list of lists
-    encoded_batch = tokenizer.encode_batch(texts)
+    if text_col is None:
+        keys = batch.keys()
+        if "text" in keys: text_col = "text"
+        elif "content" in keys: text_col = "content"
+        elif "dialog" in keys: text_col = "dialog"
+        else: text_col = list(keys)[0]
     
-    # Flatten & Add EOS (0 for RWKV?) 
-    # RWKV world tokenizer通常没有显式的EOS，或者用 0。
-    # 检查 vocab 发现 0 是 <|endoftext|> ?? 需确认。
-    # 假设 0 是 EOS。
+    raw_data = batch[text_col]
+    
+    texts = []
+    for item in raw_data:
+        if isinstance(item, str):
+            # DailyDialog 修复: 替换 __eou__ 为换行
+            clean_text = item.replace(" __eou__ ", "\n").replace("__eou__", "\n").strip()
+            texts.append(clean_text)
+        elif isinstance(item, list):
+            texts.append("\n".join(str(x) for x in item))
+        else:
+            texts.append(str(item))
+            
+    if not texts: return {"input_ids": []}
+    
+    encoded_batch = tokenizer.encode_batch(texts)
     
     flat_ids = []
     for ids in encoded_batch:
         flat_ids.extend(ids)
         flat_ids.append(0) # EOS
         
-    # Chunking
     chunks = []
-    CTX_LEN = 1024 # 需从外部传入或写死
+    CTX_LEN = 1024
     for i in range(0, len(flat_ids), CTX_LEN):
         chunk = flat_ids[i:i+CTX_LEN]
         if len(chunk) == CTX_LEN:
@@ -45,16 +63,38 @@ def process_batch(batch):
 
 def main():
     args = get_args()
-    print(f"🚀 Preprocessing {args.dataset} with Rust RWKV Tokenizer...")
+    print(f"🚀 Processing: {args.dataset}")
     
-    ds = load_dataset(args.dataset, split="train")
+    # 1. 智能加载逻辑
+    # 检查是否是本地文件
+    if os.path.exists(args.dataset):
+        ext = args.dataset.split('.')[-1]
+        if ext in ['json', 'jsonl']:
+            print("📂 Detected Local JSON/JSONL file")
+            ds = load_dataset("json", data_files=args.dataset, split="train")
+        elif ext == 'txt':
+            print("📂 Detected Local TXT file")
+            ds = load_dataset("text", data_files=args.dataset, split="train")
+        elif os.path.isdir(args.dataset):
+             print("📂 Detected Local Dataset Folder (Arrow/HF format)")
+             from datasets import load_from_disk
+             ds = load_from_disk(args.dataset)
+        else:
+            # 尝试作为 CSV
+            ds = load_dataset("csv", data_files=args.dataset, split="train")
+    else:
+        # 假设是 HF Hub ID
+        print("☁️  Loading from HF Hub...")
+        # 即使这里不加 trust_remote_code，对于标准 dataset (text, json) 也没问题
+        # 如果是特殊 script dataset，可能还会挂，但我们主要用 json/text
+        ds = load_dataset(args.dataset, split="train", trust_remote_code=True)
+
+    print(f"📊 Rows: {len(ds)}")
     
-    # 注意：因为 Rust tokenizer 内部有多线程，Python 层面的 num_proc 可以设小一点，或者设为 1
-    # 实际上 datasets 的 map 多进程是 process 级，Rust 是 thread 级，两者结合可能更好。
-    # 建议 Python num_proc = cpu_count // 2
-    
+    # 2. Map 处理
+    # 使用 lambda 传入 text_col 参数
     tokenized_ds = ds.map(
-        process_batch,
+        lambda x: process_batch(x, args.text_col),
         batched=True,
         batch_size=1000,
         num_proc=args.num_proc,
@@ -63,7 +103,7 @@ def main():
     )
     
     tokenized_ds.save_to_disk(args.save_path)
-    print("✅ Done!")
+    print(f"✅ Saved to {args.save_path}")
 
 if __name__ == "__main__":
     main()
