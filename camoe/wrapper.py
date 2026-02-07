@@ -4,32 +4,40 @@ import torch.nn.functional as F
 import math
 from typing import List, Tuple, Optional, Union
 from tqdm import tqdm
-# 手动实现 chunks，不求人
+
+
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
+
+
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval.api.instance import Instance
 
-
-# 你的项目导入
 from .system import CaMoE_System
 from .backbone import init_rwkv7_cuda
 from .config import get_config
+
+try:
+    import pyrwkv_tokenizer
+    RUST_TOKENIZER_AVAILABLE = True
+except ImportError:
+    RUST_TOKENIZER_AVAILABLE = False
 
 try:
     from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 except ImportError:
     TRIE_TOKENIZER = None
 
+
 @register_model("camoe")
 class CaMoELM(LM):
     """
-    CaMoE 模型的 lm-evaluation-harness 适配器 (高性能 Batched 版)
+    CaMoE v18 模型的 lm-evaluation-harness 适配器（支持 Rust/Python Tokenizer，Batched 评估）
     """
-    
+
     def __init__(
         self,
         pretrained: str = None,
@@ -42,112 +50,113 @@ class CaMoELM(LM):
         **kwargs,
     ):
         super().__init__()
-        
-        # 1. 配置：优先从 checkpoint 恢复以匹配架构，否则用 get_config(scale)
+
+        # 1. Config：优先从 checkpoint 恢复以匹配架构
         checkpoint = None
         if pretrained and os.path.exists(pretrained):
             checkpoint = torch.load(pretrained, map_location="cpu", weights_only=False)
         if checkpoint is not None and isinstance(checkpoint, dict) and checkpoint.get("config"):
-            self.config = checkpoint['config'].copy()
+            self.config = checkpoint["config"].copy()
             print(f"📋 Using config from checkpoint: {self.config.get('version', '?')} / {self.config.get('scale', '?')}")
         else:
             self.config = get_config(scale).copy()
             print(f"📋 Using config from scale: {scale}")
-        
+
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
         self._batch_size = int(batch_size)
-        self._max_length = int(max_length) if max_length is not None else self.config.get('ctx_len', 1024)
+        self._max_length = int(max_length) if max_length is not None else self.config.get("ctx_len", 1024)
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
-        self.CHUNK_LEN = 16  # RWKV-7 Kernel 要求
-        
-        # 2. 初始化 CUDA Kernel (防止 JIT 死锁)
-        print("⏳ Init RWKV-7 CUDA Kernel...")
+        self.CHUNK_LEN = 16
+
+        # 2. 初始化 CUDA Kernel
         init_rwkv7_cuda()
-        
+
         # 3. 构建并加载模型
         print("🏗️ Building CaMoE model...")
         self.model = CaMoE_System(self.config)
-        
-        if pretrained and os.path.exists(pretrained):
-            ckpt = checkpoint if checkpoint is not None else torch.load(pretrained, map_location='cpu', weights_only=False)
-            print(f"📦 Loading weights from {pretrained}...")
-            if isinstance(ckpt, dict) and 'model' in ckpt:
-                self.model.load_state_dict(ckpt['model'], strict=False)
-            else:
-                self.model.load_state_dict(ckpt, strict=False)
-            print("✅ Weights loaded!")
+        if checkpoint is not None:
+            state_dict = checkpoint.get("model", checkpoint)
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+                print("✅ Weights loaded (Strict)")
+            except Exception as e:
+                self.model.load_state_dict(state_dict, strict=False)
+                print(f"✅ Weights loaded (Non-Strict): {e}")
         else:
-            print("⚠️ No pretrained path or file not found, using random init")
-        
+            print("⚠️ Random initialization (No pretrained path)")
         self.model.to(self._device)
         self.model.eval()
-        
-        # 4. 加载 Tokenizer
-        vocab_file = vocab_file or self.config.get('vocab_file', 'tokenizer/rwkv_vocab_v20230424.txt')
-        if TRIE_TOKENIZER and os.path.exists(vocab_file):
-            self.tokenizer = TRIE_TOKENIZER(vocab_file)
-            print(f"✅ Loaded TRIE_TOKENIZER from {vocab_file}")
-        else:
-            raise RuntimeError(f"Tokenizer not found! vocab_file={vocab_file}")
-        
-        self.vocab_size = self.config['vocab_size']
+
+        # 4. Tokenizer：v18 优先 Rust，否则 Python TRIE
+        self.vocab_size = self.config["vocab_size"]
         self._eot_token_id = 0
-        self._pad_token_id = 0 # 用于 Batch Padding
-    
+        self._pad_token_id = 0
+
+        if RUST_TOKENIZER_AVAILABLE:
+            print("✅ Using Rust RWKV Tokenizer")
+            self.tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
+            self.is_rust_tokenizer = True
+        elif TRIE_TOKENIZER:
+            vocab_path = vocab_file or self.config.get("vocab_file", "tokenizer/rwkv_vocab_v20230424.txt")
+            if os.path.exists(vocab_path):
+                print(f"✅ Using Python Trie Tokenizer ({vocab_path})")
+                self.tokenizer = TRIE_TOKENIZER(vocab_path)
+                self.is_rust_tokenizer = False
+            else:
+                raise RuntimeError(f"Vocab file not found: {vocab_path}")
+        else:
+            raise RuntimeError("No tokenizer available (install pyrwkv-tokenizer or check path)")
+
     # ============ 必需属性 ============
     @property
     def eot_token_id(self) -> int:
         return self._eot_token_id
-    
+
     @property
     def max_gen_toks(self) -> int:
         return 256
-    
+
     @property
     def batch_size(self) -> int:
         return self._batch_size
-    
+
     @property
     def device(self) -> torch.device:
         return self._device
-    
+
     @property
     def max_length(self) -> int:
         return self._max_length
-    
+
     # ============ Tokenizer 辅助 ============
     def tok_encode(self, string: str, add_special_tokens: bool = False) -> List[int]:
-        ids = self.tokenizer.encode(string)
-        # 修复空串报错刷屏问题
-        if len(ids) == 0:
-            if string and string.strip(): # 只有当字符串非空且有内容时才警告
-                 print(f"⚠️ Warning: Empty encoding for string: '{string}'")
-        return ids
-    
+        if not string:
+            return []
+        if self.is_rust_tokenizer:
+            return self.tokenizer.encode(string)
+        return self.tokenizer.encode(string)
+
     def tok_decode(self, tokens: List[int]) -> str:
+        if self.is_rust_tokenizer:
+            return self.tokenizer.decode(tokens)
         return self.tokenizer.decode(tokens)
-    
+
     # ============ 模型前向辅助 ============
     def _pad_to_chunk(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """将 input_ids pad 到 16 的倍数 (RWKV Kernel 要求)"""
         B, T = input_ids.shape
         if T % self.CHUNK_LEN == 0:
             return input_ids, 0
         pad_len = self.CHUNK_LEN - (T % self.CHUNK_LEN)
-        padding = torch.full((B, pad_len), self._pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
+        padding = torch.zeros((B, pad_len), dtype=input_ids.dtype, device=input_ids.device)
         return torch.cat([input_ids, padding], dim=1), pad_len
-    
+
     def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass，返回 logits [B, T, V]"""
+        """Forward，返回 logits [B, T, V]。v18 推理：step=30000, phase=normal"""
         B, T = input_ids.shape
         padded_ids, pad_len = self._pad_to_chunk(input_ids)
-        
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
-                # 调用模型
-                logits, _ = self.model(padded_ids, step=0, phase="normal")
-        
-        # 切除 Padding 部分
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+                logits, _ = self.model(padded_ids, step=30000, phase="normal")
         if pad_len > 0:
             logits = logits[:, :T, :]
         return logits

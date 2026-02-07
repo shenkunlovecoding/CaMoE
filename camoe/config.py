@@ -37,7 +37,7 @@ CONFIG_04B = {
     "num_rwkv_experts": 6,
     "num_trans_experts": 2,
     "top_k": 2,  # Top-2 路由
-    "prefix_len": 64,
+    "prefix_len": 48,
     "low_rank_dim": 64,  # Bridge 低秩维度
     
     # ===== Market 参数 =====

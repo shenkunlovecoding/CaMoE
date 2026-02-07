@@ -30,8 +30,8 @@ except ImportError:
 
 # ================= 配置 =================
 # [请确认] 模型路径
-MODEL_PATH = "checkpoints/v18-pilot-1/v12_final.pth" # 你的 Pilot 路径
-SCALE = "0.1b"  # "0.4b" or "pilot" or "0.1b"
+MODEL_PATH = "checkpoints/v18_0.4b/v18_deploy.pth" # 你的 Pilot 路径
+SCALE = "0.4b"  # "0.4b" or "pilot" or "0.1b"
 DEVICE = "cuda"
 
 # ================= 加载逻辑 =================
@@ -103,7 +103,23 @@ def sample_top_p(probs, p, temperature):
     
     return torch.multinomial(probs, 1)
 
-def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0.9):
+
+def apply_repetition_penalty(logits, context_ids, penalty=1.2):
+    """对出现在 context 中的 token 的 logit 施加惩罚，减轻重复生成。logits: [B, V], context_ids: [B, Seq]"""
+    if penalty == 1.0:
+        return logits
+    score = torch.gather(logits, 1, context_ids)
+    score = torch.where(score < 0, score * penalty, score / penalty)
+    logits.scatter_(1, context_ids, score)
+    return logits
+
+
+def format_prompt(user_input):
+    """对话式 prompt 包装"""
+    return f"User: {user_input}\n\nAssistant:"
+
+
+def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.9, repetition_penalty=1.2):
     # Tokenize
     if RUST_TOKENIZER:
         input_ids = tokenizer.encode(prompt)
@@ -144,7 +160,9 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
             
             # Sampling
             target_idx = curr_x.shape[1] - 1
-            next_token_logits = logits[:, target_idx, :]
+            next_token_logits = logits[:, target_idx, :].clone()
+            # 重复惩罚：对已出现在 x 中的 token 降权
+            apply_repetition_penalty(next_token_logits, x, penalty=repetition_penalty)
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = sample_top_p(probs, top_p, temperature)
             
@@ -214,12 +232,9 @@ def generate_and_visualize(prompt, max_new_tokens=200, temperature=0.85, top_p=0
 
 # ================= 测试 =================
 prompts = [
-    "Once upon a time, there was a little girl named Lily. She loved to",
-    "The capital of France is Paris, but the capital of Japan is",
-    "If x = 5 and y = 3, then x + y equals",
-    "To make a sandwich, first you need bread. Then, you put",
-    "Alice: Hello, how are you? Bob: I am fine, thank you. Alice:",
-    "One day, a big lion saw a small mouse. The lion wanted to eat the mouse, but the mouse said,",
+    "Once upon a time, there was a little girl named Lily.",  # Story 模式不用包
+    format_prompt("The capital of France is Paris, but the capital of Japan is"),
+    format_prompt("If x = 5 and y = 3, then x + y equals"),
 ]
 
 if __name__ == "__main__":
