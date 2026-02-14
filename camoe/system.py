@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from typing import Dict, Tuple, List
 from torch.utils.checkpoint import checkpoint
 
-from .backbone import RWKV7_TimeMix
+from .backbone import RWKV7_TimeMix, DeepEmbedAttention
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
@@ -40,6 +40,16 @@ class CaMoE_Block(nn.Module):
         # RWKV-7 TimeMix (Backbone)
         self.att = RWKV7_TimeMix(n_embd, n_layer, layer_id, head_size)
         
+        # DeepEmbedAttention (v18.5-test): 与 TimeMix 并行的因果 Attention 分支
+        self.use_deep_embed_attention = config.get("use_deep_embed_attention", False)
+        vocab_size = config.get("vocab_size", 65536)
+        if self.use_deep_embed_attention:
+            self.dea = DeepEmbedAttention(
+                n_embd, n_layer, layer_id, head_size, vocab_size
+            )
+        else:
+            self.dea = None
+        
         # 专家组
         self.experts = nn.ModuleList()
         
@@ -63,13 +73,20 @@ class CaMoE_Block(nn.Module):
                 step: int,
                 warmup_steps: int,
                 use_market: bool = True,
-                training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+                training: bool = True,
+                idx: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         
         B, T, C = x.shape
         
         # 1. TimeMix (Backbone)
         att_out, v_first, rwkv_state = self.att(self.ln1(x), v_first)
         x = x + att_out
+        
+        # 1b. DeepEmbedAttention 分支 (v18.5-test)
+        if self.dea is not None and idx is not None:
+            dea_out = self.dea(self.ln1(x), idx)
+            x = x + dea_out
+        
         h = self.ln2(x)
         
         # 2. 计算所有专家的 Confidence
@@ -213,13 +230,13 @@ class CaMoE_System(nn.Module):
                 x, v_first, info = checkpoint(
                     block, 
                     x, v_first, shares, self.router, 
-                    step, warmup_steps, use_market, True, # training=True
+                    step, warmup_steps, use_market, True, idx,
                     use_reentrant=False
                 )
             else:
                 x, v_first, info = block(
                     x, v_first, shares, self.router,
-                    step, warmup_steps, use_market, self.training
+                    step, warmup_steps, use_market, self.training, idx
                 )
             
             all_info["winners"].append(info["winners"].detach())

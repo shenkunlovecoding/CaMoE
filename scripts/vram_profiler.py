@@ -7,26 +7,28 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from CaMoE.system import CaMoE_System
-from CaMoE.config import * # 导入 v18 配置
+from CaMoE.config import get_config
 
 def profile_vram(scale="0.4b"):
-    print(f"\n🚀 Profiling CaMoE v18 [{scale.upper()}] ...")
-    
-    # 选择配置
-    base_config = CONFIG_PILOT if scale == "0.4b" else CONFIG_01B
-    config = base_config.copy()
-    
+    config = get_config(scale).copy()
+    version = config.get("version", "?")
+    use_dea = config.get("use_deep_embed_attention", False)
+    print(f"\n🚀 Profiling CaMoE {version} [{scale.upper()}] ...")
+    if use_dea:
+        print("   (含 DeepEmbedAttention 分支，显存较无 DEA 更高)")
+
     # 强制修改一些可能影响显存的参数以进行压力测试
     # config['micro_batch_size'] = 6  # 可以在这里覆盖测试
     # config['ctx_len'] = 1024
-    
+
     device = "cuda"
     if not torch.cuda.is_available():
         print("❌ No CUDA device found!")
         return
 
     print(f"⚙️ Config: Batch={config['micro_batch_size']}, Ctx={config['ctx_len']}, "
-          f"Experts={config['num_rwkv_experts']}R+{config['num_trans_experts']}T (Top-{config['top_k']})")
+          f"Experts={config['num_rwkv_experts']}R+{config['num_trans_experts']}T (Top-{config['top_k']})"
+          f"{', DEA=ON' if use_dea else ''}")
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()

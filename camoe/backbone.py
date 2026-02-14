@@ -246,3 +246,100 @@ class RWKV7_TimeMix(nn.Module):
         out = self.output(x_att * g)
         
         return out, v_first , state_representation
+
+
+# ==================== DeepEmbed + DeepEmbedAttention (from RWKV-7 Goose) ====================
+# 思想：用「词表级」嵌入对 K/V 做逐 token 调制，并增加一条因果 Self-Attention 分支（Q/K/V token-shift + soft-cap）
+
+
+class DeepEmbedAttention(nn.Module):
+    """
+    DeepEmbedAttention (DEA)：与 TimeMix 并行的因果 Self-Attention 分支。
+    - Q/K/V 经 DeepEmbed（k_emb, v_emb 按 token id 查表）调制
+    - Q/K/V 做 token-shift（与上一位置混合）
+    - 使用 soft-cap: 64 * tanh(scores / 1024) 再 softmax
+    """
+    
+    def __init__(self, n_embd: int, n_layer: int, layer_id: int, head_size: int, vocab_size: int):
+        super().__init__()
+        self.layer_id = layer_id
+        self.n_embd = n_embd
+        self.n_head = n_embd // head_size
+        self.head_size = head_size
+        C = n_embd
+        H = self.n_head
+        
+        # Q/K/V 投影
+        self.qq = nn.Linear(C, C, bias=False)
+        self.k1 = nn.Linear(C, C, bias=False)
+        self.k2 = nn.Linear(C, C, bias=False)
+        self.v1 = nn.Linear(C, C, bias=False)
+        self.v2 = nn.Linear(C, C, bias=False)
+        
+        # DeepEmbed：按 token id 查表，调制 K/V
+        self.k_emb = nn.Parameter(torch.zeros(vocab_size, C))
+        self.v_emb = nn.Parameter(torch.zeros(vocab_size, C))
+        nn.init.normal_(self.k_emb, std=0.02)
+        nn.init.normal_(self.v_emb, std=0.02)
+        
+        # Token-shift 系数（与 backbone time_shift 类似）
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / max(n_layer, 1))
+            ddd = torch.ones(1, 1, C)
+            for i in range(C):
+                ddd[0, 0, i] = i / max(C - 1, 1)
+            self.x_q = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+            self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+        
+        self.ln_q = nn.LayerNorm(C)
+        self.ln_k = nn.LayerNorm(C)
+        self.ln_v = nn.LayerNorm(C)
+        
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        
+        with torch.no_grad():
+            self.qq.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
+            self.k1.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.k2.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.v1.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.v2.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+    
+    def forward(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, C), idx: (B, T) token ids
+        return: (B, T, C) DEA 分支输出
+        """
+        B, T, C = x.shape
+        # Q
+        q = self.qq(x)
+        q_prev = self.time_shift(q) - q
+        q = q + q_prev * self.x_q
+        q = self.ln_q(q)
+        
+        # K: k1 -> k2 -> * k_emb[idx]
+        k = self.k1(x)
+        k = self.k2(k) * self.k_emb[idx]
+        k_prev = self.time_shift(k) - k
+        k = k + k_prev * self.x_k
+        k = self.ln_k(k)
+        
+        # V: v1 -> v2 -> tanh -> * v_emb[idx]
+        v = self.v1(x)
+        v = torch.tanh(self.v2(v)) * self.v_emb[idx]
+        v_prev = self.time_shift(v) - v
+        v = v + v_prev * self.x_v
+        v = self.ln_v(v)
+        
+        # Causal self-attention with soft-cap (from temp.py)
+        scale = 1024.0
+        cap_scale = 64.0
+        scores = (q @ k.transpose(-2, -1)) / scale
+        scores = cap_scale * torch.tanh(scores)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+        )
+        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+        attn = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        out = attn @ v
+        return out

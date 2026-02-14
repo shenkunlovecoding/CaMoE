@@ -6,9 +6,9 @@ from .config_pilot import CONFIG_PILOT
 # ==========================================
 # 版本控制
 # ==========================================
-VERSION = "v18"
+VERSION = "v18.5-test"
 SCALE = "0.4b"  # "0.1b" or "0.4b"
-VARIANT = "6R2T-Top2"  # 架构变体描述
+VARIANT = "6R2T-Top2-DEA"  # 架构变体：含 DeepEmbed + DeepEmbedAttention
 
 # ==========================================
 # 自动生成的标识符
@@ -32,6 +32,7 @@ CONFIG_04B = {
     "head_size": 64,
     "vocab_size": 65536,  
     "tied_embeddings": True,  # 共享 Input/Output Embedding
+    "use_deep_embed_attention": True,  # v18.5-test: DeepEmbed + DEA 分支
     
     # ===== CaMoE 专家配置 (6R2T) =====
     "num_rwkv_experts": 6,
@@ -46,7 +47,7 @@ CONFIG_04B = {
     "tax_threshold": 2.0,
     "tax_rate": 0.1,
     
-    # ===== 训练参数 (RTX 5090 32GB) =====
+    # ===== 训练参数 (RTX 5090 32GB；开启 DEA 时显存略增，可酌情微调 micro_batch_size) =====
     "micro_batch_size": 6,
     "ctx_len": 1024,
     "grad_accum": 8,  # 有效 batch = 48
