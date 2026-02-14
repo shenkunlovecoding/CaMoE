@@ -1,6 +1,6 @@
 """
-RWKV-7 TimeMix Backbone
-完整实现，从S提供的代码适配
+RWKV-7 TimeMix Backbone (Turbo Edition with ClampW Kernel)
+支持 BF16 原生加速
 """
 
 import torch
@@ -23,79 +23,80 @@ def init_rwkv7_cuda():
         curr_dir = os.path.dirname(os.path.abspath(__file__))
         cuda_dir = os.path.join(curr_dir, 'cuda')
         
-        cu_file = os.path.join(cuda_dir, 'wkv7_cuda_fp32.cu')
-        cpp_file = os.path.join(cuda_dir, 'wkv7_op_fp32.cpp')
+        # 新文件名
+        cu_file = os.path.join(cuda_dir, 'rwkv7_clampw.cu')
+        cpp_file = os.path.join(cuda_dir, 'rwkv7_clampw.cpp')
         
         if not (os.path.exists(cu_file) and os.path.exists(cpp_file)):
-            print(f"⚠️ CUDA files not found in {cuda_dir}")
+            print(f"⚠️ CUDA files not found: {cu_file}")
+            print("   Using Fallback (Slow FP32)...")
             return
         
+        # 编译标志：如果不加 -D_FP32_，默认就是 BF16
+        # 注意：HEAD_SIZE 和 CHUNK_LEN 依然要传
         flags = [
             '-res-usage', 
             f'-D_C_={HEAD_SIZE}', 
             f"-D_CHUNK_LEN_={CHUNK_LEN}", 
             "--use_fast_math", 
             "-O3", 
+            "-Xptxas -O3", 
             "--extra-device-vectorization"
         ]
         
         load(
-            name="wind_backstepping", 
+            name="rwkv7_clampw", 
             sources=[cu_file, cpp_file], 
             is_python_module=False, 
             verbose=True, 
             extra_cuda_cflags=flags
         )
         
-        class WindBackstepping(torch.autograd.Function):
+        class RWKV7_ClampW(torch.autograd.Function):
             @staticmethod
-            def forward(ctx, w, q, k, v, z, b):
-                B, T, H, C = w.shape
-                assert T % CHUNK_LEN == 0, f"T={T} must be divisible by CHUNK_LEN={CHUNK_LEN}"
+            def forward(ctx, r, w, k, v, a, b):
+                B, T, H, C = r.shape
+                assert T % CHUNK_LEN == 0
                 
+                # 创建输出和状态张量
+                # 注意：BF16 Kernel 要求输入输出是 BF16/FP16，但 State 是 FP32
                 y = torch.empty_like(v)
-                s = torch.empty(B, H, T//CHUNK_LEN, C, C, dtype=torch.float32, device=w.device)
-                sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
-                torch.ops.wind_backstepping.forward(w, q, k, v, z, b, y, s, sa)
-                ctx.save_for_backward(w, q, k, v, z, b, s, sa)
+                s = torch.empty(B, H, T//CHUNK_LEN, C, C, dtype=torch.float32, device=r.device)
+                sa = torch.empty(B, T, H, C, dtype=torch.float32, device=r.device)
+                
+                torch.ops.rwkv7_clampw.forward(r, w, k, v, a, b, y, s, sa)
+                ctx.save_for_backward(r, w, k, v, a, b, s, sa)
                 return y
             
             @staticmethod
             def backward(ctx, dy):
-                w, q, k, v, z, b, s, sa = ctx.saved_tensors
-                dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
-                torch.ops.wind_backstepping.backward(w, q, k, v, z, b, dy, s, sa, dw, dq, dk, dv, dz, db)
-                return dw, dq, dk, dv, dz, db
+                r, w, k, v, a, b, s, sa = ctx.saved_tensors
+                dr, dw, dk, dv, da, db = [torch.empty_like(x) for x in [r, w, k, v, a, b]]
+                torch.ops.rwkv7_clampw.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
+                return dr, dw, dk, dv, da, db
         
-        def _run_cuda(q, w, k, v, a, b):
-            B, T, HC = q.shape
+        def _run_cuda(r, w, k, v, a, b):
+            B, T, HC = r.shape
             H = HC // HEAD_SIZE
             
-            # Kernel需要FP32
-            orig_dtype = q.dtype
-            q, w, k, v, a, b = [
-                x.float().contiguous().view(B, T, H, HEAD_SIZE) 
-                for x in [q, w, k, v, a, b]
+            # View 变换
+            # 关键改动：不再强制转 .float() (FP32)
+            # 保持原有的 dtype (BF16)，只做 contiguous 和 view
+            r, w, k, v, a, b = [
+                x.contiguous().view(B, T, H, HEAD_SIZE) 
+                for x in [r, w, k, v, a, b]
             ]
             
-            out = WindBackstepping.apply(w, q, k, v, a, b)
+            out = RWKV7_ClampW.apply(r, w, k, v, a, b)
             out = out.view(B, T, HC)
-            
-            # 转回原dtype
-            if orig_dtype != torch.float32:
-                out = out.to(orig_dtype)
-            
             return out
         
         RUN_CUDA_RWKV7 = _run_cuda
         USE_CUDA = True
-        print("✅ RWKV-7 CUDA Kernel Ready")
+        print("✅ RWKV-7 CUDA Kernel (ClampW + BF16) Ready")
         
     except Exception as e:
         print(f"⚠️ CUDA init failed: {e}")
-        print("   Using fallback (slower)")
-
-
 
 
 # ==================== RWKV-7 TimeMix ====================
@@ -229,11 +230,10 @@ class RWKV7_TimeMix(nn.Module):
         k = k * (1 + (a - 1) * self.k_a)
         
         # RWKV-7 动态状态演化
-        if USE_CUDA and RUN_CUDA_RWKV7 is not None:
-            x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
-        else:
-            # Fallback: 简化版本
-            x_att = v
+        assert USE_CUDA and RUN_CUDA_RWKV7 is not None
+        x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+        
+            
         state_representation = x_att.clone() 
         x_att = self.ln_x(x_att.view(B * T, C)).view(B, T, C)
         

@@ -1,109 +1,184 @@
 """
-Preprocess Script for CaMoE v18 (Rust RWKV Tokenizer)
-支持本地文件 (json/txt/csv) 和 HF 在线数据集
+CaMoE v18 Data Preprocessor (Ultimate Edition)
+功能:
+1. 加载多个数据源 (TinyStories, Ultrachat, Cosmo, MiniPile)
+2. 清洗 & 格式化 (User/Assistant)
+3. 采样 & 混合 (Interleave)
+4. Tokenize & Packing (Rust RWKV Tokenizer)
+5. 保存为单一数据集，供 train.py 直接读取
 """
+
 import os
 import argparse
-from datasets import load_dataset
-import pyrwkv_tokenizer 
+import multiprocessing
+from datasets import load_dataset, concatenate_datasets, interleave_datasets
+import pyrwkv_tokenizer
+
+# ================= 配置 =================
+# 定义你的配方 (Recipe)
+# 格式: "name": (path_or_id, split, mode, probability)
+# mode: "raw" (纯文本) 或 "chat" (对话)
+DATA_RECIPE = {
+    "tinystories": ("roneneldan/TinyStories", "train[:10%]", "raw", 0.4), # 取10%
+    "cosmopedia":  ("HuggingFaceTB/cosmopedia-100k", "train", "raw", 0.3), # 全量
+    "ultrachat":   ("openbmb/ultrachat", "train[:5%]", "chat", 0.2), # 取5% (约几万条)
+    "dailydialog": ("roskoN/dailydialog", "train", "chat", 0.1),
+}
+
+# 如果 Ultrachat 还是那个 list 格式，我们需要特殊处理
+# 这里假设 Ultrachat 是标准的 HF 格式
 
 def get_args():
     parser = argparse.ArgumentParser()
-    # 支持本地路径或 HF ID
-    parser.add_argument("--dataset", type=str, required=True, 
-                        help="Path to local file (.json/.txt) or HF Dataset ID")
-    parser.add_argument("--save_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, default="./data/camoe_mix_v1", help="保存路径")
     parser.add_argument("--ctx_len", type=int, default=1024)
-    parser.add_argument("--num_proc", type=int, default=16)
-    
-    # 显式指定文本列名 (可选)
-    parser.add_argument("--text_col", type=str, default=None)
+    parser.add_argument("--num_proc", type=int, default=4, help="并行进程数，内存小设为2-4")
+    parser.add_argument("--batch_size", type=int, default=100, help="Tokenize批次大小，内存小设为50")
     return parser.parse_args()
 
-def process_batch(batch, text_col=None):
-    tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
+def process_text(item, mode="raw"):
+    """清洗与格式化"""
+    text = ""
     
-    if text_col is None:
-        keys = batch.keys()
-        if "text" in keys: text_col = "text"
-        elif "content" in keys: text_col = "content"
-        elif "dialog" in keys: text_col = "dialog"
-        else: text_col = list(keys)[0]
+    # 1. 尝试获取内容
+    # Ultrachat: 'data' (list)
+    # DailyDialog: 'dialog' (list)
+    # TinyStories/Cosmo: 'text' (str)
     
-    raw_data = batch[text_col]
+    raw = None
+    if 'text' in item: raw = item['text']
+    elif 'data' in item: raw = item['data']
+    elif 'dialog' in item: raw = item['dialog']
     
-    texts = []
-    for item in raw_data:
-        if isinstance(item, str):
-            # DailyDialog 修复: 替换 __eou__ 为换行
-            clean_text = item.replace(" __eou__ ", "\n").replace("__eou__", "\n").strip()
-            texts.append(clean_text)
-        elif isinstance(item, list):
-            texts.append("\n".join(str(x) for x in item))
-        else:
-            texts.append(str(item))
+    if raw is None: return ""
+
+    # 2. 格式化
+    if isinstance(raw, list):
+        # 对话列表 -> Chat 格式
+        conversation = []
+        for i, turn in enumerate(raw):
+            if not turn: continue
+            content = str(turn).strip().replace('\r\n', '\n')
+            import re
+            content = re.sub(r'\n{2,}', '\n', content) # 去除多余换行
             
+            if mode == "chat":
+                # 自动加 User/Assistant
+                if not (content.startswith("User:") or content.startswith("Assistant:")):
+                    role = "User" if i % 2 == 0 else "Assistant"
+                    content = f"{role}: {content}"
+            
+            conversation.append(content)
+        text = "\n\n".join(conversation)
+        
+    elif isinstance(raw, str):
+        # 纯文本
+        text = raw.strip().replace(" __eou__ ", "\n")
+        if mode == "chat":
+            # 如果是 Chat 模式但原始是文本，尝试转换(简易版)
+            pass 
+            
+    return text
+
+# 全局 Tokenizer (Worker 用)
+tokenizer = None
+def init_tokenizer():
+    global tokenizer
+    tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
+
+def tokenize_and_pack(batch, ctx_len=1024):
+    global tokenizer
+    texts = batch['text_processed']
     if not texts: return {"input_ids": []}
     
-    encoded_batch = tokenizer.encode_batch(texts)
-    
-    flat_ids = []
-    for ids in encoded_batch:
-        flat_ids.extend(ids)
-        flat_ids.append(0) # EOS
-        
+    # 流式处理：边tokenize边pack，不缓存全部token
     chunks = []
-    CTX_LEN = 1024
-    for i in range(0, len(flat_ids), CTX_LEN):
-        chunk = flat_ids[i:i+CTX_LEN]
-        if len(chunk) == CTX_LEN:
-            chunks.append(chunk)
-            
+    current_chunk = []
+    
+    for text in texts:
+        ids = tokenizer.encode(text)
+        ids.append(0)  # EOS
+        
+        for token in ids:
+            current_chunk.append(token)
+            if len(current_chunk) == ctx_len:
+                chunks.append(current_chunk)
+                current_chunk = []
+        
+        # 内存保护：限制缓存chunk数量
+        if len(chunks) > 10000:
+            break
+    
+    # 丢弃尾部不足ctx_len的token
     return {"input_ids": chunks}
 
 def main():
     args = get_args()
-    print(f"🚀 Processing: {args.dataset}")
+    print(f"🚀 Preparing Mixed Dataset -> {args.save_path}")
     
-    # 1. 智能加载逻辑
-    # 检查是否是本地文件
-    if os.path.exists(args.dataset):
-        ext = args.dataset.split('.')[-1]
-        if ext in ['json', 'jsonl']:
-            print("📂 Detected Local JSON/JSONL file")
-            ds = load_dataset("json", data_files=args.dataset, split="train")
-        elif ext == 'txt':
-            print("📂 Detected Local TXT file")
-            ds = load_dataset("text", data_files=args.dataset, split="train")
-        elif os.path.isdir(args.dataset):
-             print("📂 Detected Local Dataset Folder (Arrow/HF format)")
-             from datasets import load_from_disk
-             ds = load_from_disk(args.dataset)
-        else:
-            # 尝试作为 CSV
-            ds = load_dataset("csv", data_files=args.dataset, split="train")
-    else:
-        # 假设是 HF Hub ID
-        print("☁️  Loading from HF Hub...")
-        # 即使这里不加 trust_remote_code，对于标准 dataset (text, json) 也没问题
-        # 如果是特殊 script dataset，可能还会挂，但我们主要用 json/text
-        ds = load_dataset(args.dataset, split="train", trust_remote_code=True)
+    datasets = []
+    probs = []
+    
+    # 1. 加载并标准化所有源
+    for name, (path, split, mode, prob) in DATA_RECIPE.items():
+        print(f"  - Loading {name} ({split})...")
+        try:
+            ds = load_dataset(path, split=split, trust_remote_code=True)
+            
+            # Map: 统一转成 text_processed 列
+            # 这里我们用单进程 map 快速处理文本格式化，或者多进程
+            ds = ds.map(
+                lambda x: {"text_processed": process_text(x, mode)},
+                remove_columns=ds.column_names, # 移除原始列，只留 text_processed
+                num_proc=args.num_proc,
+                desc=f"Formatting {name}"
+            )
+            
+            # 过滤空样本
+            ds = ds.filter(lambda x: len(x['text_processed']) > 0)
+            
+            datasets.append(ds)
+            probs.append(prob)
+            print(f"    -> {len(ds)} samples ready.")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load {name}: {e}")
+    
+    if not datasets:
+        print("❌ No datasets loaded!")
+        return
 
-    print(f"📊 Rows: {len(ds)}")
+    # 2. 混合 (Interleave)
+    # 归一化概率
+    total_p = sum(probs)
+    probs = [p/total_p for p in probs]
     
-    # 2. Map 处理
-    # 使用 lambda 传入 text_col 参数
-    tokenized_ds = ds.map(
-        lambda x: process_batch(x, args.text_col),
+    print(f"🥣 Mixing datasets with probs: {probs}...")
+    mixed_ds = interleave_datasets(datasets, probabilities=probs, seed=42, stopping_strategy="first_exhausted")
+    # 注意：first_exhausted 可能会丢弃大及其数据，all_exhausted 会过采样小数据
+    # 对于预训练，通常用 probabilities 采样即可，不用太在意 epoch 边界
+    # 如果想“存下来”，建议用 stopping_strategy="first_exhausted" 然后设个 limit?
+    # 或者直接由 map 处理时就是流式的。
+    
+    # 这里的 mixed_ds 是 Lazy 的。
+    
+    # 3. Tokenize & Pack (最终处理)
+    print("⚙️  Tokenizing & Packing (This will take a while)...")
+    final_ds = mixed_ds.map(
+        lambda x: tokenize_and_pack(x, args.ctx_len),
         batched=True,
-        batch_size=1000,
+        batch_size=args.batch_size,
         num_proc=args.num_proc,
-        remove_columns=ds.column_names,
-        desc="Tokenizing"
+        remove_columns=["text_processed"],
+        desc="Final Packing"
     )
     
-    tokenized_ds.save_to_disk(args.save_path)
-    print(f"✅ Saved to {args.save_path}")
+    # 4. 保存
+    print(f"💾 Saving to disk...")
+    final_ds.save_to_disk(args.save_path)
+    
+    total_tokens = len(final_ds) * args.ctx_len
+    print(f"✅ Done! Total Tokens: {total_tokens / 1e9:.4f} B")
 
 if __name__ == "__main__":
     main()

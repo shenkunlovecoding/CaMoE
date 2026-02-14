@@ -173,8 +173,9 @@ def main():
 
             total_p = sum(probs)
             probs = [p / total_p for p in probs]
-            train_data = interleave_datasets(train_datasets, probabilities=probs, seed=42,stopping_strategy="all_exhausted")
-            val_data = interleave_datasets(val_datasets, probabilities=probs, seed=42,stopping_strategy="all_exhausted")
+            train_data = interleave_datasets(train_datasets, probabilities=probs, seed=42, stopping_strategy="all_exhausted")
+            # 验证集使用 first_exhausted 并增加循环次数，避免数据过早耗尽
+            val_data = interleave_datasets(val_datasets, probabilities=probs, seed=42, stopping_strategy="first_exhausted")
             print(f"📊 Mix: {dict(zip(loaded_names, probs))} → Train={len(train_data)}, Val={len(val_data)}")
         else:
             # 单数据集
@@ -304,29 +305,37 @@ def main():
     def estimate_loss(model, loader, eval_steps):
         model.eval()
         losses = []
-        val_iter = iter(loader)
         
-        for _ in range(eval_steps):
-            try:
-                batch = next(val_iter)
-            except StopIteration:
-                val_iter = iter(loader)
-                batch = next(val_iter)
+        # 使用 itertools.cycle 无限循环验证集，避免 StopIteration
+        from itertools import cycle
+        
+        for i, batch in enumerate(cycle(loader)):
+            if i >= eval_steps:
+                break
             
             batch = batch.to(device)
-            if batch.shape[1] <= 1: continue
+            if batch.shape[1] <= 1: 
+                continue
             
             x, y = batch[:, :-1], batch[:, 1:]
             
             # Eval 时使用 Normal 模式，测试全系统
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits, info = model(x, step=100000, phase="normal") # 这里的 step 传大一点确保触发 market
+                logits, info = model(x, step=100000, phase="normal")
                 # 只算 Main Loss
                 loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
             
             losses.append(loss.item())
+            
+            # 安全检查：如果损失为 NaN 或 Inf，立即报告
+            if not torch.isfinite(torch.tensor(loss.item())):
+                print(f"⚠️ Invalid loss detected at eval step {i}: {loss.item()}")
+                continue
         
         model.train()
+        if len(losses) == 0:
+            print("⚠️ Warning: No valid losses collected during evaluation!")
+            return float('inf')
         return sum(losses) / len(losses)
 
     print(f"📊 Model params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")

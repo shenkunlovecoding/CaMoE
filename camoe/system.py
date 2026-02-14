@@ -1,21 +1,23 @@
 """
-CaMoE v18 主系统
-Fixes:
-1. 移除 Eureka 残留
-2. 修复 LinearTransformerExpert 初始化参数 (移除 bridge)
+CaMoE v18 主系统 (Final Fix)
+Changes:
+1. 强制全程开启 Router (use_market=True)，拒绝随机路由。
+2. 修复 LinearTransformerExpert 初始化。
+3. 保持 Rescale Trick 和 GC。
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, List
+from torch.utils.checkpoint import checkpoint
 
 from .backbone import RWKV7_TimeMix
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
 from .market import CapitalManager, SparseRouter
-from torch.utils.checkpoint import checkpoint
+
 class CaMoE_Block(nn.Module):
     """
     单个 CaMoE 块 (支持 Top-2 混合输出)
@@ -48,7 +50,6 @@ class CaMoE_Block(nn.Module):
         # Transformer Experts
         n_head = n_embd // head_size
         for _ in range(self.num_trans):
-            # [Fix 2] 移除 bridge 参数，因为 Bridge 已经提到外部生成 Prefix 了
             self.experts.append(LinearTransformerExpert(n_embd, n_head))
         
         # Critic
@@ -75,9 +76,9 @@ class CaMoE_Block(nn.Module):
         conf_list = [exp.get_confidence(h) for exp in self.experts]
         confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
         
-        # 3. Market Routing
+        # 3. Market Routing (关键逻辑)
         if not use_market:
-            # Inference: 随机 Top-2
+            # 只有在极罕见的 Debug 模式下才用随机，训练时严禁进入此分支！
             winners = torch.randint(0, self.num_experts, (B, T, 2), device=x.device)
             weights = torch.ones(B, T, 2, device=x.device) * 0.5
             costs = torch.zeros(B, T, device=x.device)
@@ -189,13 +190,16 @@ class CaMoE_System(nn.Module):
         )
         
         self.router = SparseRouter()
-        # [Fix 1] 移除 self.eureka 初始化
     
     def forward(self, idx: torch.Tensor, step: int = 0, 
                 phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
         x = self.emb(idx)
         v_first = None
-        use_market = (phase == "normal")
+        
+        # [CRITICAL FIX] 始终开启 Market Routing
+        # 即使在 Prewarm/Warmup，我们也需要 Router 选出最好的专家，让专家获得正确的梯度
+        # 资本的更新 (Update) 由 train.py 控制，这里只管路由 (Selection)
+        use_market = True 
         
         all_info = {
             "winners": [], "costs": [], "difficulties": [], "affinities": []
@@ -205,11 +209,11 @@ class CaMoE_System(nn.Module):
         for i, block in enumerate(self.blocks):
             shares = self.capital_manager.get_shares(i)
             if self.training:
-                # [Fix 1] 移除 self.eureka 参数传递
+                # 开启 Checkpoint 以节省显存
                 x, v_first, info = checkpoint(
                     block, 
                     x, v_first, shares, self.router, 
-                    step, warmup_steps, use_market, True, # True for training arg
+                    step, warmup_steps, use_market, True, # training=True
                     use_reentrant=False
                 )
             else:
@@ -225,26 +229,28 @@ class CaMoE_System(nn.Module):
         
         x = self.ln_out(x)
         
-        # Output
+        # Output (Tied Embedding Rescale Trick)
         if self.head is not None:
             logits = self.head(x)
         else:
-            x = x * (self.n_embd ** -0.5) # Rescale
-            logits = F.linear(x, self.emb.weight)  # Tied Embedding
+            #x = x * (self.n_embd ** -0.5) 
+            logits = F.linear(x, self.emb.weight)
         
         return logits, all_info
     
-    # ... (compute_losses, update_market 等方法保持不变)
     def compute_losses(self, logits, targets, all_info):
         B, T = targets.shape
         
+        # Main Loss
         main_loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
         
+        # Token Losses (for Market Update)
         with torch.no_grad():
             token_losses = F.cross_entropy(
                 logits.reshape(-1, self.vocab_size), targets.reshape(-1), reduction='none'
             ).reshape(B, T)
         
+        # Critic Loss
         critic_loss = 0.0
         for i, diff in enumerate(all_info.get("difficulties", [])):
             baseline = self.capital_manager.baseline_losses[i]
@@ -255,9 +261,7 @@ class CaMoE_System(nn.Module):
             critic_loss /= len(all_info["difficulties"])
 
         total_loss = main_loss + 0.1 * critic_loss
-        
-        # Bridge loss 已经移除，这里返回 0.0
-        bridge_loss = 0.0
+        bridge_loss = 0.0 # No longer used
         
         return total_loss, token_losses, main_loss, critic_loss, bridge_loss
     
@@ -277,6 +281,7 @@ class CaMoE_System(nn.Module):
                     token_losses, baseline
                 )
 
+                # Bailout logic
                 if self.blocks[i].critic.capital < 200:
                     self.blocks[i].critic.capital.fill_(2000.0)
                     if step % 100 == 0:

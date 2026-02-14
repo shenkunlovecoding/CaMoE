@@ -30,7 +30,7 @@ except ImportError:
 
 # ================= 配置 =================
 # [请确认] 模型路径
-MODEL_PATH = "checkpoints/v18_0.4b/v18_deploy.pth" # 你的 Pilot 路径
+MODEL_PATH = "checkpoints/v18_0.4b/v18_step10000.pth" # 你的 Pilot 路径
 SCALE = "0.4b"  # "0.4b" or "pilot" or "0.1b"
 DEVICE = "cuda"
 
@@ -116,7 +116,7 @@ def apply_repetition_penalty(logits, context_ids, penalty=1.2):
 
 def format_prompt(user_input):
     """对话式 prompt 包装"""
-    return f"User: {user_input}\n\nAssistant:"
+    return f"User: {user_input}\nAssistant:"
 
 
 def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.9, repetition_penalty=1.2):
@@ -239,4 +239,4 @@ prompts = [
 
 if __name__ == "__main__":
     for p in prompts:
-        generate_and_visualize(p)
+        generate_and_visualize(p,temperature=1.0,top_p=0.5,repetition_penalty=2)
