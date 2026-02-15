@@ -38,6 +38,10 @@ CONFIG_04B = {
     "dea_kv_dim": 32,  # RWKV-8 风格 DEA: k/v 低维缓存通道
     "dea_score_scale": 1024.0,
     "dea_cap_scale": 64.0,
+    # ROSA experimental branch (default off)
+    "use_rosa": False,
+    "rosa_num_streams": 32,
+    "rosa_emb_dim": 64,
     
     # ===== CaMoE 专家配置 (6R2T) =====
     "num_rwkv_experts": 6,
@@ -74,20 +78,21 @@ CONFIG_04B = {
     
     # ===== 路径 (f-string 自动生成) =====
     # 单数据集时使用 data_path；混合时使用 data_roots + mix（课程学习手动 Resume 换阶段）
-    "data_path": "./data/minipile_processed",
+    "data_path": "./data/minipile_rwkv_processed",
     "data_roots": {
-        "tinystories": "./data/tinystories_rwkv_processed",
-        "dialog": "./data/dailydialog_rwkv_processed",
-        "chat": "./data/ultrachat_rwkv_processed",
+        "fineweb_edu": "./data/fineweb_edu_rwkv_processed",
         "minipile": "./data/minipile_rwkv_processed",
+        "cosmopedia": "./data/cosmopedia_rwkv_processed",
+        "ultrachat": "./data/ultrachat_rwkv_processed",
+        "tinystories": "./data/tinystories_rwkv_processed",
     },
-    # 混合比例：配置好后训练，到下一阶段改比例并 Resume 即可
-    # 不配置 mix 则使用 data_path 单数据集
+    # 方案A（均衡版）：总和=1.0
     "mix": {
-        "tinystories": 0.6,
-        "dialog": 0.2,
-        "chat" : 0.2,
-        "minipile": 0.0,
+        "fineweb_edu": 0.4,
+        "minipile": 0.2,
+        "ultrachat": 0.2,
+        "cosmopedia": 0.1,
+        "tinystories": 0.1,
     },
     "weights_path": f"model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
@@ -117,6 +122,9 @@ CONFIG_01B = {
     "dea_kv_dim": 32,
     "dea_score_scale": 1024.0,
     "dea_cap_scale": 64.0,
+    "use_rosa": False,
+    "rosa_num_streams": 32,
+    "rosa_emb_dim": 64,
     
     # ===== CaMoE 专家配置 (3R1T) =====
     "num_rwkv_experts": 3,

@@ -13,6 +13,7 @@ from typing import Dict, Tuple, List
 from torch.utils.checkpoint import checkpoint
 
 from .backbone import RWKV7_TimeMix, DeepEmbedAttention, SharedDeepEmbed
+from .rosa import ROSA1bitLayer
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
@@ -65,6 +66,17 @@ class CaMoE_Block(nn.Module):
             )
         else:
             self.dea = None
+
+        # ROSA experimental branch (optional)
+        self.use_rosa = config.get("use_rosa", False)
+        if self.use_rosa:
+            self.rosa = ROSA1bitLayer(
+                n_embd=n_embd,
+                num_streams=config.get("rosa_num_streams", 32),
+                rosa_emb_dim=config.get("rosa_emb_dim", 64),
+            )
+        else:
+            self.rosa = None
         
         # 专家组
         self.experts = nn.ModuleList()
@@ -116,11 +128,12 @@ class CaMoE_Block(nn.Module):
         # 1. TimeMix + DEA 并行分支（同一份 pre-norm 输入）
         x_ln = self.ln1(x)
         att_out, v_first, rwkv_state = self.att(x_ln, v_first)
+        rosa_out = self.rosa(x_ln) if self.rosa is not None else 0.0
         if self.dea is not None and idx is not None:
             dea_out = self.dea(x_ln, idx)
-            x = x + att_out + dea_out
+            x = x + att_out + dea_out + rosa_out
         else:
-            x = x + att_out
+            x = x + att_out + rosa_out
         
         h = self.ln2(x)
         

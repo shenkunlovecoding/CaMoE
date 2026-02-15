@@ -118,6 +118,7 @@ def apply_phase(model: CaMoE_System, optimizer, phase: str, config: Dict) -> Non
                 'capital' in n,
                 'dea' in n,
                 'deep_embed' in n,
+                'rosa' in n,
             ])
             p.requires_grad = should_train
         lr = config.get('lr_prewarm', 1e-4)
