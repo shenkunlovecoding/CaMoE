@@ -23,7 +23,7 @@ import pyrwkv_tokenizer
 DATA_RECIPE = {
     "tinystories": ("roneneldan/TinyStories", "train[:10%]", "raw", 0.4), # 取10%
     "cosmopedia":  ("HuggingFaceTB/cosmopedia-100k", "train", "raw", 0.3), # 全量
-    "ultrachat":   ("openbmb/ultrachat", "train[:5%]", "chat", 0.2), # 取5% (约几万条)
+    "ultrachat":   ("HuggingFaceH4/ultrachat_200k", "train_sft", "chat", 0.2),
     "dailydialog": ("roskoN/dailydialog", "train", "chat", 0.1),
 }
 
@@ -60,33 +60,61 @@ def process_text(item: Dict[str, Any], mode: str = "raw") -> str:
     text = ""
     
     # 1. 尝试获取内容
-    # Ultrachat: 'data' (list)
+    # Ultrachat 200k: 'messages' (list[{"role","content"}])
+    # Ultrachat(old): 'data' (list)
     # DailyDialog: 'dialog' (list)
     # TinyStories/Cosmo: 'text' (str)
     
     raw = None
-    if 'text' in item: raw = item['text']
-    elif 'data' in item: raw = item['data']
-    elif 'dialog' in item: raw = item['dialog']
+    if 'messages' in item:
+        raw = item['messages']
+    elif 'text' in item:
+        raw = item['text']
+    elif 'data' in item:
+        raw = item['data']
+    elif 'dialog' in item:
+        raw = item['dialog']
     
     if raw is None: return ""
 
     # 2. 格式化
     if isinstance(raw, list):
-        # 对话列表 -> Chat 格式
+        # 对话列表 -> Chat 格式（兼容 list[str] / list[dict]）
         conversation = []
         for i, turn in enumerate(raw):
-            if not turn: continue
-            content = str(turn).strip().replace('\r\n', '\n')
+            if not turn:
+                continue
+
+            role = None
+            content = None
+            if isinstance(turn, dict):
+                role = str(turn.get("role", "")).strip().lower()
+                content = str(turn.get("content", "")).strip()
+            else:
+                content = str(turn).strip()
+
+            if not content:
+                continue
+
+            content = content.replace('\r\n', '\n')
             content = re.sub(r'\n{2,}', '\n', content) # 去除多余换行
-            
+
             if mode == "chat":
-                # 自动加 User/Assistant
-                if not (content.startswith("User:") or content.startswith("Assistant:")):
-                    role = "User" if i % 2 == 0 else "Assistant"
-                    content = f"{role}: {content}"
-            
-            conversation.append(content)
+                if role in ("user", "assistant", "system"):
+                    if role == "system":
+                        # system 统一并入文本，但标注角色，便于模型感知
+                        line = f"System: {content}"
+                    elif role == "user":
+                        line = f"User: {content}"
+                    else:
+                        line = f"Assistant: {content}"
+                else:
+                    # 无角色时回退到交替规则
+                    guessed = "User" if i % 2 == 0 else "Assistant"
+                    line = f"{guessed}: {content}"
+                conversation.append(line)
+            else:
+                conversation.append(content)
         text = "\n\n".join(conversation)
         
     elif isinstance(raw, str):
