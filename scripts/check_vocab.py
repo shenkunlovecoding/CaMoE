@@ -4,7 +4,7 @@ import pyrwkv_tokenizer
 
 def check():
     # 1. 加载一个训练样本
-    ds = load_from_disk("./data/tinystories_rwkv_processed") # 你的数据路径
+    ds = load_from_disk("./data/camoe_toy_mix") # 你的数据路径
     sample_ids = ds[0]['input_ids'][:20] # 取前20个token
     
     # 2. 用 Rust Tokenizer 解码

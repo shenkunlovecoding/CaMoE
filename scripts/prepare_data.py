@@ -12,7 +12,8 @@ import os
 import argparse
 import multiprocessing
 from typing import Any, Dict
-from datasets import load_dataset, concatenate_datasets, interleave_datasets
+import re
+from datasets import load_dataset, interleave_datasets
 import pyrwkv_tokenizer
 
 # ================= 配置 =================
@@ -77,7 +78,6 @@ def process_text(item: Dict[str, Any], mode: str = "raw") -> str:
         for i, turn in enumerate(raw):
             if not turn: continue
             content = str(turn).strip().replace('\r\n', '\n')
-            import re
             content = re.sub(r'\n{2,}', '\n', content) # 去除多余换行
             
             if mode == "chat":
@@ -121,6 +121,10 @@ def tokenize_and_pack(batch: Dict[str, Any], ctx_len: int = 1024) -> Dict[str, A
       Dict[str, Any]: 包含 ``input_ids`` 列的新批次。
     """
     global tokenizer
+    if tokenizer is None:
+        # 在 datasets 的多进程 map worker 中做懒加载初始化，避免 NoneType.encode 报错
+        init_tokenizer()
+
     texts = batch['text_processed']
     if not texts: return {"input_ids": []}
     
@@ -160,7 +164,7 @@ def main() -> None:
     for name, (path, split, mode, prob) in DATA_RECIPE.items():
         print(f"  - Loading {name} ({split})...")
         try:
-            ds = load_dataset(path, split=split, trust_remote_code=True)
+            ds = load_dataset(path, split=split)
             
             # Map: 统一转成 text_processed 列
             # 这里我们用单进程 map 快速处理文本格式化，或者多进程

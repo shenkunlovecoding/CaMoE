@@ -7,8 +7,7 @@ import os
 import gc
 import time
 import argparse
-import re
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -170,7 +169,7 @@ def main() -> None:
     """
     init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
+    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b", "0.4b_toy"])
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
@@ -472,7 +471,7 @@ def main() -> None:
         
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, info = model(x, step=step, phase=phase)
-            total_loss, token_losses, main_loss, critic_loss ,bridge_loss = model.compute_losses(logits, y, info)
+            total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
             loss_to_backward = total_loss / config['grad_accum']
 
         loss_to_backward.backward()
@@ -498,14 +497,12 @@ def main() -> None:
             
             # 统计
             stats = model.log_market_health()
-            trans_share = stats.get("L0/TransShare", 0)
-            if isinstance(trans_share, torch.Tensor): trans_share = trans_share.item()
             
             # 打印 (瞬时 Loss)
             log_str = f"Step {step} | Loss: {main_loss.item():.3f}"
             if val_loss:
                 log_str += f" | ValLoss: {val_loss:.3f}"
-            log_str += f" | Trans%: {trans_share:.1f} | TPS: {tps:.0f} | [{phase.upper()}]"
+            log_str += f" | TPS: {tps:.0f} | [{phase.upper()}]"
             print(log_str)
             
             # SwanLab Log (关键修正：传入 step 参数)
@@ -513,7 +510,6 @@ def main() -> None:
                 logs = {
                     "Loss/Train_Main": main_loss.item(),
                     "Loss/Train_Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
-                    "Loss/Train_Bridge" : bridge_loss.item() if isinstance(bridge_loss, torch.Tensor) else bridge_loss,
                     "Speed/TPS": tps,
                     **stats
                 }

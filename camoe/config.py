@@ -95,6 +95,26 @@ CONFIG_04B = {
 }
 
 # ==========================================
+# 0.4B Toy 配置（快速验证流程）
+# ==========================================
+CONFIG_04B_TOY = {
+    **CONFIG_04B,
+    "scale": "0.4b_toy",
+    "run_name": f"Toy-0.4b-{VARIANT}-{VERSION}",
+    "micro_batch_size": 1,
+    "ctx_len": 512,
+    "grad_accum": 24,
+    "total_steps": 6000,
+    "prewarm_steps": 500,
+    "warmup_steps": 1500,
+    "eval_interval": 200,
+    "eval_iters": 20,
+    "data_path": "./data/camoe_toy_mix",
+    "mix": None,
+    "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
+}
+
+# ==========================================
 # 0.1B 规模配置 (测试/对照组)
 # ==========================================
 CONFIG_01B = {
@@ -170,6 +190,8 @@ CONFIG_01B = {
 def get_config(scale: str = "0.4b"):
     if scale == "0.4b":
         return CONFIG_04B
+    elif scale == "0.4b_toy":
+        return CONFIG_04B_TOY
     elif scale == "0.1b":
         return CONFIG_PILOT
     else:

@@ -394,16 +394,13 @@ class CaMoE_System(nn.Module):
     def log_market_health(self) -> Dict:
         r"""log_market_health() -> Dict
 
-        汇总若干关键层的市场健康指标。
+        汇总所有层的市场健康指标。
 
         Returns:
           Dict: 包含 RWKV/Transformer 份额、Gini、Critic 资本等指标。
         """
         metrics = {}
-        check_layers = [0, self.n_layer // 2, self.n_layer - 1]
-        check_layers = sorted(list(set([i for i in check_layers if i < self.n_layer])))
-
-        for i in check_layers:
+        for i in range(self.n_layer):
             caps = self.capital_manager.capitals[i]
             total_cap = caps.sum() + 1e-6
             
