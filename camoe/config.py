@@ -119,7 +119,7 @@ CONFIG_04B_TOY = {
     "cuda_use_fast_math": True,
     "cuda_force_fp32_kernel": False,
     "use_gradient_checkpoint": False,
-    "data_path": "./data/camoe_toy_mix",
+    "data_path": "./data/camoe_mix_v1",
     "mix": None,
     "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
 }
