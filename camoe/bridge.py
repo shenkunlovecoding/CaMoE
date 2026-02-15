@@ -9,7 +9,17 @@ import torch.nn.functional as F
 
 
 class UltimateBridge(nn.Module):
-    def __init__(self, n_embd: int, max_prefix_len: int = 64, low_rank_dim: int = 64):
+    r"""UltimateBridge(n_embd, max_prefix_len=64, low_rank_dim=64) -> None
+
+    将 RWKV 隐状态映射为 Transformer 专家可用的前缀表示。
+
+    Args:
+      n_embd (int): 隐状态维度。
+      max_prefix_len (int, optional): 前缀 token 长度。Default: ``64``。
+      low_rank_dim (int, optional): 低秩中间维度。Default: ``64``。
+    """
+
+    def __init__(self, n_embd: int, max_prefix_len: int = 64, low_rank_dim: int = 64) -> None:
         super().__init__()
         self.max_prefix_len = max_prefix_len
         self.n_embd = n_embd
@@ -36,12 +46,14 @@ class UltimateBridge(nn.Module):
         self.norm = nn.LayerNorm(n_embd)
 
     def forward(self, x: torch.Tensor, rwkv_state: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N, C] - 当前 Token Embedding
-        rwkv_state: [N, C] - RWKV Hidden State (允许梯度回流)
-        
+        r"""forward(x, rwkv_state) -> Tensor
+
+        Args:
+          x (Tensor): 形状 ``[N, C]``，当前 token 特征。
+          rwkv_state (Tensor): 形状 ``[N, C]``，RWKV 状态表示。
+
         Returns:
-            prefix: [N, prefix_len, C]
+          Tensor: 形状 ``[N, prefix_len, C]`` 的 prefix。
         """
         N, C = x.shape
         

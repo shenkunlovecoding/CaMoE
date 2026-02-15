@@ -33,6 +33,11 @@ CONFIG_04B = {
     "vocab_size": 65536,  
     "tied_embeddings": True,  # 共享 Input/Output Embedding
     "use_deep_embed_attention": True,  # v18.5-test: DeepEmbed + DEA 分支
+    "use_shared_deep_embed": True,  # 跨层共享 DeepEmbed 表，显著降低参数/显存
+    "dea_q_dim": 256,  # RWKV-8 风格 DEA: q 维度
+    "dea_kv_dim": 32,  # RWKV-8 风格 DEA: k/v 低维缓存通道
+    "dea_score_scale": 1024.0,
+    "dea_cap_scale": 64.0,
     
     # ===== CaMoE 专家配置 (6R2T) =====
     "num_rwkv_experts": 6,
@@ -106,6 +111,12 @@ CONFIG_01B = {
     "head_size": 64,
     "vocab_size": 32000,
     "tied_embeddings": True,
+    "use_deep_embed_attention": False,
+    "use_shared_deep_embed": True,
+    "dea_q_dim": 256,
+    "dea_kv_dim": 32,
+    "dea_score_scale": 1024.0,
+    "dea_cap_scale": 64.0,
     
     # ===== CaMoE 专家配置 (3R1T) =====
     "num_rwkv_experts": 3,

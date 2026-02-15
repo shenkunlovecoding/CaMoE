@@ -2,12 +2,22 @@ import os
 import torch
 import torch.nn.functional as F
 import math
-from typing import List, Tuple, Optional, Union
+from typing import Iterable, List, Tuple
 from tqdm import tqdm
 
 
-def chunks(lst, n):
-    """Yield successive n-sized chunks from lst."""
+def chunks(lst: List["Instance"], n: int) -> Iterable[List["Instance"]]:
+    r"""chunks(lst, n) -> Iterable[List[Instance]]
+
+    将请求列表按固定批大小切分。
+
+    Args:
+      lst (List[Instance]): 原始请求列表。
+      n (int): 每批大小。
+
+    Returns:
+      Iterable[List[Instance]]: 分批后的迭代器。
+    """
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
@@ -48,7 +58,20 @@ class CaMoELM(LM):
         max_length: int = None,
         dtype: str = "bfloat16",
         **kwargs,
-    ):
+    ) -> None:
+        r"""__init__(pretrained=None, scale="0.4b", vocab_file=None, device="cuda", batch_size=1, max_length=None, dtype="bfloat16", **kwargs) -> None
+
+        初始化 lm-evaluation-harness 适配器，自动加载配置、权重与 tokenizer。
+
+        Args:
+          pretrained (str, optional): checkpoint 路径。Default: ``None``。
+          scale (str, optional): 模型规模标识。Default: ``"0.4b"``。
+          vocab_file (str, optional): 词表路径。Default: ``None``。
+          device (str, optional): 运行设备。Default: ``"cuda"``。
+          batch_size (int, optional): 评估批大小。Default: ``1``。
+          max_length (int, optional): 最大上下文长度。Default: ``None``。
+          dtype (str, optional): AMP 精度类型。Default: ``"bfloat16"``。
+        """
         super().__init__()
 
         # 1. Config：优先从 checkpoint 恢复以匹配架构
@@ -130,6 +153,15 @@ class CaMoELM(LM):
 
     # ============ Tokenizer 辅助 ============
     def tok_encode(self, string: str, add_special_tokens: bool = False) -> List[int]:
+        r"""tok_encode(string, add_special_tokens=False) -> List[int]
+
+        Args:
+          string (str): 输入文本。
+          add_special_tokens (bool, optional): 与接口兼容的保留参数。Default: ``False``。
+
+        Returns:
+          List[int]: token id 序列。
+        """
         if not string:
             return []
         if self.is_rust_tokenizer:
@@ -137,12 +169,30 @@ class CaMoELM(LM):
         return self.tokenizer.encode(string)
 
     def tok_decode(self, tokens: List[int]) -> str:
+        r"""tok_decode(tokens) -> str
+
+        Args:
+          tokens (List[int]): token id 序列。
+
+        Returns:
+          str: 解码文本。
+        """
         if self.is_rust_tokenizer:
             return self.tokenizer.decode(tokens)
         return self.tokenizer.decode(tokens)
 
     # ============ 模型前向辅助 ============
     def _pad_to_chunk(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        r"""_pad_to_chunk(input_ids) -> Tuple[Tensor, int]
+
+        将序列长度对齐到 CUDA kernel 要求的 chunk 边界。
+
+        Args:
+          input_ids (Tensor): 形状 ``[B, T]``。
+
+        Returns:
+          Tuple[Tensor, int]: 对齐后的输入与补齐长度。
+        """
         B, T = input_ids.shape
         if T % self.CHUNK_LEN == 0:
             return input_ids, 0
@@ -151,7 +201,16 @@ class CaMoELM(LM):
         return torch.cat([input_ids, padding], dim=1), pad_len
 
     def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward，返回 logits [B, T, V]。v18 推理：step=30000, phase=normal"""
+        r"""_model_call(input_ids) -> Tensor
+
+        统一封装模型前向，返回与输入等长的 logits。
+
+        Args:
+          input_ids (Tensor): 形状 ``[B, T]``。
+
+        Returns:
+          Tensor: 形状 ``[B, T, V]``。
+        """
         B, T = input_ids.shape
         padded_ids, pad_len = self._pad_to_chunk(input_ids)
         with torch.no_grad():
@@ -164,6 +223,16 @@ class CaMoELM(LM):
     # ============ 核心评估方法 (Batched) ============
     
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+        r"""loglikelihood(requests) -> List[Tuple[float, bool]]
+
+        批量计算 (context, continuation) 的对数似然与 greedy 命中标志。
+
+        Args:
+          requests (List[Instance]): lm-eval 请求列表。
+
+        Returns:
+          List[Tuple[float, bool]]: 每条请求的 ``(logprob_sum, all_greedy_correct)``。
+        """
         results = []
         
         # 1. 分 Batch
@@ -257,8 +326,15 @@ class CaMoELM(LM):
         return results
 
     def loglikelihood_rolling(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        """
-        实现抽象方法，支持 PPL 测试。
+        r"""loglikelihood_rolling(requests) -> List[Tuple[float, bool]]
+
+        实现 rolling loglikelihood，用于 PPL 等评测任务。
+
+        Args:
+          requests (List[Instance]): lm-eval 请求列表。
+
+        Returns:
+          List[Tuple[float, bool]]: 每条请求的 ``(logprob_sum, all_greedy_correct)``。
         """
         results = []
         for batch in tqdm(chunks(requests, self.batch_size), total=math.ceil(len(requests)/self.batch_size), desc="rolling"):
@@ -301,8 +377,15 @@ class CaMoELM(LM):
         return results
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
-        """
-        生成任务 (如 GSM8k)。保持 Serial 生成，因为变长生成很难 Batch。
+        r"""generate_until(requests) -> List[str]
+
+        串行生成文本，直到命中停止词或达到最大生成长度。
+
+        Args:
+          requests (List[Instance]): lm-eval 生成请求。
+
+        Returns:
+          List[str]: 每条请求的生成结果。
         """
         results = []
         # 使用 tqdm 显示进度

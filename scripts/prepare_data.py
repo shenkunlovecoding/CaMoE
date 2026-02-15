@@ -11,6 +11,7 @@ CaMoE v18 Data Preprocessor (Ultimate Edition)
 import os
 import argparse
 import multiprocessing
+from typing import Any, Dict
 from datasets import load_dataset, concatenate_datasets, interleave_datasets
 import pyrwkv_tokenizer
 
@@ -28,7 +29,14 @@ DATA_RECIPE = {
 # 如果 Ultrachat 还是那个 list 格式，我们需要特殊处理
 # 这里假设 Ultrachat 是标准的 HF 格式
 
-def get_args():
+def get_args() -> argparse.Namespace:
+    r"""get_args() -> argparse.Namespace
+
+    解析数据预处理命令行参数。
+
+    Returns:
+      argparse.Namespace: 解析后的参数对象。
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_path", type=str, default="./data/camoe_mix_v1", help="保存路径")
     parser.add_argument("--ctx_len", type=int, default=1024)
@@ -36,8 +44,18 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=100, help="Tokenize批次大小，内存小设为50")
     return parser.parse_args()
 
-def process_text(item, mode="raw"):
-    """清洗与格式化"""
+def process_text(item: Dict[str, Any], mode: str = "raw") -> str:
+    r"""process_text(item, mode="raw") -> str
+
+    将不同来源样本标准化为训练文本。
+
+    Args:
+      item (Dict[str, Any]): 单条样本。
+      mode (str, optional): ``"raw"`` 或 ``"chat"``。Default: ``"raw"``。
+
+    Returns:
+      str: 清洗后的文本；无效样本返回空字符串。
+    """
     text = ""
     
     # 1. 尝试获取内容
@@ -83,10 +101,25 @@ def process_text(item, mode="raw"):
 # 全局 Tokenizer (Worker 用)
 tokenizer = None
 def init_tokenizer():
+    r"""init_tokenizer() -> None
+
+    初始化全局 RWKV tokenizer，供多进程 worker 调用。
+    """
     global tokenizer
     tokenizer = pyrwkv_tokenizer.RWKVTokenizer()
 
-def tokenize_and_pack(batch, ctx_len=1024):
+def tokenize_and_pack(batch: Dict[str, Any], ctx_len: int = 1024) -> Dict[str, Any]:
+    r"""tokenize_and_pack(batch, ctx_len=1024) -> Dict[str, Any]
+
+    对文本进行分词并打包成固定长度序列。
+
+    Args:
+      batch (Dict[str, Any]): batched 样本字典，需包含 ``text_processed``。
+      ctx_len (int, optional): 序列长度。Default: ``1024``。
+
+    Returns:
+      Dict[str, Any]: 包含 ``input_ids`` 列的新批次。
+    """
     global tokenizer
     texts = batch['text_processed']
     if not texts: return {"input_ids": []}
@@ -112,7 +145,11 @@ def tokenize_and_pack(batch, ctx_len=1024):
     # 丢弃尾部不足ctx_len的token
     return {"input_ids": chunks}
 
-def main():
+def main() -> None:
+    r"""main() -> None
+
+    混合多源数据并导出为可直接训练的数据集格式。
+    """
     args = get_args()
     print(f"🚀 Preparing Mixed Dataset -> {args.save_path}")
     

@@ -9,7 +9,17 @@ from typing import Dict, Tuple
 
 
 class CriticVC(nn.Module):
-    def __init__(self, n_embd: int, num_experts: int, init_capital: float = 10000.0):
+    r"""CriticVC(n_embd, num_experts, init_capital=10000.0) -> None
+
+    Critic 负责预测难度与专家偏好，并通过做多/做空更新自身资本。
+
+    Args:
+      n_embd (int): 输入隐藏维度。
+      num_experts (int): 专家数。
+      init_capital (float, optional): Critic 初始资本。Default: ``10000.0``。
+    """
+
+    def __init__(self, n_embd: int, num_experts: int, init_capital: float = 10000.0) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.init_capital = init_capital
@@ -39,20 +49,51 @@ class CriticVC(nn.Module):
         self.register_buffer('prediction_accuracy', torch.tensor(0.5))
     
     def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""forward(h) -> Tuple[Tensor, Tensor]
+
+        Args:
+          h (Tensor): 形状 ``[B, T, C]`` 的隐藏表示。
+
+        Returns:
+          Tuple[Tensor, Tensor]:
+          ``difficulty`` 形状 ``[B, T, 1]``，
+          ``affinity`` 形状 ``[B, T, E]``。
+        """
         feat = self.feature(h)
         difficulty = self.difficulty_head(feat) + 1e-3
         affinity = self.affinity_head(feat)
         return difficulty, affinity
     
     def apply_to_bids(self, bids: torch.Tensor, affinity: torch.Tensor) -> torch.Tensor:
+        r"""apply_to_bids(bids, affinity) -> Tensor
+
+        使用当前资本对 affinity 缩放，生成对报价的修正项。
+
+        Args:
+          bids (Tensor): 基础报价，形状 ``[B, T, E]``。
+          affinity (Tensor): 形状 ``[B, T, E]``。
+
+        Returns:
+          Tensor: 修正后的报价，形状 ``[B, T, E]``。
+        """
         capital_ratio = (self.capital / self.init_capital).clamp(0.1, 2.0)
         modification = affinity * capital_ratio * 0.05
         return bids + modification
     
     def settle(self, affinity: torch.Tensor, winners: torch.Tensor, 
                token_losses: torch.Tensor, baseline: float) -> Dict:
-        """
-        winners: [B, T, 2] - Top-2 中标者
+        r"""settle(affinity, winners, token_losses, baseline) -> Dict
+
+        根据做多/做空结果更新 Critic 资本，并返回结算摘要。
+
+        Args:
+          affinity (Tensor): 形状 ``[B, T, E]``，偏好值（正=做多，负=做空）。
+          winners (Tensor): 形状 ``[B, T, 2]``，Top-2 中标者。
+          token_losses (Tensor): 形状 ``[B, T]``，token 损失。
+          baseline (float): 当前基准损失。
+
+        Returns:
+          Dict: 包含 ``profit`` 与 ``capital``。
         """
         with torch.no_grad():
             B, T, E = affinity.shape

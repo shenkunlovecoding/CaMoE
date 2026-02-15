@@ -4,8 +4,17 @@ import glob
 import torch
 from CaMoE.config import CONFIG_MINIPILE
 
-def analyze_checkpoint(ckpt_path):
-    """分析单个 checkpoint 的市场状态"""
+def analyze_checkpoint(ckpt_path: str):
+    r"""analyze_checkpoint(ckpt_path) -> dict | None
+
+    读取并分析单个 checkpoint 的专家资本分布。
+
+    Args:
+      ckpt_path (str): checkpoint 文件路径。
+
+    Returns:
+      dict | None: 分析结果；加载失败时返回 ``None``。
+    """
     try:
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     except Exception as e:
@@ -71,8 +80,14 @@ def analyze_checkpoint(ckpt_path):
     return result
 
 
-def print_analysis(results):
-    """打印分析结果"""
+def print_analysis(results) -> None:
+    r"""print_analysis(results) -> None
+
+    打印 checkpoint 分析报告。
+
+    Args:
+      results: ``analyze_checkpoint`` 的结果列表。
+    """
     print("\n" + "=" * 80)
     print("📊 CHECKPOINT ANALYSIS REPORT")
     print("=" * 80)
@@ -129,8 +144,14 @@ def print_analysis(results):
         print(f"  Transformer 专家平均份额: {avg_trans:.1f}%")
 
 
-def recommend_checkpoints(results):
-    """推荐重点测试的 checkpoint"""
+def recommend_checkpoints(results) -> None:
+    r"""recommend_checkpoints(results) -> None
+
+    根据 Gini 与专家份额启发式推荐重点评测 checkpoint。
+
+    Args:
+      results: ``analyze_checkpoint`` 的结果列表。
+    """
     print("\n" + "=" * 80)
     print("🎯 推荐测试的 CHECKPOINT")
     print("=" * 80)
@@ -187,7 +208,11 @@ def recommend_checkpoints(results):
         print(f"  🤖 Transformer 份额: {avg_trans:.1f}%")
 
 
-def main():
+def main() -> None:
+    r"""main() -> None
+
+    命令行入口：批量分析目录中的 checkpoint 并输出推荐。
+    """
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", "-d", default="checkpoints/minipile", help="Checkpoint 目录")

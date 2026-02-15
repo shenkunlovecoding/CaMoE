@@ -6,13 +6,32 @@ Top-2 Vickrey Auction with Third-Price Clearing
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict
+from typing import Tuple
 
 
 class CapitalManager(nn.Module):
-    def __init__(self, num_layers: int, num_experts: int, 
-                 total_capital: float = 10000.0, min_share: float = 0.05,
-                 tax_threshold: float = 2.0, tax_rate: float = 0.1):
+    r"""CapitalManager(num_layers, num_experts, total_capital=10000.0, min_share=0.05, tax_threshold=2.0, tax_rate=0.1) -> None
+
+    管理每一层专家资本的动态更新，用于市场路由的长期激励。
+
+    Args:
+      num_layers (int): 模型层数。
+      num_experts (int): 每层专家数量。
+      total_capital (float, optional): 初始总资本规模。Default: ``10000.0``。
+      min_share (float, optional): 每个专家最低资本占比保障系数。Default: ``0.05``。
+      tax_threshold (float, optional): 触发累进税的资本倍数阈值。Default: ``2.0``。
+      tax_rate (float, optional): 对超额资本征税比例。Default: ``0.1``。
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        total_capital: float = 10000.0,
+        min_share: float = 0.05,
+        tax_threshold: float = 2.0,
+        tax_rate: float = 0.1,
+    ) -> None:
         super().__init__()
         self.num_layers = num_layers
         self.num_experts = num_experts
@@ -27,15 +46,35 @@ class CapitalManager(nn.Module):
         self.register_buffer('baseline_losses', torch.ones(num_layers) * 5.0)
     
     def get_shares(self, layer_idx: int) -> torch.Tensor:
+        r"""get_shares(layer_idx) -> Tensor
+
+        返回某层专家资本占比，用于路由报价缩放。
+
+        Args:
+          layer_idx (int): 层索引。
+
+        Returns:
+          Tensor: 形状为 ``[num_experts]`` 的资本占比向量。
+        """
         caps = self.capitals[layer_idx]
         return caps / (caps.sum() + 1e-6)
     
-    def update(self, layer_idx: int, winners: torch.Tensor, 
-               token_losses: torch.Tensor, costs: torch.Tensor):
-        """
-        winners: [B, T, 2] - Top-2 中标者
-        token_losses: [B, T]
-        costs: [B, T] - 成交价 (Third-price)
+    def update(
+        self,
+        layer_idx: int,
+        winners: torch.Tensor,
+        token_losses: torch.Tensor,
+        costs: torch.Tensor,
+    ) -> None:
+        r"""update(layer_idx, winners, token_losses, costs) -> None
+
+        根据 token 级收益更新专家资本，并应用税收、保底和总量控制。
+
+        Args:
+          layer_idx (int): 当前层索引。
+          winners (Tensor): 形状 ``[B, T, 2]``，Top-2 中标专家索引。
+          token_losses (Tensor): 形状 ``[B, T]``，token 级损失。
+          costs (Tensor): 形状 ``[B, T]``，成交价（第三价格）。
         """
         with torch.no_grad():
             avg_loss = token_losses.mean()
@@ -80,10 +119,12 @@ class CapitalManager(nn.Module):
 
 
 class SparseRouter:
+    r"""SparseRouter(noise_std=0.02) -> None
+
+    基于 Top-2 Vickrey 拍卖的稀疏路由器。
     """
-    v18: Top-2 Vickrey Auction Router
-    """
-    def __init__(self, noise_std: float = 0.02):
+
+    def __init__(self, noise_std: float = 0.02) -> None:
         self.noise_std = noise_std
     
     def route(self, 
@@ -92,18 +133,21 @@ class SparseRouter:
               difficulty: torch.Tensor,
               critic_subsidy: torch.Tensor = None,
               training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
+        r"""route(confidences, capital_shares, difficulty, critic_subsidy=None, training=True) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+
+        执行 Top-3 竞价、Top-2 选举、第三价格清算，并输出 Top-2 混合权重。
+
         Args:
-            confidences: [B, T, E]
-            capital_shares: [E]
-            difficulty: [B, T, 1]
-            critic_subsidy: [B, T, E] (可选)
-        
+          confidences (Tensor): 形状 ``[B, T, E]``，专家置信度。
+          capital_shares (Tensor): 形状 ``[E]``，专家资本占比。
+          difficulty (Tensor): 形状 ``[B, T, 1]``，样本难度。
+          critic_subsidy (Tensor, optional): 形状 ``[B, T, E]``，Critic 报价修正。
+          training (bool, optional): 是否加探索噪声。Default: ``True``。
+
         Returns:
-            winners: [B, T, 2] - Top-2 专家索引
-            weights: [B, T, 2] - 混合权重 (Softmax)
-            price: [B, T] - 成交价 (Third-price)
-            bids: [B, T, E] - 完整报价
+          Tuple[Tensor, Tensor, Tensor, Tensor]:
+          ``winners`` 形状 ``[B, T, 2]``，``weights`` 形状 ``[B, T, 2]``，
+          ``price`` 形状 ``[B, T]``，``bids`` 形状 ``[B, T, E]``。
         """
         B, T, E = confidences.shape
         

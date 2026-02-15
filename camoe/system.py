@@ -12,19 +12,26 @@ from torch.nn import functional as F
 from typing import Dict, Tuple, List
 from torch.utils.checkpoint import checkpoint
 
-from .backbone import RWKV7_TimeMix, DeepEmbedAttention
+from .backbone import RWKV7_TimeMix, DeepEmbedAttention, SharedDeepEmbed
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
 from .market import CapitalManager, SparseRouter
 
 class CaMoE_Block(nn.Module):
-    """
-    单个 CaMoE 块 (支持 Top-2 混合输出)
-    """
+    r"""单个 CaMoE Block，包含 TimeMix、DEA 与 Top-2 专家路由。"""
     
-    def __init__(self, n_embd: int, n_layer: int, layer_id: int, 
-                 head_size: int, config: Dict, bridge: nn.Module):
+    def __init__(
+        self,
+        n_embd: int,
+        n_layer: int,
+        layer_id: int,
+        head_size: int,
+        config: Dict,
+        bridge: nn.Module,
+        shared_deep_embed: nn.Module = None,
+    ) -> None:
+        r"""初始化单层 CaMoE Block。"""
         super().__init__()
         
         self.layer_id = layer_id
@@ -45,7 +52,16 @@ class CaMoE_Block(nn.Module):
         vocab_size = config.get("vocab_size", 65536)
         if self.use_deep_embed_attention:
             self.dea = DeepEmbedAttention(
-                n_embd, n_layer, layer_id, head_size, vocab_size
+                n_embd=n_embd,
+                n_layer=n_layer,
+                layer_id=layer_id,
+                head_size=head_size,
+                vocab_size=vocab_size,
+                shared_deep_embed=shared_deep_embed,
+                q_dim=config.get("dea_q_dim", 256),
+                kv_dim=config.get("dea_kv_dim", 32),
+                score_scale=config.get("dea_score_scale", 1024.0),
+                cap_scale=config.get("dea_cap_scale", 64.0),
             )
         else:
             self.dea = None
@@ -75,17 +91,36 @@ class CaMoE_Block(nn.Module):
                 use_market: bool = True,
                 training: bool = True,
                 idx: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        r"""forward(x, v_first, capital_shares, router, step, warmup_steps, use_market=True, training=True, idx=None) -> Tuple[Tensor, Tensor, Dict]
+
+        执行单层前向：并行 TimeMix/DEA、市场路由、专家执行与残差融合。
+
+        Args:
+          x (Tensor): 形状 ``[B, T, C]`` 的输入隐藏状态。
+          v_first (Tensor): RWKV 首层 value 缓存。
+          capital_shares (Tensor): 形状 ``[E]`` 的专家资本占比。
+          router (SparseRouter): 路由器实例。
+          step (int): 当前训练步。
+          warmup_steps (int): warmup 阶段边界。
+          use_market (bool, optional): 是否使用市场路由。Default: ``True``。
+          training (bool, optional): 是否训练模式。Default: ``True``。
+          idx (Tensor, optional): 形状 ``[B, T]`` 的 token id。Default: ``None``。
+
+        Returns:
+          Tuple[Tensor, Tensor, Dict]:
+          更新后的隐藏状态、``v_first`` 与路由信息字典。
+        """
         
         B, T, C = x.shape
         
-        # 1. TimeMix (Backbone)
-        att_out, v_first, rwkv_state = self.att(self.ln1(x), v_first)
-        x = x + att_out
-        
-        # 1b. DeepEmbedAttention 分支 (v18.5-test)
+        # 1. TimeMix + DEA 并行分支（同一份 pre-norm 输入）
+        x_ln = self.ln1(x)
+        att_out, v_first, rwkv_state = self.att(x_ln, v_first)
         if self.dea is not None and idx is not None:
-            dea_out = self.dea(self.ln1(x), idx)
-            x = x + dea_out
+            dea_out = self.dea(x_ln, idx)
+            x = x + att_out + dea_out
+        else:
+            x = x + att_out
         
         h = self.ln2(x)
         
@@ -156,7 +191,10 @@ class CaMoE_Block(nn.Module):
 
 
 class CaMoE_System(nn.Module):
-    def __init__(self, config: Dict):
+    r"""CaMoE 主系统，封装多层 Block、市场状态与损失计算。"""
+
+    def __init__(self, config: Dict) -> None:
+        r"""初始化系统级模块与共享组件。"""
         super().__init__()
         self.config = config
         self.n_embd = config['n_embd']
@@ -169,6 +207,15 @@ class CaMoE_System(nn.Module):
         
         # Embedding
         self.emb = nn.Embedding(self.vocab_size, self.n_embd)
+
+        # Shared DeepEmbed table (optional, recommended for VRAM efficiency)
+        self.deep_embed = None
+        if config.get("use_deep_embed_attention", False) and config.get("use_shared_deep_embed", True):
+            self.deep_embed = SharedDeepEmbed(
+                vocab_size=self.vocab_size,
+                k_dim=min(config.get("dea_q_dim", 256), self.n_embd),
+                v_dim=self.n_embd,
+            )
         
         # 共享 Bridge
         self.bridge = UltimateBridge(
@@ -186,7 +233,8 @@ class CaMoE_System(nn.Module):
                 i,
                 config['head_size'],
                 config,
-                bridge=self.bridge
+                bridge=self.bridge,
+                shared_deep_embed=self.deep_embed,
             ))
         
         self.ln_out = nn.LayerNorm(self.n_embd)
@@ -210,6 +258,18 @@ class CaMoE_System(nn.Module):
     
     def forward(self, idx: torch.Tensor, step: int = 0, 
                 phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
+        r"""forward(idx, step=0, phase="normal") -> Tuple[Tensor, Dict]
+
+        执行整网前向并收集各层路由信息。
+
+        Args:
+          idx (Tensor): 形状 ``[B, T]`` 的 token id。
+          step (int, optional): 当前步数。Default: ``0``。
+          phase (str, optional): 训练阶段标签。Default: ``"normal"``。
+
+        Returns:
+          Tuple[Tensor, Dict]: ``logits`` 与各层 ``info``。
+        """
         x = self.emb(idx)
         v_first = None
         
@@ -255,7 +315,25 @@ class CaMoE_System(nn.Module):
         
         return logits, all_info
     
-    def compute_losses(self, logits, targets, all_info):
+    def compute_losses(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        all_info: Dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        r"""compute_losses(logits, targets, all_info) -> Tuple[Tensor, Tensor, Tensor, Tensor, float]
+
+        计算主损失、token 级损失以及 Critic 损失。
+
+        Args:
+          logits (Tensor): 形状 ``[B, T, V]``。
+          targets (Tensor): 形状 ``[B, T]``。
+          all_info (Dict): 各层难度/路由信息。
+
+        Returns:
+          Tuple[Tensor, Tensor, Tensor, Tensor, float]:
+          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``bridge_loss``。
+        """
         B, T = targets.shape
         
         # Main Loss
@@ -282,7 +360,16 @@ class CaMoE_System(nn.Module):
         
         return total_loss, token_losses, main_loss, critic_loss, bridge_loss
     
-    def update_market(self, all_info, token_losses, step):
+    def update_market(self, all_info: Dict, token_losses: torch.Tensor, step: int) -> None:
+        r"""update_market(all_info, token_losses, step) -> None
+
+        根据 token 级损失结算市场状态与 Critic 资本。
+
+        Args:
+          all_info (Dict): 前向收集的市场信息。
+          token_losses (Tensor): 形状 ``[B, T]``。
+          step (int): 当前训练步。
+        """
         with torch.no_grad():
             for i in range(self.n_layer):
                 if i >= len(all_info.get("winners", [])): 
@@ -305,6 +392,13 @@ class CaMoE_System(nn.Module):
                         print(f"🏛️  Layer {i}: Critic Bailout (Step {step})")
     
     def log_market_health(self) -> Dict:
+        r"""log_market_health() -> Dict
+
+        汇总若干关键层的市场健康指标。
+
+        Returns:
+          Dict: 包含 RWKV/Transformer 份额、Gini、Critic 资本等指标。
+        """
         metrics = {}
         check_layers = [0, self.n_layer // 2, self.n_layer - 1]
         check_layers = sorted(list(set([i for i in check_layers if i < self.n_layer])))

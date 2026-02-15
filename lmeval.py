@@ -11,7 +11,13 @@ import lm_eval
 from CaMoE.wrapper import CaMoELM
 
 
-def main():
+def main() -> None:
+    r"""main() -> None
+
+    lm-evaluation-harness 评测入口。
+
+    负责初始化 CUDA kernel、加载模型适配器、执行任务评测并保存结果 JSON。
+    """
     parser = argparse.ArgumentParser(description="CaMoE lm-eval: 使用 get_config(scale) 与 checkpoint 内 config 匹配架构")
     parser.add_argument("--pretrained", type=str, default=None, help="Checkpoint 路径，例如 checkpoints/v18_0.4b/v18_step2000.pth")
     parser.add_argument("--scale", type=str, default="0.4b", choices=["0.1b", "0.4b"], help="未从 checkpoint 读 config 时使用的规模")

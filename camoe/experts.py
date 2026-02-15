@@ -9,10 +9,16 @@ import torch.nn.functional as F
 
 
 class SparseRWKVFFN(nn.Module):
+    r"""SparseRWKVFFN(n_embd, expand=4) -> None
+
+    RWKV 风格 ReLU^2 FFN 专家（无状态版本）。
+
+    Args:
+      n_embd (int): 输入/输出通道维度。
+      expand (int, optional): FFN 扩展倍率。Default: ``4``。
     """
-    RWKV FFN 专家 (无状态版)
-    """
-    def __init__(self, n_embd: int, expand: int = 4):
+
+    def __init__(self, n_embd: int, expand: int = 4) -> None:
         super().__init__()
         hidden = n_embd * expand
         self.key = nn.Linear(n_embd, hidden, bias=False)
@@ -30,13 +36,29 @@ class SparseRWKVFFN(nn.Module):
         nn.init.orthogonal_(self.key.weight.data, gain=2.0)
     
     def get_confidence(self, x: torch.Tensor) -> torch.Tensor:
-        """返回 [B, T] 的置信度"""
+        r"""get_confidence(x) -> Tensor
+
+        计算 token 级专家置信度。
+
+        Args:
+          x (Tensor): 形状 ``[B, T, C]``。
+
+        Returns:
+          Tensor: 形状 ``[B, T]`` 的置信度。
+        """
         return self.confidence(x).squeeze(-1)
         
     def forward(self, x: torch.Tensor, prefix: torch.Tensor = None) -> torch.Tensor:
-        """
-        x: [N, C]
-        prefix: 忽略 (RWKV 不需要 Bridge)
+        r"""forward(x, prefix=None) -> Tensor
+
+        执行 FFN 前向。
+
+        Args:
+          x (Tensor): 形状 ``[N, C]``。
+          prefix (Tensor, optional): 占位参数，RWKV 专家不使用。Default: ``None``。
+
+        Returns:
+          Tensor: 形状 ``[N, C]`` 的专家输出。
         """
         k = torch.relu(self.key(x)) ** 2
         out = self.value(k)
@@ -44,11 +66,16 @@ class SparseRWKVFFN(nn.Module):
 
 
 class LinearTransformerExpert(nn.Module):
+    r"""LinearTransformerExpert(n_embd, n_head) -> None
+
+    使用 Bridge Prefix 作为 K/V 的线性 Transformer 专家。
+
+    Args:
+      n_embd (int): 输入/输出维度。
+      n_head (int): 注意力头数。
     """
-    Linear Transformer 专家
-    使用 Bridge 生成的 Prefix 作为 K/V
-    """
-    def __init__(self, n_embd: int, n_head: int):
+
+    def __init__(self, n_embd: int, n_head: int) -> None:
         super().__init__()
         self.n_head = n_head
         self.head_dim = n_embd // n_head
@@ -70,13 +97,25 @@ class LinearTransformerExpert(nn.Module):
         nn.init.orthogonal_(self.o.weight, gain=0.1)
 
     def get_confidence(self, x: torch.Tensor) -> torch.Tensor:
-        """返回 [B, T] 的置信度"""
+        r"""get_confidence(x) -> Tensor
+
+        Args:
+          x (Tensor): 形状 ``[B, T, C]``。
+
+        Returns:
+          Tensor: 形状 ``[B, T]`` 的置信度。
+        """
         return self.confidence(x).squeeze(-1)
 
     def forward(self, x: torch.Tensor, prefix: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N, C] - Query 来源
-        prefix: [N, P, C] - Key/Value 来源 (由 Bridge 生成)
+        r"""forward(x, prefix) -> Tensor
+
+        Args:
+          x (Tensor): 形状 ``[N, C]``，Query 来源。
+          prefix (Tensor): 形状 ``[N, P, C]``，由 Bridge 生成的 Key/Value 来源。
+
+        Returns:
+          Tensor: 形状 ``[N, C]`` 的专家输出。
         """
         N, C = x.shape
         H, D = self.n_head, self.head_dim

@@ -84,7 +84,19 @@ else:
     exit()
 
 # ================= 辅助函数 =================
-def sample_top_p(probs, p, temperature):
+def sample_top_p(probs: torch.Tensor, p: float, temperature: float) -> torch.Tensor:
+    r"""sample_top_p(probs, p, temperature) -> Tensor
+
+    对概率分布执行 top-p 采样。
+
+    Args:
+      probs (Tensor): 形状 ``[B, V]`` 的概率分布。
+      p (float): nucleus 截断阈值。
+      temperature (float): 采样温度；``0`` 表示贪心。
+
+    Returns:
+      Tensor: 形状 ``[B, 1]`` 的采样 token id。
+    """
     if temperature == 0:
         return torch.argmax(probs, dim=-1).unsqueeze(0)
     
@@ -104,8 +116,23 @@ def sample_top_p(probs, p, temperature):
     return torch.multinomial(probs, 1)
 
 
-def apply_repetition_penalty(logits, context_ids, penalty=1.2):
-    """对出现在 context 中的 token 的 logit 施加惩罚，减轻重复生成。logits: [B, V], context_ids: [B, Seq]"""
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    context_ids: torch.Tensor,
+    penalty: float = 1.2,
+) -> torch.Tensor:
+    r"""apply_repetition_penalty(logits, context_ids, penalty=1.2) -> Tensor
+
+    对上下文出现过的 token 施加重复惩罚。
+
+    Args:
+      logits (Tensor): 形状 ``[B, V]``。
+      context_ids (Tensor): 形状 ``[B, Seq]``。
+      penalty (float, optional): 重复惩罚系数。Default: ``1.2``。
+
+    Returns:
+      Tensor: 应用惩罚后的 logits。
+    """
     if penalty == 1.0:
         return logits
     score = torch.gather(logits, 1, context_ids)
@@ -114,12 +141,38 @@ def apply_repetition_penalty(logits, context_ids, penalty=1.2):
     return logits
 
 
-def format_prompt(user_input):
-    """对话式 prompt 包装"""
+def format_prompt(user_input: str) -> str:
+    r"""format_prompt(user_input) -> str
+
+    将用户输入包装成简单对话模板。
+
+    Args:
+      user_input (str): 用户文本。
+
+    Returns:
+      str: 拼接后的 prompt。
+    """
     return f"User: {user_input}\nAssistant:"
 
 
-def generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.9, repetition_penalty=1.2):
+def generate_and_visualize(
+    prompt: str,
+    max_new_tokens: int = 200,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.2,
+) -> None:
+    r"""generate_and_visualize(prompt, max_new_tokens=200, temperature=1.0, top_p=0.9, repetition_penalty=1.2) -> None
+
+    生成文本并输出按路由强度着色的可视化结果。
+
+    Args:
+      prompt (str): 输入提示词。
+      max_new_tokens (int, optional): 最大生成长度。Default: ``200``。
+      temperature (float, optional): 采样温度。Default: ``1.0``。
+      top_p (float, optional): nucleus 阈值。Default: ``0.9``。
+      repetition_penalty (float, optional): 重复惩罚。Default: ``1.2``。
+    """
     # Tokenize
     if RUST_TOKENIZER:
         input_ids = tokenizer.encode(prompt)

@@ -8,6 +8,7 @@ import gc
 import time
 import argparse
 import re
+from typing import Dict, Iterator, Optional
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -24,8 +25,15 @@ from CaMoE.system import CaMoE_System
 from CaMoE.config import get_config, VERSION
 
 
-def load_backbone(model, path):
-    """从 RWKV 底模加载权重"""
+def load_backbone(model: CaMoE_System, path: str) -> None:
+    r"""load_backbone(model, path) -> None
+
+    从 RWKV 底模迁移可对齐权重到 CaMoE 架构。
+
+    Args:
+      model (CaMoE_System): 当前 CaMoE 模型。
+      path (str): RWKV 底模权重路径。
+    """
     if not os.path.exists(path):
         print(f"⚠️ Weights not found: {path} (Starting from scratch)")
         return
@@ -67,14 +75,35 @@ def load_backbone(model, path):
     model.load_state_dict(my_dict, strict=False)
     print(f"✅ Loaded matching tensors (~{loaded})")
 
-def get_phase(step: int, config: dict) -> str:
+def get_phase(step: int, config: Dict) -> str:
+    r"""get_phase(step, config) -> str
+
+    根据训练步数返回当前训练阶段。
+
+    Args:
+      step (int): 当前全局步数。
+      config (Dict): 训练配置。
+
+    Returns:
+      str: ``"prewarm"``、``"warmup"`` 或 ``"normal"``。
+    """
     if step < config.get('prewarm_steps', 100):
         return "prewarm"
     if step < config.get('warmup_steps', 500):
         return "warmup"
     return "normal"
 
-def apply_phase(model, optimizer, phase: str, config: dict):
+def apply_phase(model: CaMoE_System, optimizer, phase: str, config: Dict) -> None:
+    r"""apply_phase(model, optimizer, phase, config) -> None
+
+    根据阶段设置可训练参数与学习率。
+
+    Args:
+      model (CaMoE_System): 训练中的模型。
+      optimizer: 优化器实例（8-bit AdamW）。
+      phase (str): 当前阶段名。
+      config (Dict): 训练配置。
+    """
     num_rwkv = config.get('num_rwkv_experts', 2)
     num_trans = config.get('num_trans_experts', 1)
     
@@ -82,7 +111,14 @@ def apply_phase(model, optimizer, phase: str, config: dict):
         trans_indices = [str(i) for i in range(num_rwkv, num_rwkv + num_trans)]
         for n, p in model.named_parameters():
             is_trans_expert = any(f'experts.{idx}.' in n for idx in trans_indices)
-            should_train = any([is_trans_expert, 'bridge' in n, 'critic' in n, 'capital' in n])
+            should_train = any([
+                is_trans_expert,
+                'bridge' in n,
+                'critic' in n,
+                'capital' in n,
+                'dea' in n,
+                'deep_embed' in n,
+            ])
             p.requires_grad = should_train
         lr = config.get('lr_prewarm', 1e-4)
         
@@ -98,19 +134,40 @@ def apply_phase(model, optimizer, phase: str, config: dict):
     for pg in optimizer.param_groups:
         pg['lr'] = lr
 
-def log_gpu():
+def log_gpu() -> str:
+    r"""log_gpu() -> str
+
+    返回当前 GPU 显存占用摘要字符串。
+
+    Returns:
+      str: 显存信息；无 CUDA 时返回空字符串。
+    """
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
         total = torch.cuda.get_device_properties(0).total_memory / 1024**3
         return f"GPU: {alloc:.1f}/{total:.1f}GB"
     return ""
 
-def infinite_loader(loader):
+def infinite_loader(loader: DataLoader) -> Iterator:
+    r"""infinite_loader(loader) -> Iterator
+
+    将有限 DataLoader 包装为无限迭代器。
+
+    Args:
+      loader (DataLoader): 原始数据加载器。
+
+    Returns:
+      Iterator: 循环产出 batch 的迭代器。
+    """
     while True:
         for batch in loader:
             yield batch
 
-def main():
+def main() -> None:
+    r"""main() -> None
+
+    训练主入口，包含数据加载、断点续训、阶段训练、评估与保存。
+    """
     init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
@@ -203,7 +260,17 @@ def main():
         return
 
     # 3. DataLoader & Collate
-    def simple_collate(batch):
+    def simple_collate(batch) -> torch.Tensor:
+        r"""simple_collate(batch) -> Tensor
+
+        将变长样本拼接为固定长度 batch，并按 CUDA kernel 约束进行长度对齐。
+
+        Args:
+          batch: 原始样本列表，每项包含 ``input_ids``。
+
+        Returns:
+          Tensor: 形状 ``[B, T]`` 的 long 张量。
+        """
         input_ids = [item["input_ids"] for item in batch]
         max_len = max(len(ids) for ids in input_ids)
         max_len = min(max_len, config['ctx_len'] + 1)
@@ -302,7 +369,19 @@ def main():
     # [新增] 评估函数
     # ==========================================
     @torch.no_grad()
-    def estimate_loss(model, loader, eval_steps):
+    def estimate_loss(model: CaMoE_System, loader: DataLoader, eval_steps: int) -> float:
+        r"""estimate_loss(model, loader, eval_steps) -> float
+
+        在验证集上估算平均交叉熵损失。
+
+        Args:
+          model (CaMoE_System): 待评估模型。
+          loader (DataLoader): 验证集加载器。
+          eval_steps (int): 评估批次数。
+
+        Returns:
+          float: 平均验证损失；若无有效值则返回 ``inf``。
+        """
         model.eval()
         losses = []
         
