@@ -167,13 +167,35 @@ def main() -> None:
 
     训练主入口，包含数据加载、断点续训、阶段训练、评估与保存。
     """
-    init_rwkv7_cuda()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b", "0.4b_toy"])
+    parser.add_argument(
+        "--diag",
+        default="baseline",
+        choices=["baseline", "no_amp", "no_fast_math", "fp32_kernel"],
+        help="Diagnostic switches for isolating NaN source",
+    )
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
     config = get_config(args.scale)
+
+    # Diagnostic overrides (switch-only; no model structure changes)
+    if args.diag == "no_amp":
+        config["train_use_amp"] = False
+    elif args.diag == "no_fast_math":
+        config["cuda_use_fast_math"] = False
+    elif args.diag == "fp32_kernel":
+        config["cuda_use_fast_math"] = False
+        config["cuda_force_fp32_kernel"] = True
+
+    # Pass diagnostic kernel switches through env for backbone.init_rwkv7_cuda()
+    os.environ["CAMOE_DISABLE_FAST_MATH"] = "1" if not config.get("cuda_use_fast_math", True) else "0"
+    os.environ["CAMOE_FORCE_FP32_KERNEL"] = "1" if config.get("cuda_force_fp32_kernel", False) else "0"
+    os.environ["CAMOE_NAN_DEBUG"] = "1" if config.get("nan_debug", False) else "0"
+    os.environ["CAMOE_SANITIZE_TIMEMIX_OUT"] = "1" if config.get("sanitize_timemix_output", False) else "0"
+    os.environ["CAMOE_FORCE_TIMEMIX_FALLBACK"] = "1" if config.get("force_timemix_fallback", False) else "0"
+    init_rwkv7_cuda()
     
     # 强制设置 Eval 频率
     eval_interval = config.get('eval_interval', 1000)  # 每500步评测一次
@@ -181,6 +203,15 @@ def main() -> None:
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.set_float32_matmul_precision('high')
+
+    train_use_amp = bool(config.get("train_use_amp", True)) and device == "cuda"
+    amp_dtype_name = str(config.get("amp_dtype", "bfloat16"))
+    amp_dtype = torch.bfloat16 if amp_dtype_name == "bfloat16" else torch.float16
+    print(
+        f"🧪 Diag={args.diag} | AMP={train_use_amp}({amp_dtype_name}) | "
+        f"fast_math={config.get('cuda_use_fast_math', True)} | "
+        f"fp32_kernel={config.get('cuda_force_fp32_kernel', False)}"
+    )
 
     # ==========================================
     # 2. Dataset & Split（支持多数据集混合，手动 Resume 换阶段）
@@ -398,7 +429,7 @@ def main() -> None:
             x, y = batch[:, :-1], batch[:, 1:]
             
             # Eval 时使用 Normal 模式，测试全系统
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=train_use_amp):
                 logits, info = model(x, step=100000, phase="normal")
                 # 只算 Main Loss
                 loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
@@ -439,7 +470,7 @@ def main() -> None:
             resume="allow"
         )
         # 获取当前的 run_id (如果是新的，这里会生成新的)
-        current_run_id = experiment.run.id
+        current_run_id = experiment.public.run_id
     
     os.makedirs(config['save_dir'], exist_ok=True)
     
@@ -469,10 +500,19 @@ def main() -> None:
             
         x, y = x_batch[:, :-1], x_batch[:, 1:]
         
-        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, info = model(x, step=step, phase=phase)
-            total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
-            loss_to_backward = total_loss / config['grad_accum']
+        try:
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=train_use_amp):
+                logits, info = model(x, step=step, phase=phase)
+                total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
+                loss_to_backward = total_loss / config['grad_accum']
+        except RuntimeError as e:
+            print(f"💥 Forward/LOSS failed at step={step}, phase={phase}: {e}")
+            raise
+
+        if not torch.isfinite(loss_to_backward):
+            print(f"⚠️ Non-finite loss at step {step}: {float(loss_to_backward)} (skip batch)")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         loss_to_backward.backward()
         

@@ -66,6 +66,7 @@ CONFIG_04B = {
     "lr_prewarm": 1e-4,
     "lr_warmup": 2e-4,
     "lr_normal": 3e-4,
+    "use_gradient_checkpoint": True,
     
     # ===== 日志与评估 =====
     "log_interval": 10,
@@ -109,6 +110,15 @@ CONFIG_04B_TOY = {
     "warmup_steps": 1500,
     "eval_interval": 200,
     "eval_iters": 20,
+    "lr_prewarm": 3e-5,
+    "lr_warmup": 8e-5,
+    "lr_normal": 1e-4,
+    # Diagnostic/runtime switches (no structure change)
+    "train_use_amp": True,
+    "amp_dtype": "bfloat16",
+    "cuda_use_fast_math": True,
+    "cuda_force_fp32_kernel": False,
+    "use_gradient_checkpoint": False,
     "data_path": "./data/camoe_toy_mix",
     "mix": None,
     "save_dir": f"checkpoints/{VERSION}_0.4b_toy",

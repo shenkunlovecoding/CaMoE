@@ -43,11 +43,11 @@ CONFIG_PILOT = {
     "tax_threshold": 1.5, # 税收严一点，防止垄断
     "tax_rate": 0.2,
     
-    # ===== 训练参数 (RTX 4080 16GB) =====
-    "micro_batch_size": 6, # 0.1B + P32 + GC，8 应该很轻松，甚至可以试 16
-    "ctx_len": 1024,
-    "grad_accum": 8, # 有效 batch = 32
-    "total_steps": 5000, # 快速验证
+    # ===== 训练参数 (保守显存版，优先跑通) =====
+    "micro_batch_size": 1,
+    "ctx_len": 512,
+    "grad_accum": 16, # 有效 batch = 16
+    "total_steps": 5000,
     
     # ===== 阶段控制 =====
     "prewarm_steps": 500,  # 快速预热
@@ -57,6 +57,16 @@ CONFIG_PILOT = {
     "lr_prewarm": 3e-4,
     "lr_warmup": 5e-4,
     "lr_normal": 3e-4, # 0.1B 可以稍微大一点
+    "use_gradient_checkpoint": False,
+    # Diagnostic/runtime switches (no structure change)
+    "train_use_amp": False,
+    "amp_dtype": "bfloat16",
+    "cuda_use_fast_math": False,
+    "cuda_force_fp32_kernel": False,
+    "stabilize_logits": True,
+    "nan_debug": True,
+    "sanitize_timemix_output": True,
+    "force_timemix_fallback": False,
     
     # ===== 日志与评估 =====
     "log_interval": 10,
@@ -66,7 +76,7 @@ CONFIG_PILOT = {
     # ===== 路径 (本地路径) =====
     # 假设你有 TinyStories 数据，如果没有，可以用 HuggingFace 在线流式
     # 这里指向你的本地数据目录
-    "data_path": "./data/tinystories_rwkv_processed", 
+    "data_path": "./data/camoe_toy_mix",
     "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth", # 如果没有底模，代码会自动随机初始化
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
     "save_dir": f"checkpoints/{VERSION}",

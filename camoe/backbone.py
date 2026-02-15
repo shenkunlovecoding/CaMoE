@@ -16,6 +16,8 @@ HEAD_SIZE = 64
 CHUNK_LEN = 16
 USE_CUDA = False
 RUN_CUDA_RWKV7 = None
+CUDA_KERNEL_EXPECTS_FP32 = False
+W_SCALE = -math.exp(-0.5)
 
 def init_rwkv7_cuda():
     r"""init_rwkv7_cuda() -> None
@@ -24,7 +26,7 @@ def init_rwkv7_cuda():
 
     成功后会设置全局 ``USE_CUDA=True`` 并绑定 ``RUN_CUDA_RWKV7``。
     """
-    global USE_CUDA, RUN_CUDA_RWKV7
+    global USE_CUDA, RUN_CUDA_RWKV7, CUDA_KERNEL_EXPECTS_FP32
     
     try:
         curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,29 +43,44 @@ def init_rwkv7_cuda():
         
         # 编译标志：如果不加 -D_FP32_，默认就是 BF16
         # 注意：HEAD_SIZE 和 CHUNK_LEN 依然要传
+        use_fast_math = os.environ.get("CAMOE_DISABLE_FAST_MATH", "0") != "1"
+        force_fp32_kernel = os.environ.get("CAMOE_FORCE_FP32_KERNEL", "0") == "1"
+
         flags = [
             '-res-usage', 
-            f'-D_C_={HEAD_SIZE}', 
+            f'-D_N_={HEAD_SIZE}', 
             f"-D_CHUNK_LEN_={CHUNK_LEN}", 
-            "--use_fast_math", 
             "-O3", 
             "-Xptxas -O3", 
             "--extra-device-vectorization"
         ]
+        if use_fast_math:
+            flags.append("--use_fast_math")
+        if force_fp32_kernel:
+            flags.append("-D_FP32_")
+        cxx_flags = ["-D_FP32_"] if force_fp32_kernel else []
+        print(f"🔧 RWKV CUDA flags: fast_math={use_fast_math}, fp32_kernel={force_fp32_kernel}")
         
+        ext_name = "rwkv7_clampw"
         load(
-            name="rwkv7_clampw", 
+            name=ext_name, 
             sources=[cu_file, cpp_file], 
             is_python_module=False, 
             verbose=True, 
-            extra_cuda_cflags=flags
+            extra_cuda_cflags=flags,
+            extra_cflags=cxx_flags,
         )
+        # TORCH_LIBRARY namespace is fixed in rwkv7_clampw.cpp
+        op_ns = torch.ops.rwkv7_clampw
         
         class RWKV7_ClampW(torch.autograd.Function):
             @staticmethod
             def forward(ctx, r, w, k, v, a, b):
                 B, T, H, C = r.shape
                 assert T % CHUNK_LEN == 0
+                expected_dtype = torch.float32 if force_fp32_kernel else torch.bfloat16
+                assert all(i.dtype == expected_dtype for i in [r, w, k, v, a, b]), "RWKV7 kernel dtype mismatch"
+                assert all(i.is_contiguous() for i in [r, w, k, v, a, b]), "RWKV7 kernel needs contiguous tensors"
                 
                 # 创建输出和状态张量
                 # 注意：BF16 Kernel 要求输入输出是 BF16/FP16，但 State 是 FP32
@@ -71,36 +88,44 @@ def init_rwkv7_cuda():
                 s = torch.empty(B, H, T//CHUNK_LEN, C, C, dtype=torch.float32, device=r.device)
                 sa = torch.empty(B, T, H, C, dtype=torch.float32, device=r.device)
                 
-                torch.ops.rwkv7_clampw.forward(r, w, k, v, a, b, y, s, sa)
+                op_ns.forward(r, w, k, v, a, b, y, s, sa)
                 ctx.save_for_backward(r, w, k, v, a, b, s, sa)
                 return y
             
             @staticmethod
             def backward(ctx, dy):
+                expected_dtype = torch.float32 if force_fp32_kernel else torch.bfloat16
+                assert dy.dtype == expected_dtype, "RWKV7 backward dtype mismatch"
+                assert dy.is_contiguous(), "RWKV7 backward needs contiguous dy"
                 r, w, k, v, a, b, s, sa = ctx.saved_tensors
                 dr, dw, dk, dv, da, db = [torch.empty_like(x) for x in [r, w, k, v, a, b]]
-                torch.ops.rwkv7_clampw.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
+                op_ns.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
                 return dr, dw, dk, dv, da, db
         
         def _run_cuda(r, w, k, v, a, b):
             B, T, HC = r.shape
             H = HC // HEAD_SIZE
+            orig_dtype = r.dtype
+            target_dtype = torch.float32 if CUDA_KERNEL_EXPECTS_FP32 else torch.bfloat16
             
             # View 变换
             # 关键改动：不再强制转 .float() (FP32)
             # 保持原有的 dtype (BF16)，只做 contiguous 和 view
             r, w, k, v, a, b = [
-                x.contiguous().view(B, T, H, HEAD_SIZE) 
+                x.to(dtype=target_dtype).contiguous().view(B, T, H, HEAD_SIZE)
                 for x in [r, w, k, v, a, b]
             ]
             
             out = RWKV7_ClampW.apply(r, w, k, v, a, b)
-            out = out.view(B, T, HC)
+            out = out.view(B, T, HC).to(orig_dtype)
             return out
         
         RUN_CUDA_RWKV7 = _run_cuda
         USE_CUDA = True
-        print("✅ RWKV-7 CUDA Kernel (ClampW + BF16) Ready")
+        CUDA_KERNEL_EXPECTS_FP32 = force_fp32_kernel
+        print(
+            f"✅ RWKV-7 CUDA Kernel (ClampW + {'FP32' if force_fp32_kernel else 'BF16'}) Ready"
+        )
         
     except Exception as e:
         print(f"⚠️ CUDA init failed: {e}")
@@ -201,6 +226,72 @@ class RWKV7_TimeMix(nn.Module):
             self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
             self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
             self.output.weight.data.zero_()
+
+    @staticmethod
+    def _report_nonfinite(x: torch.Tensor, name: str, layer_id: int) -> None:
+        if torch.isfinite(x).all():
+            return
+        with torch.no_grad():
+            bad = ~torch.isfinite(x)
+            bad_count = int(bad.sum().item())
+            total = x.numel()
+            finite_x = x[torch.isfinite(x)]
+            if finite_x.numel() > 0:
+                vmin = float(finite_x.min().item())
+                vmax = float(finite_x.max().item())
+            else:
+                vmin = float("nan")
+                vmax = float("nan")
+            print(
+                f"❌ NaNDebug-TimeMix | layer={layer_id} | tensor={name} | "
+                f"bad={bad_count}/{total} | finite_min={vmin:.6e} | finite_max={vmax:.6e}"
+            )
+
+    @staticmethod
+    def _run_torch_fallback(
+        r: torch.Tensor,
+        w_raw: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        n_head: int,
+        head_size: int,
+    ) -> torch.Tensor:
+        r"""纯 PyTorch 的 TimeMix 递推实现，用于 CUDA kernel 异常时的应急路径。"""
+        B, T, C = r.shape
+        H, N = n_head, head_size
+        r = r.view(B, T, H, N).float()
+        w_raw = w_raw.view(B, T, H, N).float()
+        k = k.view(B, T, H, N).float()
+        v = v.view(B, T, H, N).float()
+        a = a.view(B, T, H, N).float()
+        b = b.view(B, T, H, N).float()
+
+        # 与 CUDA kernel 保持同样的 w 变换
+        w = torch.exp(W_SCALE / (1.0 + torch.exp(-w_raw)))
+
+        state = torch.zeros(B, H, N, N, device=r.device, dtype=torch.float32)
+        ys = []
+        for t in range(T):
+            rt = r[:, t]  # [B,H,N]
+            wt = w[:, t]
+            kt = k[:, t]
+            vt = v[:, t]
+            at = a[:, t]
+            bt = b[:, t]
+
+            sa = (state * at.unsqueeze(-2)).sum(dim=-1)  # [B,H,N_i]
+            state = (
+                state * wt.unsqueeze(-2)
+                + sa.unsqueeze(-1) * bt.unsqueeze(-2)
+                + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+            )
+            yt = (state * rt.unsqueeze(-2)).sum(dim=-1)  # [B,H,N_i]
+            ys.append(yt)
+
+        y = torch.stack(ys, dim=1).reshape(B, T, C)
+        return y.to(r.dtype)
     
     def forward(
         self, x: torch.Tensor, v_first: torch.Tensor = None
@@ -251,12 +342,21 @@ class RWKV7_TimeMix(nn.Module):
         k = k * (1 + (a - 1) * self.k_a)
         
         # RWKV-7 动态状态演化
-        assert USE_CUDA and RUN_CUDA_RWKV7 is not None
-        x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
-        
+        use_fallback = os.environ.get("CAMOE_FORCE_TIMEMIX_FALLBACK", "0") == "1"
+        if (not use_fallback) and USE_CUDA and RUN_CUDA_RWKV7 is not None:
+            x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+        else:
+            x_att = self._run_torch_fallback(r, w, k, v, -kk, kk * a, self.n_head, self.head_size)
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(x_att, "x_att_raw", self.layer_id)
+        if os.environ.get("CAMOE_SANITIZE_TIMEMIX_OUT", "0") == "1":
+            x_att = torch.nan_to_num(x_att, nan=0.0, posinf=0.0, neginf=0.0)
+
             
         state_representation = x_att.clone() 
         x_att = self.ln_x(x_att.view(B * T, C)).view(B, T, C)
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(x_att, "x_att_ln", self.layer_id)
         
         # Bonus term
         x_att = x_att + (
@@ -265,6 +365,8 @@ class RWKV7_TimeMix(nn.Module):
         ).view(B, T, C)
         
         out = self.output(x_att * g)
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(out, "att_out", self.layer_id)
         
         return out, v_first , state_representation
 
