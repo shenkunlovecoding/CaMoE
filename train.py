@@ -310,7 +310,7 @@ def main() -> None:
         input_len = ((max_len - 1 + CHUNK_LEN - 1) // CHUNK_LEN) * CHUNK_LEN
         target_len = max(input_len + 1, CHUNK_LEN + 1)
         
-        padded_batch = torch.zeros(len(batch), target_len, dtype=torch.long)
+        padded_batch = torch.full((len(batch), target_len), -100, dtype=torch.long)
         for i, ids in enumerate(input_ids):
             l = min(len(ids), target_len)
             padded_batch[i, :l] = ids[:l]
@@ -432,7 +432,11 @@ def main() -> None:
             with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=train_use_amp):
                 logits, info = model(x, step=100000, phase="normal")
                 # 只算 Main Loss
-                loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, model.vocab_size),
+                    y.reshape(-1),
+                    ignore_index=-100,
+                )
             
             losses.append(loss.item())
             

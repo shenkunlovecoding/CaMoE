@@ -394,7 +394,8 @@ class CaMoE_System(nn.Module):
         if self.head is not None:
             logits = self.head(x)
         else:
-            #x = x * (self.n_embd ** -0.5) 
+            # Tied embedding 需缩放，避免 logits 幅度过大导致 CE 量纲异常
+            x = x * (self.n_embd ** -0.5)
             logits = F.linear(x, self.emb.weight)
         self._assert_finite(logits, "logits", step, self.n_layer)
         
@@ -426,15 +427,24 @@ class CaMoE_System(nn.Module):
         B, T = targets.shape
         
         # Main Loss
-        main_loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
+        main_loss = F.cross_entropy(
+            logits.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
         
         # Token Losses (for Market Update)
         with torch.no_grad():
             token_losses = F.cross_entropy(
-                logits.reshape(-1, self.vocab_size), targets.reshape(-1), reduction='none'
+                logits.reshape(-1, self.vocab_size),
+                targets.reshape(-1),
+                reduction='none',
+                ignore_index=-100,
             ).reshape(B, T)
             if self.config.get("stabilize_logits", False):
                 token_losses = torch.nan_to_num(token_losses, nan=0.0, posinf=100.0, neginf=0.0)
+            # ignore_index 位置本身为 0 loss，这里再显式归零，避免后续市场更新误用
+            token_losses = token_losses.masked_fill(targets.eq(-100), 0.0)
         
         # Critic Loss
         critic_loss = 0.0
