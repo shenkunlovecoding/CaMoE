@@ -1,7 +1,7 @@
 """
-CaMoE v18 Data Preprocessor (Ultimate Edition)
+CaMoE v19 Data Preprocessor (Ultimate Edition)
 功能:
-1. 加载多个数据源 (TinyStories, Ultrachat, Cosmo, MiniPile)
+1. 加载多个数据源 (FineWeb-Edu, UltraChat-200k, Cosmopedia-100k)
 2. 清洗 & 格式化 (User/Assistant)
 3. 采样 & 混合 (Interleave)
 4. Tokenize & Packing (Rust RWKV Tokenizer)
@@ -18,13 +18,14 @@ import pyrwkv_tokenizer
 
 # ================= 配置 =================
 # 定义你的配方 (Recipe)
-# 格式: "name": (path_or_id, split, mode, probability)
+# 格式1(旧): "name": (path_or_id, split, mode, probability)
+# 格式2(新): "name": (path_or_id, subset_or_none, split, mode, probability)
 # mode: "raw" (纯文本) 或 "chat" (对话)
 DATA_RECIPE = {
-    "tinystories": ("roneneldan/TinyStories", "train[:10%]", "raw", 0.4), # 取10%
-    "cosmopedia":  ("HuggingFaceTB/cosmopedia-100k", "train", "raw", 0.3), # 全量
-    "ultrachat":   ("HuggingFaceH4/ultrachat_200k", "train_sft", "chat", 0.2),
-    "dailydialog": ("roskoN/dailydialog", "train", "chat", 0.1),
+    # 目标方案：FineWeb-Edu(sample-10BT) / UltraChat-200k / Cosmopedia-100k 各 33%
+    "fineweb_edu":      ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "raw", 1.0 / 3.0),
+    "ultrachat_200k":   ("HuggingFaceH4/ultrachat_200k", None, "train_sft", "chat", 1.0 / 3.0),
+    "cosmopedia_100k":  ("HuggingFaceTB/cosmopedia-100k", None, "train", "raw", 1.0 / 3.0),
 }
 
 # 如果 Ultrachat 还是那个 list 格式，我们需要特殊处理
@@ -39,13 +40,13 @@ def get_args() -> argparse.Namespace:
       argparse.Namespace: 解析后的参数对象。
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save_path", type=str, default="./data/camoe_mix_v1", help="保存路径")
+    parser.add_argument("--save_path", type=str, default="./data/camoe_mix_v19_edu_chat_cosmo", help="保存路径")
     parser.add_argument("--ctx_len", type=int, default=1024)
     parser.add_argument("--num_proc", type=int, default=4, help="并行进程数，内存小设为2-4")
     parser.add_argument("--batch_size", type=int, default=100, help="Tokenize批次大小，内存小设为50")
     return parser.parse_args()
 
-def process_text(item: Dict[str, Any], mode: str = "raw") -> str:
+def process_text(item: Dict[str, Any], mode: str = "raw", source: str = "") -> str:
     r"""process_text(item, mode="raw") -> str
 
     将不同来源样本标准化为训练文本。
@@ -59,7 +60,36 @@ def process_text(item: Dict[str, Any], mode: str = "raw") -> str:
     """
     text = ""
     
-    # 1. 尝试获取内容
+    source_l = source.lower()
+
+    # 1) 数据集特化预处理
+    # Cosmopedia: 常见字段为 prompt + text。默认拼接，增强指令->讲解信号。
+    if source_l.startswith("cosmopedia"):
+        prompt = str(item.get("prompt", "")).strip()
+        text = str(item.get("text", "")).strip()
+        merged = text if not prompt else (f"{prompt}\n\n{text}" if text else prompt)
+        return merged
+
+    # FineWeb-Edu: 基于可用字段做轻量质控，过滤低语言置信度/极短样本
+    if source_l.startswith("fineweb"):
+        lang_score = item.get("language_score", None)
+        token_count = item.get("token_count", None)
+        text = str(item.get("text", "")).strip()
+        if lang_score is not None:
+            try:
+                if float(lang_score) < 0.6:
+                    return ""
+            except Exception:
+                pass
+        if token_count is not None:
+            try:
+                if int(token_count) < 32:
+                    return ""
+            except Exception:
+                pass
+        return text
+
+    # 2. 通用路径：尝试获取内容
     # Ultrachat 200k: 'messages' (list[{"role","content"}])
     # Ultrachat(old): 'data' (list)
     # DailyDialog: 'dialog' (list)
@@ -189,15 +219,27 @@ def main() -> None:
     probs = []
     
     # 1. 加载并标准化所有源
-    for name, (path, split, mode, prob) in DATA_RECIPE.items():
+    for name, recipe in DATA_RECIPE.items():
+        if len(recipe) == 4:
+            path, split, mode, prob = recipe
+            subset = None
+        elif len(recipe) == 5:
+            path, subset, split, mode, prob = recipe
+        else:
+            print(f"⚠️ Invalid recipe format for {name}: {recipe}")
+            continue
+
         print(f"  - Loading {name} ({split})...")
         try:
-            ds = load_dataset(path, split=split)
+            if subset is None:
+                ds = load_dataset(path, split=split)
+            else:
+                ds = load_dataset(path, subset, split=split)
             
             # Map: 统一转成 text_processed 列
             # 这里我们用单进程 map 快速处理文本格式化，或者多进程
             ds = ds.map(
-                lambda x: {"text_processed": process_text(x, mode)},
+                lambda x: {"text_processed": process_text(x, mode, name)},
                 remove_columns=ds.column_names, # 移除原始列，只留 text_processed
                 num_proc=args.num_proc,
                 desc=f"Formatting {name}"

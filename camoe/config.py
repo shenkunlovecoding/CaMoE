@@ -13,7 +13,7 @@ VARIANT = "6R2T-Top2-DEA"  # 架构变体：含 DeepEmbed + DeepEmbedAttention
 # ==========================================
 # 自动生成的标识符
 # ==========================================
-RUN_ID = f"MiniPile-{SCALE}-{VARIANT}-{VERSION}"
+RUN_ID = f"FineWebEdu-UltraChat-Cosmopedia-{SCALE}-{VARIANT}-{VERSION}"
 
 # ==========================================
 # 0.4B 规模配置 (v19 主力)
@@ -79,20 +79,18 @@ CONFIG_04B = {
     
     # ===== 路径 (f-string 自动生成) =====
     # 单数据集时使用 data_path；混合时使用 data_roots + mix（课程学习手动 Resume 换阶段）
-    "data_path": "./data/minipile_processed",
+    "data_path": "./data/camoe_mix_v19_edu_chat_cosmo",
     "data_roots": {
-        "tinystories": "./data/tinystories_rwkv_processed",
-        "dialog": "./data/dailydialog_rwkv_processed",
-        "chat": "./data/ultrachat_rwkv_processed",
-        "minipile": "./data/minipile_rwkv_processed",
+        "fineweb_edu": "./data/fineweb_edu_sample10bt_rwkv_processed",
+        "ultrachat_200k": "./data/ultrachat_200k_rwkv_processed",
+        "cosmopedia_100k": "./data/cosmopedia_100k_rwkv_processed",
     },
     # 混合比例：配置好后训练，到下一阶段改比例并 Resume 即可
     # 不配置 mix 则使用 data_path 单数据集
     "mix": {
-        "tinystories": 0.6,
-        "dialog": 0.2,
-        "chat" : 0.2,
-        "minipile": 0.0,
+        "fineweb_edu": 1.0 / 3.0,
+        "ultrachat_200k": 1.0 / 3.0,
+        "cosmopedia_100k": 1.0 / 3.0,
     },
     "weights_path": f"model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
