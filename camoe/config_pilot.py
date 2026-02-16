@@ -1,4 +1,4 @@
-VERSION = "v18-pilot-1"
+VERSION = "v19-pilot-1"
 SCALE = "0.1b" 
 VARIANT = "3R1T-Top2-P32"
 

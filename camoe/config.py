@@ -1,12 +1,12 @@
 """
-CaMoE v18 配置文件
+CaMoE v19 配置文件
 使用 version 字段自动生成路径
 """
 from .config_pilot import CONFIG_PILOT
 # ==========================================
 # 版本控制
 # ==========================================
-VERSION = "v18.5-test"
+VERSION = "v19"
 SCALE = "0.4b"  # "0.1b" or "0.4b"
 VARIANT = "6R2T-Top2-DEA"  # 架构变体：含 DeepEmbed + DeepEmbedAttention
 
@@ -16,7 +16,7 @@ VARIANT = "6R2T-Top2-DEA"  # 架构变体：含 DeepEmbed + DeepEmbedAttention
 RUN_ID = f"MiniPile-{SCALE}-{VARIANT}-{VERSION}"
 
 # ==========================================
-# 0.4B 规模配置 (v18 主力)
+# 0.4B 规模配置 (v19 主力)
 # ==========================================
 CONFIG_04B = {
     # ===== 元信息 =====
@@ -32,7 +32,7 @@ CONFIG_04B = {
     "head_size": 64,
     "vocab_size": 65536,  
     "tied_embeddings": True,  # 共享 Input/Output Embedding
-    "use_deep_embed_attention": True,  # v18.5-test: DeepEmbed + DEA 分支
+    "use_deep_embed_attention": True,  # v19: DeepEmbed + DEA 分支
     "use_shared_deep_embed": True,  # 跨层共享 DeepEmbed 表，显著降低参数/显存
     "dea_q_dim": 256,  # RWKV-8 风格 DEA: q 维度
     "dea_kv_dim": 32,  # RWKV-8 风格 DEA: k/v 低维缓存通道
