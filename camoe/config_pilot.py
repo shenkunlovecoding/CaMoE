@@ -58,6 +58,10 @@ CONFIG_PILOT = {
     "lr_warmup": 5e-4,
     "lr_normal": 3e-4, # 0.1B 可以稍微大一点
     "use_gradient_checkpoint": False,
+    "checkpoint_att_stage": False,
+    "checkpoint_expert_stage": False,
+    "route_no_grad": True,
+    "lazy_prefix_union": True,
     # Diagnostic/runtime switches (no structure change)
     "train_use_amp": False,
     "amp_dtype": "bfloat16",

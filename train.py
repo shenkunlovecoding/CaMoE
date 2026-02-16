@@ -484,14 +484,16 @@ def main() -> None:
     # Logging 逻辑 (回滚到瞬时值 + 修复Step显示)
     # ==========================================
     log_interval = config.get('log_interval', 10)
+    last_phase = None
     
     # 5. Training Loop
     for step in range(start_step, config['total_steps']):
-        torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         
         phase = get_phase(step, config)
-        apply_phase(model, optimizer, phase, config)
+        if phase != last_phase:
+            apply_phase(model, optimizer, phase, config)
+            last_phase = phase
         
         try:
             x_batch = next(train_iter)

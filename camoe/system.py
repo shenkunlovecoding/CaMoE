@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, List
+from contextlib import nullcontext
 from torch.utils.checkpoint import checkpoint
 
 from .backbone import RWKV7_TimeMix, DeepEmbedAttention, SharedDeepEmbed
@@ -41,6 +42,11 @@ class CaMoE_Block(nn.Module):
         self.n_embd = n_embd
         self.bridge = bridge
         self.nan_debug = config.get("nan_debug", False)
+        use_gc = config.get("use_gradient_checkpoint", True)
+        self.checkpoint_att_stage = use_gc and config.get("checkpoint_att_stage", True)
+        self.checkpoint_expert_stage = use_gc and config.get("checkpoint_expert_stage", True)
+        self.route_no_grad = config.get("route_no_grad", True)
+        self.lazy_prefix_union = config.get("lazy_prefix_union", True)
         
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -106,6 +112,159 @@ class CaMoE_Block(nn.Module):
             )
         raise RuntimeError(f"NaN/Inf in block {self.layer_id}, tensor={name}, step={step}")
     
+    def _forward_att_stage(
+        self,
+        x: torch.Tensor,
+        v_first: torch.Tensor,
+        idx: torch.Tensor,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""执行 TimeMix(+DEA) 与 ln2，返回 x_after_att/h/v_first/rwkv_state。"""
+        self._assert_finite(x, "x_in", step)
+        x_ln = self.ln1(x)
+        self._assert_finite(x_ln, "x_ln", step)
+        att_out, v_first, rwkv_state = self.att(x_ln, v_first)
+        self._assert_finite(att_out, "att_out", step)
+        self._assert_finite(v_first, "v_first_att", step)
+        self._assert_finite(rwkv_state, "rwkv_state", step)
+        if self.dea is not None and idx is not None:
+            dea_out = self.dea(x_ln, idx)
+            self._assert_finite(dea_out, "dea_out", step)
+            x_after_att = x + att_out + dea_out
+        else:
+            x_after_att = x + att_out
+        self._assert_finite(x_after_att, "x_after_att", step)
+        h = self.ln2(x_after_att)
+        self._assert_finite(h, "h_ln2", step)
+        return x_after_att, h, v_first, rwkv_state
+
+    def _forward_route_stage(
+        self,
+        h: torch.Tensor,
+        capital_shares: torch.Tensor,
+        router: SparseRouter,
+        use_market: bool,
+        training: bool,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""执行 confidence/critic/router，返回 winners/weights/costs/difficulty/affinity。"""
+        route_ctx = torch.no_grad if self.route_no_grad else nullcontext
+        with route_ctx():
+            route_h = h.detach() if self.route_no_grad else h
+            conf_list = [exp.get_confidence(route_h) for exp in self.experts]
+            confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
+            self._assert_finite(confidences, "confidences", step)
+
+            if not use_market:
+                B, T, _E = confidences.shape
+                winners = torch.randint(0, self.num_experts, (B, T, 2), device=h.device)
+                weights = torch.ones(B, T, 2, device=h.device) * 0.5
+                costs = torch.zeros(B, T, device=h.device)
+                difficulty = torch.ones(B, T, 1, device=h.device)
+                affinity = torch.zeros(B, T, self.num_experts, device=h.device)
+            else:
+                difficulty, affinity = self.critic(route_h)
+                self._assert_finite(difficulty, "difficulty", step)
+                self._assert_finite(affinity, "affinity", step)
+                critic_subsidy = self.critic.subsidy_from_affinity(affinity)
+                self._assert_finite(critic_subsidy, "critic_subsidy", step)
+                winners, weights, costs, bids = router.route(
+                    confidences, capital_shares, difficulty, critic_subsidy, training
+                )
+                self._assert_finite(weights, "weights", step)
+                self._assert_finite(costs, "costs", step)
+                self._assert_finite(bids, "bids", step)
+
+        return winners.detach(), weights.detach(), costs.detach(), difficulty.detach(), affinity.detach()
+
+    def _build_trans_prefix_union(
+        self,
+        h: torch.Tensor,
+        rwkv_state: torch.Tensor,
+        winners: torch.Tensor,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""仅为 Transformer 命中 token 构建 prefix；返回 prefix_union 与索引映射。"""
+        B, T, C = h.shape
+        flat_bt = B * T
+        flat_h = h.reshape(flat_bt, C)
+        flat_state = rwkv_state.reshape(flat_bt, C)
+
+        if not self.lazy_prefix_union:
+            bridge_prefix = self.bridge(flat_h, flat_state)  # [B*T, P, C]
+            self._assert_finite(bridge_prefix, "bridge_prefix_full", step)
+            prefix_indices = torch.arange(flat_bt, device=h.device, dtype=torch.long)
+            return bridge_prefix, prefix_indices
+
+        trans_mask = (winners[:, :, 0] >= self.num_rwkv) | (winners[:, :, 1] >= self.num_rwkv)
+        flat_mask = trans_mask.reshape(-1)
+        prefix_indices = torch.full((flat_bt,), -1, device=h.device, dtype=torch.long)
+
+        if not flat_mask.any():
+            empty_prefix = torch.empty(
+                0,
+                self.bridge.max_prefix_len,
+                C,
+                device=h.device,
+                dtype=h.dtype,
+            )
+            return empty_prefix, prefix_indices
+
+        prefix_union = self.bridge(flat_h[flat_mask], flat_state[flat_mask])  # [N_u, P, C]
+        self._assert_finite(prefix_union, "bridge_prefix_union", step)
+        prefix_indices[flat_mask] = torch.arange(prefix_union.shape[0], device=h.device, dtype=torch.long)
+        return prefix_union, prefix_indices
+
+    def _forward_expert_stage(
+        self,
+        x_after_att: torch.Tensor,
+        h: torch.Tensor,
+        rwkv_state: torch.Tensor,
+        winners: torch.Tensor,
+        weights: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+        r"""执行 Top-2 专家混合并返回 block 输出。"""
+        B, T, C = h.shape
+        prefix_union, prefix_indices = self._build_trans_prefix_union(h, rwkv_state, winners, step)
+        final_out = torch.zeros_like(h)  # [B, T, C]
+
+        for rank in range(2):
+            rank_winners = winners[:, :, rank]  # [B, T]
+            rank_weights = weights[:, :, rank].unsqueeze(-1)  # [B, T, 1]
+
+            for e in range(self.num_experts):
+                mask = (rank_winners == e)  # [B, T]
+                if not mask.any():
+                    continue
+
+                selected_h = h[mask]  # [N, C]
+                selected_weights = rank_weights[mask]  # [N, 1]
+
+                if e >= self.num_rwkv:
+                    flat_mask = mask.reshape(-1)
+                    if self.lazy_prefix_union:
+                        sel_idx = prefix_indices[flat_mask]
+                        valid = sel_idx >= 0
+                        if not valid.any():
+                            continue
+                        expert_out = torch.zeros_like(selected_h)
+                        expert_out[valid] = self.experts[e](selected_h[valid], prefix_union[sel_idx[valid]])
+                    else:
+                        expert_out = self.experts[e](selected_h, prefix_union[flat_mask])
+                else:
+                    expert_out = self.experts[e](selected_h, None)
+                self._assert_finite(expert_out, f"expert_out_e{e}", step)
+
+                weighted_out = expert_out * selected_weights
+                self._assert_finite(weighted_out, f"weighted_out_e{e}", step)
+                final_out[mask] += weighted_out
+
+        self._assert_finite(final_out, "final_out", step)
+        x_out = x_after_att + final_out
+        self._assert_finite(x_out, "x_out", step)
+        return x_out
+
     def forward(self, 
                 x: torch.Tensor, 
                 v_first: torch.Tensor,
@@ -116,116 +275,37 @@ class CaMoE_Block(nn.Module):
                 use_market: bool = True,
                 training: bool = True,
                 idx: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        r"""forward(x, v_first, capital_shares, router, step, warmup_steps, use_market=True, training=True, idx=None) -> Tuple[Tensor, Tensor, Dict]
+        r"""forward(x, v_first, capital_shares, router, step, warmup_steps, use_market=True, training=True, idx=None) -> Tuple[Tensor, Tensor, Dict]"""
+        del warmup_steps
 
-        执行单层前向：并行 TimeMix/DEA、市场路由、专家执行与残差融合。
-
-        Args:
-          x (Tensor): 形状 ``[B, T, C]`` 的输入隐藏状态。
-          v_first (Tensor): RWKV 首层 value 缓存。
-          capital_shares (Tensor): 形状 ``[E]`` 的专家资本占比。
-          router (SparseRouter): 路由器实例。
-          step (int): 当前训练步。
-          warmup_steps (int): warmup 阶段边界。
-          use_market (bool, optional): 是否使用市场路由。Default: ``True``。
-          training (bool, optional): 是否训练模式。Default: ``True``。
-          idx (Tensor, optional): 形状 ``[B, T]`` 的 token id。Default: ``None``。
-
-        Returns:
-          Tuple[Tensor, Tensor, Dict]:
-          更新后的隐藏状态、``v_first`` 与路由信息字典。
-        """
-        
-        B, T, C = x.shape
-        self._assert_finite(x, "x_in", step)
-        
-        # 1. TimeMix + DEA 并行分支（同一份 pre-norm 输入）
-        x_ln = self.ln1(x)
-        self._assert_finite(x_ln, "x_ln", step)
-        att_out, v_first, rwkv_state = self.att(x_ln, v_first)
-        self._assert_finite(att_out, "att_out", step)
-        self._assert_finite(v_first, "v_first_att", step)
-        self._assert_finite(rwkv_state, "rwkv_state", step)
-        if self.dea is not None and idx is not None:
-            dea_out = self.dea(x_ln, idx)
-            self._assert_finite(dea_out, "dea_out", step)
-            x = x + att_out + dea_out
-        else:
-            x = x + att_out
-        self._assert_finite(x, "x_after_att", step)
-        
-        h = self.ln2(x)
-        self._assert_finite(h, "h_ln2", step)
-        
-        # 2. 计算所有专家的 Confidence
-        conf_list = [exp.get_confidence(h) for exp in self.experts]
-        confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
-        self._assert_finite(confidences, "confidences", step)
-        
-        # 3. Market Routing (关键逻辑)
-        if not use_market:
-            # 只有在极罕见的 Debug 模式下才用随机，训练时严禁进入此分支！
-            winners = torch.randint(0, self.num_experts, (B, T, 2), device=x.device)
-            weights = torch.ones(B, T, 2, device=x.device) * 0.5
-            costs = torch.zeros(B, T, device=x.device)
-            difficulty = torch.ones(B, T, 1, device=x.device)
-            affinity = torch.zeros(B, T, self.num_experts, device=x.device)
-        else:
-            difficulty, affinity = self.critic(h)
-            self._assert_finite(difficulty, "difficulty", step)
-            self._assert_finite(affinity, "affinity", step)
-            critic_subsidy = self.critic.apply_to_bids(torch.zeros_like(confidences), affinity)
-            self._assert_finite(critic_subsidy, "critic_subsidy", step)
-            winners, weights, costs, bids = router.route(
-                confidences, capital_shares, difficulty, critic_subsidy, training
+        if self.training and self.checkpoint_att_stage:
+            x_after_att, h, v_first, rwkv_state = checkpoint(
+                lambda xx, vv, ii: self._forward_att_stage(xx, vv, ii, step),
+                x,
+                v_first,
+                idx,
+                use_reentrant=False,
             )
-            self._assert_finite(weights, "weights", step)
-            self._assert_finite(costs, "costs", step)
-            self._assert_finite(bids, "bids", step)
-        
-        # 4. 生成 Bridge Prefix (一次性，供所有 Trans 专家使用)
-        flat_h = h.reshape(-1, C)
-        flat_state = rwkv_state.reshape(-1, C)
-        bridge_prefix = self.bridge(flat_h, flat_state)  # [B*T, P, C]
-        self._assert_finite(bridge_prefix, "bridge_prefix", step)
-        
-        # 5. Top-2 Expert Execution (双路混合)
-        final_out = torch.zeros_like(h)  # [B, T, C]
-        
-        for rank in range(2):
-            rank_winners = winners[:, :, rank]  # [B, T]
-            rank_weights = weights[:, :, rank].unsqueeze(-1)  # [B, T, 1]
-            
-            for e in range(self.num_experts):
-                mask = (rank_winners == e)  # [B, T]
-                if not mask.any():
-                    continue
-                
-                # Gather 被选中的 Token
-                selected_h = h[mask]  # [N, C]
-                selected_weights = rank_weights[mask]  # [N, 1]
-                
-                # 执行专家
-                if e >= self.num_rwkv:
-                    # Transformer: 需要 Prefix
-                    flat_mask = mask.reshape(-1)
-                    selected_prefix = bridge_prefix[flat_mask]  # [N, P, C]
-                    expert_out = self.experts[e](selected_h, selected_prefix)
-                else:
-                    # RWKV: 不需要 Prefix
-                    expert_out = self.experts[e](selected_h, None)
-                self._assert_finite(expert_out, f"expert_out_e{e}", step)
-                
-                # 加权累加
-                weighted_out = expert_out * selected_weights
-                self._assert_finite(weighted_out, f"weighted_out_e{e}", step)
-                final_out[mask] += weighted_out
+        else:
+            x_after_att, h, v_first, rwkv_state = self._forward_att_stage(x, v_first, idx, step)
 
-        # 残差连接
-        self._assert_finite(final_out, "final_out", step)
-        x = x + final_out
-        self._assert_finite(x, "x_out", step)
-        
+        winners, weights, costs, difficulty, affinity = self._forward_route_stage(
+            h, capital_shares, router, use_market, training, step
+        )
+
+        if self.training and self.checkpoint_expert_stage:
+            x = checkpoint(
+                lambda x0, h0, s0, w0, wt0: self._forward_expert_stage(x0, h0, s0, w0, wt0, step),
+                x_after_att,
+                h,
+                rwkv_state,
+                winners,
+                weights,
+                use_reentrant=False,
+            )
+        else:
+            x = self._forward_expert_stage(x_after_att, h, rwkv_state, winners, weights, step)
+
         info = {
             "winners": winners,
             "costs": costs,
@@ -362,19 +442,10 @@ class CaMoE_System(nn.Module):
 
         for i, block in enumerate(self.blocks):
             shares = self.capital_manager.get_shares(i)
-            if self.training and self.use_gradient_checkpoint:
-                # 开启 Checkpoint 以节省显存
-                x, v_first, info = checkpoint(
-                    block, 
-                    x, v_first, shares, self.router, 
-                    step, warmup_steps, use_market, True, idx,
-                    use_reentrant=False
-                )
-            else:
-                x, v_first, info = block(
-                    x, v_first, shares, self.router,
-                    step, warmup_steps, use_market, self.training, idx
-                )
+            x, v_first, info = block(
+                x, v_first, shares, self.router,
+                step, warmup_steps, use_market, self.training, idx
+            )
 
             self._assert_finite(x, "block_out", step, i)
             self._assert_finite(v_first, "v_first", step, i)

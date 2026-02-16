@@ -76,9 +76,21 @@ class CriticVC(nn.Module):
         Returns:
           Tensor: 修正后的报价，形状 ``[B, T, E]``。
         """
+        return bids + self.subsidy_from_affinity(affinity)
+
+    def subsidy_from_affinity(self, affinity: torch.Tensor) -> torch.Tensor:
+        r"""subsidy_from_affinity(affinity) -> Tensor
+
+        仅根据 affinity 生成报价修正（不需要分配与 bids 同形状的全零张量）。
+
+        Args:
+          affinity (Tensor): 形状 ``[B, T, E]``。
+
+        Returns:
+          Tensor: 形状 ``[B, T, E]`` 的 subsidy。
+        """
         capital_ratio = (self.capital / self.init_capital).clamp(0.1, 2.0)
-        modification = affinity * capital_ratio * 0.05
-        return bids + modification
+        return affinity * capital_ratio * 0.05
     
     def settle(self, affinity: torch.Tensor, winners: torch.Tensor, 
                token_losses: torch.Tensor, baseline: float) -> Dict:

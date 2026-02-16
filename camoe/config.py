@@ -67,6 +67,10 @@ CONFIG_04B = {
     "lr_warmup": 2e-4,
     "lr_normal": 3e-4,
     "use_gradient_checkpoint": True,
+    "checkpoint_att_stage": True,
+    "checkpoint_expert_stage": True,
+    "route_no_grad": True,
+    "lazy_prefix_union": True,
     
     # ===== 日志与评估 =====
     "log_interval": 10,
@@ -119,6 +123,10 @@ CONFIG_04B_TOY = {
     "cuda_use_fast_math": True,
     "cuda_force_fp32_kernel": False,
     "use_gradient_checkpoint": False,
+    "checkpoint_att_stage": False,
+    "checkpoint_expert_stage": False,
+    "route_no_grad": True,
+    "lazy_prefix_union": True,
     "data_path": "./data/camoe_mix_v1",
     "mix": None,
     "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
@@ -175,6 +183,11 @@ CONFIG_01B = {
     "lr_prewarm": 1e-4,
     "lr_warmup": 2e-4,
     "lr_normal": 3e-4,
+    "use_gradient_checkpoint": True,
+    "checkpoint_att_stage": True,
+    "checkpoint_expert_stage": True,
+    "route_no_grad": True,
+    "lazy_prefix_union": True,
     
     # ===== 日志与评估 =====
     "log_interval": 10,

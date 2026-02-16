@@ -95,7 +95,7 @@ class CapitalManager(nn.Module):
                 
                 performance = baseline - real_loss
                 profit = performance - expense
-                caps[e] += profit.sum().item()
+                caps[e] = caps[e] + profit.sum()
             
             # 累进税
             avg_cap = caps.mean()
