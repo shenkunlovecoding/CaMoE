@@ -394,6 +394,8 @@ def get_config(scale: str = "0.4b"):
         return CONFIG_04B_TOY
     if scale == "0.1b":
         return CONFIG_01B
+    if scale == "pilot":
+        return CONFIG_PILOT
     raise ValueError(f"Unknown scale: {scale}")
 
 

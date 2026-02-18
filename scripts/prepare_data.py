@@ -23,9 +23,7 @@ import pyrwkv_tokenizer
 # mode: "raw" (纯文本) 或 "chat" (对话)
 DATA_RECIPE = {
     # 目标方案：FineWeb-Edu(sample-10BT) / UltraChat-200k / Cosmopedia-100k 各 33%
-    "fineweb_edu":      ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "raw", 1.0 / 3.0),
-    "ultrachat_200k":   ("HuggingFaceH4/ultrachat_200k", None, "train_sft", "chat", 1.0 / 3.0),
-    "cosmopedia_100k":  ("HuggingFaceTB/cosmopedia-100k", None, "train", "raw", 1.0 / 3.0),
+    "tinystories":      ("roneneldan/TinyStories", None, "train", "raw", 1.0),
 }
 
 # 如果 Ultrachat 还是那个 list 格式，我们需要特殊处理
@@ -40,7 +38,7 @@ def get_args() -> argparse.Namespace:
       argparse.Namespace: 解析后的参数对象。
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save_path", type=str, default="./data/camoe_mix_v19_edu_chat_cosmo", help="保存路径")
+    parser.add_argument("--save_path", type=str, default="./data/camoe_toy_mix", help="保存路径")
     parser.add_argument("--ctx_len", type=int, default=1024)
     parser.add_argument("--num_proc", type=int, default=4, help="并行进程数，内存小设为2-4")
     parser.add_argument("--batch_size", type=int, default=100, help="Tokenize批次大小，内存小设为50")
