@@ -249,11 +249,16 @@ class CaMoE_Block(nn.Module):
                         if not valid.any():
                             continue
                         expert_out = torch.zeros_like(selected_h)
-                        expert_out[valid] = self.experts[e](selected_h[valid], prefix_union[sel_idx[valid]])
+                        expert_valid = self.experts[e](selected_h[valid], prefix_union[sel_idx[valid]])
+                        if expert_valid.dtype != expert_out.dtype:
+                            expert_valid = expert_valid.to(expert_out.dtype)
+                        expert_out[valid] = expert_valid
                     else:
                         expert_out = self.experts[e](selected_h, prefix_union[flat_mask])
                 else:
                     expert_out = self.experts[e](selected_h, None)
+                if expert_out.dtype != selected_h.dtype:
+                    expert_out = expert_out.to(selected_h.dtype)
                 self._assert_finite(expert_out, f"expert_out_e{e}", step)
 
                 weighted_out = expert_out * selected_weights
@@ -327,6 +332,7 @@ class CaMoE_System(nn.Module):
         self.vocab_size = config['vocab_size']
         self.use_gradient_checkpoint = config.get("use_gradient_checkpoint", True)
         self.nan_debug = config.get("nan_debug", False)
+        self.economy_cfg = config.get("economy", {})
         
         self.num_rwkv_experts = config.get('num_rwkv_experts', 6)
         self.num_trans_experts = config.get('num_trans_experts', 2)
@@ -378,10 +384,14 @@ class CaMoE_System(nn.Module):
             total_capital=config.get('total_capital', 10000.0),
             min_share=config.get('min_capital_share', 0.05),
             tax_threshold=config.get('tax_threshold', 2.0),
-            tax_rate=config.get('tax_rate', 0.1)
+            tax_rate=config.get('tax_rate', 0.1),
+            economy=self.economy_cfg,
         )
         
         self.router = SparseRouter()
+        self.register_buffer("layer_performance_ema", torch.zeros(self.n_layer))
+        self._critic_loss_ema = None
+        self._last_critic_bonus_signal = 0.0
 
     def _assert_finite(self, x: torch.Tensor, name: str, step: int, layer_id: int = -1) -> None:
         r"""_assert_finite(x, name, step, layer_id=-1) -> None
@@ -532,36 +542,139 @@ class CaMoE_System(nn.Module):
         
         return total_loss, token_losses, main_loss, critic_loss, bridge_loss
     
-    def update_market(self, all_info: Dict, token_losses: torch.Tensor, step: int) -> None:
-        r"""update_market(all_info, token_losses, step) -> None
+    def _compute_critic_bonus_signal(self, critic_loss) -> float:
+        if critic_loss is None:
+            return 0.0
+        curr = float(critic_loss.detach().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+        eps = 1e-6
+        momentum = float(self.economy_cfg.get("critic_bonus_ema_momentum", 0.95))
 
-        根据 token 级损失结算市场状态与 Critic 资本。
+        if self._critic_loss_ema is None:
+            self._critic_loss_ema = curr
+            return 0.0
 
-        Args:
-          all_info (Dict): 前向收集的市场信息。
-          token_losses (Tensor): 形状 ``[B, T]``。
-          step (int): 当前训练步。
-        """
+        prev = self._critic_loss_ema
+        signal = (prev - curr) / (abs(prev) + eps)
+        self._critic_loss_ema = momentum * prev + (1.0 - momentum) * curr
+        return float(signal)
+
+    def _build_donor_state(self, donor_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
+        donor_state = {}
+        if donor_indices.numel() == 0:
+            return donor_state
+
+        weights = []
+        for idx in donor_indices.tolist():
+            cap = torch.clamp(self.blocks[idx].critic.capital, min=1.0)
+            weights.append(cap)
+        weight_tensor = torch.stack(weights)
+        norm_w = weight_tensor / (weight_tensor.sum() + 1e-6)
+
+        for name, _p in self.blocks[0].critic.named_parameters():
+            acc = None
+            for w, idx in zip(norm_w, donor_indices.tolist()):
+                src = dict(self.blocks[idx].critic.named_parameters())[name].detach()
+                term = src * w.to(src.dtype)
+                acc = term if acc is None else (acc + term)
+            donor_state[name] = acc
+        return donor_state
+
+    def _handle_critic_bankruptcy_and_restructure(self, layer_idx: int, step: int) -> None:
+        critic = self.blocks[layer_idx].critic
+        threshold = float(self.economy_cfg.get("critic_bankrupt_threshold_ratio", 0.2)) * critic.init_capital
+        bailout_base = float(self.economy_cfg.get("bailout_base", 1000.0))
+        bailout_decay = float(self.economy_cfg.get("bailout_decay", 0.65))
+        bailout_min = float(self.economy_cfg.get("bailout_min", 200.0))
+        alpha = float(self.economy_cfg.get("restructure_alpha", 0.12))
+        donor_topk = int(self.economy_cfg.get("donor_topk", 2))
+
+        if float(critic.capital.item()) >= threshold:
+            return
+
+        bcount = float(critic.bailout_count.item())
+        bailout = max(bailout_min, bailout_base * (bailout_decay ** bcount))
+        critic.capital = critic.capital + bailout
+        critic.debt = critic.debt + bailout
+        critic.bailout_count = critic.bailout_count + 1
+
+        if self.n_layer <= 1:
+            return
+
+        scores = self.layer_performance_ema.clone()
+        scores[layer_idx] = -1e9
+        k = min(donor_topk, self.n_layer - 1)
+        donor_indices = torch.topk(scores, k=k).indices
+        donor_state = self._build_donor_state(donor_indices)
+        critic.restructure_from_donors(donor_state, alpha=alpha)
+
+        if step % 100 == 0:
+            print(f"🏛️ Layer {layer_idx}: Critic bailout={bailout:.2f}, debt={float(critic.debt.item()):.2f}")
+
+    def update_market(
+        self,
+        all_info: Dict,
+        token_losses: torch.Tensor,
+        step: int,
+        phase: str = "normal",
+        critic_loss=None,
+    ) -> None:
+        r"""update_market(all_info, token_losses, step, phase="normal", critic_loss=None) -> None"""
         with torch.no_grad():
+            bonus_signal = self._compute_critic_bonus_signal(critic_loss)
+            bonus_clip = self.economy_cfg.get("critic_bonus_clip", (-0.1, 0.3))
+            clipped_signal = float(max(float(bonus_clip[0]), min(float(bonus_clip[1]), bonus_signal)))
+            self._last_critic_bonus_signal = clipped_signal
+
+            if phase == "criticwarm":
+                reward_scale = float(self.economy_cfg.get("criticwarm_reward_scale", 2.0))
+                penalty_scale = float(self.economy_cfg.get("criticwarm_penalty_scale", 0.4))
+                critic_bonus_scale = float(self.economy_cfg.get("critic_bonus_scale", 0.2))
+            else:
+                reward_scale = 1.0
+                penalty_scale = 1.0
+                critic_bonus_scale = 0.0
+
+            base_commission = float(self.economy_cfg.get("base_commission", 0.8))
+            dividend_scale = float(self.economy_cfg.get("dividend_scale", 0.6))
+            dividend_std_factor = float(self.economy_cfg.get("dividend_std_factor", 0.5))
+            repay_ratio = float(self.economy_cfg.get("repay_ratio", 0.25))
+
             for i in range(self.n_layer):
-                if i >= len(all_info.get("winners", [])): 
+                if i >= len(all_info.get("winners", [])):
                     continue
-                
-                self.capital_manager.update(
+
+                _cap_stats = self.capital_manager.update(
                     i, all_info["winners"][i], token_losses, all_info["costs"][i]
                 )
-                
-                baseline = self.capital_manager.baseline_losses[i].item()
+
+                baseline = float(self.capital_manager.baseline_losses[i].item())
+                perf = baseline - float(token_losses.mean().item())
+                self.layer_performance_ema[i] = 0.95 * self.layer_performance_ema[i] + 0.05 * perf
+
                 self.blocks[i].critic.settle(
-                    all_info["affinities"][i], all_info["winners"][i],
-                    token_losses, baseline
+                    all_info["affinities"][i],
+                    all_info["winners"][i],
+                    token_losses,
+                    baseline,
+                    reward_scale=reward_scale,
+                    penalty_scale=penalty_scale,
+                    critic_bonus_scale=critic_bonus_scale,
+                    bonus_clip=bonus_clip,
+                    critic_loss_signal=clipped_signal,
+                    base_commission=base_commission,
+                    dividend_scale=dividend_scale,
+                    dividend_std_factor=dividend_std_factor,
                 )
 
-                # Bailout logic
-                if self.blocks[i].critic.capital < 200:
-                    self.blocks[i].critic.capital.fill_(2000.0)
-                    if step % 100 == 0:
-                        print(f"🏛️  Layer {i}: Critic Bailout (Step {step})")
+                # 债务自动偿还
+                critic = self.blocks[i].critic
+                if float(critic.debt.item()) > 0:
+                    repay_base = torch.clamp(critic.capital - critic.init_capital * 0.2, min=0.0)
+                    repay = torch.clamp(repay_base * repay_ratio, min=0.0, max=critic.debt)
+                    critic.capital = critic.capital - repay
+                    critic.debt = critic.debt - repay
+
+                self._handle_critic_bankruptcy_and_restructure(i, step)
     
     def log_market_health(self) -> Dict:
         r"""log_market_health() -> Dict
@@ -588,5 +701,16 @@ class CaMoE_System(nn.Module):
             metrics[f"L{i}/RWKVShare"] = rwkv_share.item()
             metrics[f"L{i}/Gini"] = gini.item()
             metrics[f"L{i}/CriticCap"] = self.blocks[i].critic.capital.item()
+            metrics[f"L{i}/CriticDebt"] = self.blocks[i].critic.debt.item()
+            metrics[f"L{i}/BailoutCount"] = self.blocks[i].critic.bailout_count.item()
+            metrics[f"L{i}/AssetVelocity"] = self.capital_manager.get_asset_velocity(i).item()
+            metrics[f"L{i}/QEInject"] = self.capital_manager.last_qe_inject[i].item()
+            metrics[f"L{i}/QEDrain"] = self.capital_manager.last_qe_drain[i].item()
+            metrics[f"L{i}/IdleTax"] = self.capital_manager.last_idle_tax[i].item()
+            metrics[f"L{i}/Depreciation"] = self.capital_manager.last_depreciation[i].item()
+            metrics[f"L{i}/ProfitFlow"] = self.capital_manager.last_profit_flow[i].item()
+            metrics[f"L{i}/WealthTax"] = self.capital_manager.last_wealth_tax[i].item()
+            metrics[f"L{i}/PerfEMA"] = self.layer_performance_ema[i].item()
+            metrics[f"L{i}/CriticBonusSignal"] = float(self._last_critic_bonus_signal)
         
         return metrics

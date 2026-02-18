@@ -1,22 +1,152 @@
 """
-CaMoE v19 配置文件
-使用 version 字段自动生成路径
+CaMoE v20 配置文件
+7 阶段训练调度 + 经济系统增强版
 """
+
 from .config_pilot import CONFIG_PILOT
+
 # ==========================================
 # 版本控制
 # ==========================================
-VERSION = "v19"
-SCALE = "0.4b"  # "0.1b" or "0.4b"
-VARIANT = "6R2T-Top2-DEA"  # 架构变体：含 DeepEmbed + DeepEmbedAttention
+VERSION = "v20"
+SCALE = "0.4b"
+VARIANT = "6R2T-Top2"
 
 # ==========================================
-# 自动生成的标识符
+# 自动生成标识符
 # ==========================================
-RUN_ID = f"FineWebEdu-UltraChat-Cosmopedia-{SCALE}-{VARIANT}-{VERSION}"
+RUN_ID = f"FineWeb70-Cosmo30-{SCALE}-{VARIANT}-{VERSION}"
 
 # ==========================================
-# 0.4B 规模配置 (v19 主力)
+# 通用分组名（用于分阶段训练）
+# ==========================================
+PARAM_GROUPS = [
+    "rwkv_backbone",
+    "rwkv_experts",
+    "trans_experts",
+    "bridge",
+    "critic",
+    "emb_head",
+]
+
+# ==========================================
+# v20 七阶段调度（SFT/RLHF 占位）
+# ==========================================
+PHASE_SCHEDULE_V20 = [
+    {
+        "name": "prewarm",
+        "steps": 2000,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["trans_experts", "bridge"],
+        "lr_mult": {
+            "rwkv_backbone": 0.0,
+            "rwkv_experts": 0.0,
+            "trans_experts": 1.0,
+            "bridge": 1.0,
+            "critic": 0.0,
+            "emb_head": 0.0,
+        },
+        "market_update": False,
+    },
+    {
+        "name": "warm",
+        "steps": 3000,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.35,
+            "rwkv_experts": 0.35,
+            "trans_experts": 0.35,
+            "bridge": 0.35,
+            "critic": 0.35,
+            "emb_head": 0.35,
+        },
+        "market_update": False,
+    },
+    {
+        "name": "criticwarm",
+        "steps": 4000,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["critic"],
+        "lr_mult": {
+            "rwkv_backbone": 0.0,
+            "rwkv_experts": 0.0,
+            "trans_experts": 0.0,
+            "bridge": 0.0,
+            "critic": 2.0,
+            "emb_head": 0.0,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "prenormal",
+        "steps": 3000,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.35,
+            "rwkv_experts": 0.6,
+            "trans_experts": 0.8,
+            "bridge": 0.8,
+            "critic": 1.6,
+            "emb_head": 0.5,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "normal",
+        "steps": 40000,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.7,
+            "rwkv_experts": 1.0,
+            "trans_experts": 1.0,
+            "bridge": 1.0,
+            "critic": 1.0,
+            "emb_head": 0.8,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "sft",
+        "steps": 0,
+        "data_profile": "ultrachat_100",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.5,
+            "rwkv_experts": 0.8,
+            "trans_experts": 0.8,
+            "bridge": 0.6,
+            "critic": 0.5,
+            "emb_head": 0.8,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "rlhf",
+        "steps": 0,
+        "data_profile": "rlhf_placeholder",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.3,
+            "rwkv_experts": 0.5,
+            "trans_experts": 0.5,
+            "bridge": 0.4,
+            "critic": 0.6,
+            "emb_head": 0.6,
+        },
+        "market_update": True,
+    },
+]
+
+
+def _total_steps(schedule):
+    return int(sum(max(0, int(p.get("steps", 0))) for p in schedule))
+
+
+# ==========================================
+# 0.4B 主配置（v20）
 # ==========================================
 CONFIG_04B = {
     # ===== 元信息 =====
@@ -25,81 +155,199 @@ CONFIG_04B = {
     "variant": VARIANT,
     "project": f"CaMoE-{VERSION}",
     "run_name": RUN_ID,
-    
     # ===== 模型结构 =====
     "n_embd": 1024,
-    "n_layer": 16,  # 比 0.1b 的 12 层多
+    "n_layer": 16,
     "head_size": 64,
-    "vocab_size": 65536,  
-    "tied_embeddings": True,  # 共享 Input/Output Embedding
-    "use_deep_embed_attention": True,  # v19: DeepEmbed + DEA 分支
-    "use_shared_deep_embed": True,  # 跨层共享 DeepEmbed 表，显著降低参数/显存
-    "dea_q_dim": 256,  # RWKV-8 风格 DEA: q 维度
-    "dea_kv_dim": 32,  # RWKV-8 风格 DEA: k/v 低维缓存通道
+    "vocab_size": 65536,
+    "tied_embeddings": True,
+    "use_deep_embed_attention": False,
+    "use_shared_deep_embed": True,
+    "dea_q_dim": 256,
+    "dea_kv_dim": 32,
     "dea_score_scale": 1024.0,
     "dea_cap_scale": 64.0,
-    
-    # ===== CaMoE 专家配置 (6R2T) =====
+    # ===== 专家配置 =====
     "num_rwkv_experts": 6,
     "num_trans_experts": 2,
-    "top_k": 2,  # Top-2 路由
+    "top_k": 2,
     "prefix_len": 48,
-    "low_rank_dim": 64,  # Bridge 低秩维度
-    
-    # ===== Market 参数 =====
+    "low_rank_dim": 64,
+    # ===== 优化器与阶段 =====
+    "base_lr": 1e-4,
+    "phase_schedule": PHASE_SCHEDULE_V20,
+    "sft_steps": 0,
+    "rlhf_steps": 0,
+    "total_steps": _total_steps(PHASE_SCHEDULE_V20),
+    "param_groups": PARAM_GROUPS,
+    # ===== Market 参数（兼容旧键） =====
     "total_capital": 10000.0,
     "min_capital_share": 0.05,
     "tax_threshold": 2.0,
     "tax_rate": 0.1,
-    
-    # ===== 训练参数 (RTX 5090 32GB；开启 DEA 时显存略增，可酌情微调 micro_batch_size) =====
+    # ===== 经济系统（v20） =====
+    "economy": {
+        # 中央银行 / QE
+        "qe_low_ratio": 0.85,
+        "qe_high_ratio": 1.20,
+        "qe_inject_ratio": 0.20,
+        "qe_drain_ratio": 0.10,
+        "qe_floor_alloc_ratio": 0.70,
+        # 基础算力保障
+        "base_compute_floor_ratio": 0.06,
+        # 破产保护 + 债务重组
+        "critic_bankrupt_threshold_ratio": 0.20,
+        "bailout_base": 1000.0,
+        "bailout_decay": 0.65,
+        "bailout_min": 200.0,
+        "repay_ratio": 0.25,
+        "restructure_alpha": 0.12,
+        "donor_topk": 2,
+        # 闲置税 + 折旧
+        "idle_threshold": 0.01,
+        "idle_tax_rate": 0.02,
+        "depreciation_rate": 0.001,
+        # 分红
+        "base_commission": 0.8,
+        "dividend_scale": 0.6,
+        "dividend_std_factor": 0.5,
+        # CriticWarm 奖励增强（中等）
+        "criticwarm_reward_scale": 2.0,
+        "criticwarm_penalty_scale": 0.4,
+        "critic_bonus_scale": 0.2,
+        "critic_bonus_clip": (-0.1, 0.3),
+        "critic_bonus_ema_momentum": 0.95,
+    },
+    # ===== 训练参数 =====
     "micro_batch_size": 6,
     "ctx_len": 1024,
-    "grad_accum": 8,  # 有效 batch = 48
-    "total_steps": 100000,
-    
-    # ===== 阶段控制 (超长预热) =====
-    "prewarm_steps": 4000,   # 冻结 RWKV，只训 Bridge/Trans
-    "warmup_steps": 10000,   # 全参数热身
-    
-    # ===== 学习率 =====
-    "lr_prewarm": 1e-4,
-    "lr_warmup": 2e-4,
-    "lr_normal": 3e-4,
+    "grad_accum": 8,
     "use_gradient_checkpoint": True,
     "checkpoint_att_stage": True,
     "checkpoint_expert_stage": True,
     "route_no_grad": True,
     "lazy_prefix_union": True,
-    
     # ===== 日志与评估 =====
     "log_interval": 10,
     "eval_interval": 1000,
     "eval_iters": 50,
-    
-    # ===== 路径 (f-string 自动生成) =====
-    # 单数据集时使用 data_path；混合时使用 data_roots + mix（课程学习手动 Resume 换阶段）
-    "data_path": "./data/camoe_mix_v19_edu_chat_cosmo",
+    # ===== 数据 =====
+    "data_path": "./data/camoe_mix_v20_fineweb70_cosmo30",
     "data_roots": {
         "fineweb_edu": "./data/fineweb_edu_sample10bt_rwkv_processed",
         "ultrachat_200k": "./data/ultrachat_200k_rwkv_processed",
         "cosmopedia_100k": "./data/cosmopedia_100k_rwkv_processed",
     },
-    # 混合比例：配置好后训练，到下一阶段改比例并 Resume 即可
-    # 不配置 mix 则使用 data_path 单数据集
-    "mix": {
-        "fineweb_edu": 1.0 / 3.0,
-        "ultrachat_200k": 1.0 / 3.0,
-        "cosmopedia_100k": 1.0 / 3.0,
+    "data_profiles": {
+        "fineweb_cosmo_70_30": {
+            "mix": {
+                "fineweb_edu": 0.70,
+                "cosmopedia_100k": 0.30,
+            }
+        },
+        "ultrachat_100": {
+            "mix": {
+                "ultrachat_200k": 1.0,
+            }
+        },
+        "rlhf_placeholder": {
+            "mix": {},
+        },
     },
-    "weights_path": f"model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
+    # 兼容旧代码路径（默认等于主 profile）
+    "mix": {
+        "fineweb_edu": 0.70,
+        "cosmopedia_100k": 0.30,
+    },
+    # ===== 其他 =====
+    "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
     "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
     "save_dir": f"checkpoints/{VERSION}_{SCALE}",
+    # ===== 旧字段兼容（用于旧逻辑 fallback） =====
+    "prewarm_steps": 2000,
+    "warmup_steps": 5000,
+    "lr_prewarm": 1e-4,
+    "lr_warmup": 3.5e-5,
+    "lr_normal": 1e-4,
 }
 
+
 # ==========================================
-# 0.4B Toy 配置（快速验证流程）
+# 0.4B Toy 配置（快速验证）
 # ==========================================
+CONFIG_04B_TOY_PHASES = [
+    {
+        "name": "prewarm",
+        "steps": 100,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["trans_experts", "bridge"],
+        "lr_mult": {
+            "rwkv_backbone": 0.0,
+            "rwkv_experts": 0.0,
+            "trans_experts": 1.0,
+            "bridge": 1.0,
+            "critic": 0.0,
+            "emb_head": 0.0,
+        },
+        "market_update": False,
+    },
+    {
+        "name": "warm",
+        "steps": 150,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {g: 0.35 for g in PARAM_GROUPS},
+        "market_update": False,
+    },
+    {
+        "name": "criticwarm",
+        "steps": 200,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["critic"],
+        "lr_mult": {
+            "rwkv_backbone": 0.0,
+            "rwkv_experts": 0.0,
+            "trans_experts": 0.0,
+            "bridge": 0.0,
+            "critic": 2.0,
+            "emb_head": 0.0,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "prenormal",
+        "steps": 100,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.35,
+            "rwkv_experts": 0.6,
+            "trans_experts": 0.8,
+            "bridge": 0.8,
+            "critic": 1.6,
+            "emb_head": 0.5,
+        },
+        "market_update": True,
+    },
+    {
+        "name": "normal",
+        "steps": 450,
+        "data_profile": "fineweb_cosmo_70_30",
+        "train_groups": ["all"],
+        "lr_mult": {
+            "rwkv_backbone": 0.7,
+            "rwkv_experts": 1.0,
+            "trans_experts": 1.0,
+            "bridge": 1.0,
+            "critic": 1.0,
+            "emb_head": 0.8,
+        },
+        "market_update": True,
+    },
+    {"name": "sft", "steps": 0, "data_profile": "ultrachat_100", "train_groups": ["all"], "lr_mult": {}, "market_update": True},
+    {"name": "rlhf", "steps": 0, "data_profile": "rlhf_placeholder", "train_groups": ["all"], "lr_mult": {}, "market_update": True},
+]
+
 CONFIG_04B_TOY = {
     **CONFIG_04B,
     "scale": "0.4b_toy",
@@ -107,15 +355,13 @@ CONFIG_04B_TOY = {
     "micro_batch_size": 1,
     "ctx_len": 512,
     "grad_accum": 24,
-    "total_steps": 6000,
-    "prewarm_steps": 500,
-    "warmup_steps": 1500,
+    "phase_schedule": CONFIG_04B_TOY_PHASES,
+    "total_steps": _total_steps(CONFIG_04B_TOY_PHASES),
+    "log_interval": 10,
     "eval_interval": 200,
     "eval_iters": 20,
-    "lr_prewarm": 3e-5,
-    "lr_warmup": 8e-5,
-    "lr_normal": 1e-4,
-    # Diagnostic/runtime switches (no structure change)
+    "base_lr": 8e-5,
+    # Diagnostic/runtime switches
     "train_use_amp": True,
     "amp_dtype": "bfloat16",
     "cuda_use_fast_math": True,
@@ -125,98 +371,31 @@ CONFIG_04B_TOY = {
     "checkpoint_expert_stage": False,
     "route_no_grad": True,
     "lazy_prefix_union": True,
-    "data_path": "./data/camoe_mix_v1",
-    "mix": None,
     "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
 }
 
+
 # ==========================================
-# 0.1B 规模配置 (测试/对照组)
+# 0.1B 配置（保持 pilot）
 # ==========================================
 CONFIG_01B = {
-    # ===== 元信息 =====
+    **CONFIG_PILOT,
     "version": VERSION,
-    "scale": "0.1b",
-    "variant": "3R1T-Top2",
     "project": f"CaMoE-{VERSION}",
-    "run_name": f"MiniPile-0.1b-3R1T-Top2-{VERSION}",
-    
-    # ===== 模型结构 =====
-    "n_embd": 768,
-    "n_layer": 12,
-    "head_size": 64,
-    "vocab_size": 32000,
-    "tied_embeddings": True,
-    "use_deep_embed_attention": False,
-    "use_shared_deep_embed": True,
-    "dea_q_dim": 256,
-    "dea_kv_dim": 32,
-    "dea_score_scale": 1024.0,
-    "dea_cap_scale": 64.0,
-    
-    # ===== CaMoE 专家配置 (3R1T) =====
-    "num_rwkv_experts": 3,
-    "num_trans_experts": 1,
-    "top_k": 2,
-    "prefix_len": 64,
-    "low_rank_dim": 64,
-    
-    # ===== Market 参数 =====
-    "total_capital": 10000.0,
-    "min_capital_share": 0.05,
-    "tax_threshold": 2.0,
-    "tax_rate": 0.1,
-    
-    # ===== 训练参数 =====
-    "micro_batch_size": 4,
-    "ctx_len": 768,
-    "grad_accum": 12,
-    "total_steps": 40000,
-    
-    # ===== 阶段控制 =====
-    "prewarm_steps": 2000,
-    "warmup_steps": 6000,
-    
-    # ===== 学习率 =====
-    "lr_prewarm": 1e-4,
-    "lr_warmup": 2e-4,
-    "lr_normal": 3e-4,
-    "use_gradient_checkpoint": True,
-    "checkpoint_att_stage": True,
-    "checkpoint_expert_stage": True,
-    "route_no_grad": True,
-    "lazy_prefix_union": True,
-    
-    # ===== 日志与评估 =====
-    "log_interval": 10,
-    "eval_interval": 1000,
-    "eval_iters": 50,
-    
-    # ===== 路径 =====
-    "data_path": "./data/minipile_processed",
-    "data_roots": {
-        "tinystories": "./data/tinystories_rwkv_processed",
-        "dialog": "./data/dialog_rwkv_processed",
-        "minipile": "./data/minipile_rwkv_processed",
-    },
-    "mix": None,  # 0.1b 默认单数据集，需要时配置 mix
-    "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
-    "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
+    "run_name": f"Pilot-0.1b-{VERSION}",
     "save_dir": f"checkpoints/{VERSION}_0.1b",
 }
 
-# ==========================================
-# 默认配置选择
-# ==========================================
+
 def get_config(scale: str = "0.4b"):
     if scale == "0.4b":
         return CONFIG_04B
-    elif scale == "0.4b_toy":
+    if scale == "0.4b_toy":
         return CONFIG_04B_TOY
-    elif scale == "0.1b":
-        return CONFIG_PILOT
-    else:
-        raise ValueError(f"Unknown scale: {scale}")
+    if scale == "0.1b":
+        return CONFIG_01B
+    raise ValueError(f"Unknown scale: {scale}")
+
 
 # 向后兼容
 CONFIG_MINIPILE = CONFIG_04B

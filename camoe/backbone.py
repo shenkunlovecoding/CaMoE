@@ -50,8 +50,7 @@ def init_rwkv7_cuda():
             '-res-usage', 
             f'-D_N_={HEAD_SIZE}', 
             f"-D_CHUNK_LEN_={CHUNK_LEN}", 
-            "-O3", 
-            "-Xptxas -O3", 
+            "-O3",  
             "--extra-device-vectorization"
         ]
         if use_fast_math:

@@ -1,13 +1,13 @@
 """
-CaMoE v12.0 训练脚本 (带 Eval Loss)
-支持: 断点续训 / 自动步数识别 / 混合精度 / 显存优化 / 验证集评估
+CaMoE v20 训练脚本
+支持: 七阶段调度 / 分组学习率 / 分阶段数据 profile / 经济系统增强 / Eval Loss
 """
 
 import os
 import gc
 import time
 import argparse
-from typing import Dict, Iterator
+from typing import Dict, Iterator, List, Tuple, Any
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -74,64 +74,264 @@ def load_backbone(model: CaMoE_System, path: str) -> None:
     model.load_state_dict(my_dict, strict=False)
     print(f"✅ Loaded matching tensors (~{loaded})")
 
-def get_phase(step: int, config: Dict) -> str:
-    r"""get_phase(step, config) -> str
+def _build_phase_plan(config: Dict) -> List[Dict[str, Any]]:
+    schedule = config.get("phase_schedule")
+    if schedule:
+        plan = []
+        cursor = 0
+        for phase in schedule:
+            item = dict(phase)
+            steps = max(0, int(item.get("steps", 0)))
+            item["steps"] = steps
+            item["start_step"] = cursor
+            item["end_step"] = cursor + steps
+            plan.append(item)
+            cursor += steps
+        return plan
 
-    根据训练步数返回当前训练阶段。
+    # 兼容旧配置：三阶段
+    pre = int(config.get("prewarm_steps", 100))
+    warm_end = int(config.get("warmup_steps", 500))
+    warm = max(0, warm_end - pre)
+    total = int(config.get("total_steps", warm_end + 1000))
+    normal = max(0, total - warm_end)
+    return [
+        {
+            "name": "prewarm",
+            "steps": pre,
+            "start_step": 0,
+            "end_step": pre,
+            "data_profile": "default",
+            "train_groups": ["all"],
+            "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
+            "market_update": False,
+        },
+        {
+            "name": "warmup",
+            "steps": warm,
+            "start_step": pre,
+            "end_step": pre + warm,
+            "data_profile": "default",
+            "train_groups": ["all"],
+            "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
+            "market_update": False,
+        },
+        {
+            "name": "normal",
+            "steps": normal,
+            "start_step": pre + warm,
+            "end_step": pre + warm + normal,
+            "data_profile": "default",
+            "train_groups": ["all"],
+            "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
+            "market_update": True,
+        },
+    ]
 
-    Args:
-      step (int): 当前全局步数。
-      config (Dict): 训练配置。
 
-    Returns:
-      str: ``"prewarm"``、``"warmup"`` 或 ``"normal"``。
-    """
-    if step < config.get('prewarm_steps', 100):
-        return "prewarm"
-    if step < config.get('warmup_steps', 500):
-        return "warmup"
-    return "normal"
+def _phase_total_steps(phase_plan: List[Dict[str, Any]]) -> int:
+    return int(sum(max(0, int(p.get("steps", 0))) for p in phase_plan))
 
-def apply_phase(model: CaMoE_System, optimizer, phase: str, config: Dict) -> None:
-    r"""apply_phase(model, optimizer, phase, config) -> None
 
-    根据阶段设置可训练参数与学习率。
+def get_phase(step: int, phase_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
+    r"""get_phase(step, phase_plan) -> Dict"""
+    for phase in phase_plan:
+        if step < phase["end_step"]:
+            return phase
+    # 超范围时回退最后一个有步数的阶段
+    for phase in reversed(phase_plan):
+        if phase.get("steps", 0) > 0:
+            return phase
+    return phase_plan[-1] if phase_plan else {"name": "normal", "data_profile": "default", "market_update": True}
 
-    Args:
-      model (CaMoE_System): 训练中的模型。
-      optimizer: 优化器实例（8-bit AdamW）。
-      phase (str): 当前阶段名。
-      config (Dict): 训练配置。
-    """
-    num_rwkv = config.get('num_rwkv_experts', 2)
-    num_trans = config.get('num_trans_experts', 1)
-    
-    if phase == "prewarm":
-        trans_indices = [str(i) for i in range(num_rwkv, num_rwkv + num_trans)]
-        for n, p in model.named_parameters():
-            is_trans_expert = any(f'experts.{idx}.' in n for idx in trans_indices)
-            should_train = any([
-                is_trans_expert,
-                'bridge' in n,
-                'critic' in n,
-                'capital' in n,
-                'dea' in n,
-                'deep_embed' in n,
-            ])
-            p.requires_grad = should_train
-        lr = config.get('lr_prewarm', 1e-4)
-        
-    elif phase == "warmup":
-        for p in model.parameters():
-            p.requires_grad = True
-        lr = config.get('lr_warmup', 2e-4)
-    else:
-        for p in model.parameters():
-            p.requires_grad = True
-        lr = config.get('lr_normal', 3e-4)
-    
+
+def _classify_param_group(name: str, num_rwkv: int) -> str:
+    if ".critic." in name:
+        return "critic"
+    if name.startswith("bridge."):
+        return "bridge"
+    if name.startswith("emb.") or name.startswith("ln_out.") or name.startswith("head.") or name.startswith("deep_embed."):
+        return "emb_head"
+
+    if name.startswith("blocks."):
+        parts = name.split(".")
+        if len(parts) > 3 and parts[2] == "experts":
+            try:
+                expert_idx = int(parts[3])
+                return "rwkv_experts" if expert_idx < num_rwkv else "trans_experts"
+            except ValueError:
+                pass
+        return "rwkv_backbone"
+
+    return "rwkv_backbone"
+
+
+def build_param_groups(model: CaMoE_System, config: Dict) -> Tuple[List[Dict[str, Any]], Dict[str, List[torch.nn.Parameter]]]:
+    r"""build_param_groups(model, config) -> (optimizer_param_groups, group_map)"""
+    groups = {g: [] for g in config.get("param_groups", [
+        "rwkv_backbone", "rwkv_experts", "trans_experts", "bridge", "critic", "emb_head"
+    ])}
+    num_rwkv = int(config.get("num_rwkv_experts", 6))
+
+    for name, p in model.named_parameters():
+        g = _classify_param_group(name, num_rwkv)
+        if g not in groups:
+            groups[g] = []
+        groups[g].append(p)
+
+    base_lr = float(config.get("base_lr", 1e-4))
+    optim_groups = []
+    for gname, params in groups.items():
+        if not params:
+            continue
+        optim_groups.append({
+            "params": params,
+            "lr": base_lr,
+            "name": gname,
+        })
+    return optim_groups, groups
+
+
+def apply_phase_policy(
+    optimizer,
+    phase: Dict[str, Any],
+    config: Dict,
+    group_map: Dict[str, List[torch.nn.Parameter]],
+) -> None:
+    r"""apply_phase_policy(optimizer, phase, config, group_map) -> None"""
+    base_lr = float(config.get("base_lr", 1e-4))
+    train_groups = set(phase.get("train_groups", ["all"]))
+    train_all = "all" in train_groups
+    lr_mult = phase.get("lr_mult", {})
+
+    for gname, params in group_map.items():
+        active = train_all or (gname in train_groups)
+        for p in params:
+            p.requires_grad = active
+
     for pg in optimizer.param_groups:
-        pg['lr'] = lr
+        gname = pg.get("name", "")
+        mult = float(lr_mult.get(gname, 1.0 if (train_all or gname in train_groups) else 0.0))
+        if not (train_all or gname in train_groups):
+            mult = 0.0
+        pg["lr"] = base_lr * mult
+
+
+def _load_profile_datasets(config: Dict, profile_name: str) -> Tuple[Dataset, Dataset]:
+    data_profiles = config.get("data_profiles") or {}
+    profile = data_profiles.get(profile_name, {})
+
+    if profile_name == "default" and not profile:
+        profile = {
+            "mix": config.get("mix"),
+            "data_path": config.get("data_path"),
+        }
+
+    mix = profile.get("mix")
+    data_path = profile.get("data_path", config.get("data_path"))
+    data_roots = config.get("data_roots") or {}
+
+    if mix and data_roots:
+        train_datasets = []
+        val_datasets = []
+        probs = []
+        loaded_names = []
+
+        for name, prob in mix.items():
+            if prob <= 0:
+                continue
+            path = data_roots.get(name)
+            if not path or not os.path.exists(path):
+                print(f"⚠️ Dataset not found: {path}, skipping {name}.")
+                continue
+
+            ds = load_from_disk(path)
+            if isinstance(ds, DatasetDict):
+                tr = ds["train"]
+                va = ds.get("validation") or ds.get("test")
+                if va is None:
+                    split = tr.train_test_split(test_size=0.01, seed=42)
+                    tr, va = split["train"], split["test"]
+            else:
+                split = ds.train_test_split(test_size=0.01, seed=42)
+                tr, va = split["train"], split["test"]
+
+            tr.set_format(type="torch", columns=["input_ids"])
+            va.set_format(type="torch", columns=["input_ids"])
+            train_datasets.append(tr)
+            val_datasets.append(va)
+            probs.append(float(prob))
+            loaded_names.append(name)
+            print(f"  - [{profile_name}] {name}: train={len(tr)}, val={len(va)} (prob={prob})")
+
+        if not train_datasets:
+            raise ValueError(f"No valid datasets in profile '{profile_name}'.")
+
+        total_p = sum(probs)
+        probs = [p / total_p for p in probs]
+        train_data = interleave_datasets(
+            train_datasets,
+            probabilities=probs,
+            seed=42,
+            stopping_strategy="all_exhausted",
+        )
+        val_data = interleave_datasets(
+            val_datasets,
+            probabilities=probs,
+            seed=42,
+            stopping_strategy="first_exhausted",
+        )
+        print(f"📊 Profile={profile_name} Mix: {dict(zip(loaded_names, probs))} -> Train={len(train_data)}, Val={len(val_data)}")
+        return train_data, val_data
+
+    # 单数据集
+    if not data_path:
+        raise ValueError(f"Profile '{profile_name}' has no mix and no data_path.")
+    raw_dataset = load_from_disk(data_path)
+    if isinstance(raw_dataset, DatasetDict):
+        if "validation" in raw_dataset:
+            train_data, val_data = raw_dataset["train"], raw_dataset["validation"]
+        elif "test" in raw_dataset:
+            train_data, val_data = raw_dataset["train"], raw_dataset["test"]
+        else:
+            split = raw_dataset["train"].train_test_split(test_size=0.05, seed=42)
+            train_data, val_data = split["train"], split["test"]
+    elif isinstance(raw_dataset, Dataset):
+        split = raw_dataset.train_test_split(test_size=0.05, seed=42)
+        train_data, val_data = split["train"], split["test"]
+    else:
+        raise ValueError("Unknown dataset type")
+
+    train_data.set_format(type="torch", columns=["input_ids"])
+    val_data.set_format(type="torch", columns=["input_ids"])
+    print(f"📊 Profile={profile_name}: Train={len(train_data)}, Val={len(val_data)}")
+    return train_data, val_data
+
+
+def build_loader_for_profile(
+    profile_name: str,
+    config: Dict,
+    collate_fn,
+) -> Tuple[DataLoader, DataLoader]:
+    r"""build_loader_for_profile(profile_name, config, collate_fn) -> (train_loader, val_loader)"""
+    train_data, val_data = _load_profile_datasets(config, profile_name)
+    train_loader = DataLoader(
+        train_data,
+        batch_size=config["micro_batch_size"],
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=config["micro_batch_size"],
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    return train_loader, val_loader
 
 def log_gpu() -> str:
     r"""log_gpu() -> str
@@ -213,83 +413,13 @@ def main() -> None:
         f"fp32_kernel={config.get('cuda_force_fp32_kernel', False)}"
     )
 
-    # ==========================================
-    # 2. Dataset & Split（支持多数据集混合，手动 Resume 换阶段）
-    # ==========================================
-    print("🚀 Loading datasets...")
-    try:
-        mix = config.get("mix")
-        data_roots = config.get("data_roots") or {}
+    phase_plan = _build_phase_plan(config)
+    config["phase_schedule"] = phase_plan
+    total_steps_from_schedule = _phase_total_steps(phase_plan)
+    if total_steps_from_schedule > 0:
+        config["total_steps"] = total_steps_from_schedule
 
-        if mix and data_roots:
-            # 混合模式：按 mix 比例 interleave，课程学习时改 config + Resume 即可
-            train_datasets = []
-            val_datasets = []
-            probs = []
-            loaded_names = []
-
-            for name, prob in mix.items():
-                if prob <= 0:
-                    continue
-                path = data_roots.get(name)
-                if not path or not os.path.exists(path):
-                    print(f"⚠️ Dataset not found: {path}, skipping {name}.")
-                    continue
-
-                ds = load_from_disk(path)
-                if isinstance(ds, DatasetDict):
-                    tr = ds["train"]
-                    va = ds.get("validation") or ds.get("test")
-                    if va is None:
-                        split = tr.train_test_split(test_size=0.01, seed=42)
-                        tr, va = split["train"], split["test"]
-                else:
-                    split = ds.train_test_split(test_size=0.01, seed=42)
-                    tr, va = split["train"], split["test"]
-
-                tr.set_format(type="torch", columns=["input_ids"])
-                va.set_format(type="torch", columns=["input_ids"])
-                train_datasets.append(tr)
-                val_datasets.append(va)
-                probs.append(prob)
-                loaded_names.append(name)
-                print(f"  - {name}: train={len(tr)}, val={len(va)} (prob={prob})")
-
-            if not train_datasets:
-                raise ValueError("No valid datasets in mix (paths missing or prob=0).")
-
-            total_p = sum(probs)
-            probs = [p / total_p for p in probs]
-            train_data = interleave_datasets(train_datasets, probabilities=probs, seed=42, stopping_strategy="all_exhausted")
-            # 验证集使用 first_exhausted 并增加循环次数，避免数据过早耗尽
-            val_data = interleave_datasets(val_datasets, probabilities=probs, seed=42, stopping_strategy="first_exhausted")
-            print(f"📊 Mix: {dict(zip(loaded_names, probs))} → Train={len(train_data)}, Val={len(val_data)}")
-        else:
-            # 单数据集
-            raw_dataset = load_from_disk(config.get("data_path"))
-            if isinstance(raw_dataset, DatasetDict):
-                if "validation" in raw_dataset:
-                    train_data, val_data = raw_dataset["train"], raw_dataset["validation"]
-                elif "test" in raw_dataset:
-                    train_data, val_data = raw_dataset["train"], raw_dataset["test"]
-                else:
-                    split = raw_dataset["train"].train_test_split(test_size=0.05, seed=42)
-                    train_data, val_data = split["train"], split["test"]
-            elif isinstance(raw_dataset, Dataset):
-                split = raw_dataset.train_test_split(test_size=0.05, seed=42)
-                train_data, val_data = split["train"], split["test"]
-            else:
-                raise ValueError("Unknown dataset type")
-
-            train_data.set_format(type="torch", columns=["input_ids"])
-            val_data.set_format(type="torch", columns=["input_ids"])
-            print(f"📊 Dataset Split: Train={len(train_data)}, Val={len(val_data)}")
-
-    except Exception as e:
-        print(f"❌ Error loading dataset: {e}")
-        return
-
-    # 3. DataLoader & Collate
+    # 2. DataLoader Collate
     def simple_collate(batch) -> torch.Tensor:
         r"""simple_collate(batch) -> Tensor
 
@@ -316,23 +446,12 @@ def main() -> None:
             padded_batch[i, :l] = ids[:l]
         return padded_batch
 
-    train_loader = DataLoader(
-        train_data, batch_size=config['micro_batch_size'], shuffle=True, 
-        num_workers=0, collate_fn=simple_collate, pin_memory=True
-    )
-    # [新增] 验证集 Loader
-    val_loader = DataLoader(
-        val_data, batch_size=config['micro_batch_size'], shuffle=False, 
-        num_workers=0, collate_fn=simple_collate, pin_memory=True
-    )
-    
-    train_iter = infinite_loader(train_loader)
-
-    # 4. Model & Optimizer
+    # 3. Model & Optimizer
     print("🏗️ Building model...")
     model = CaMoE_System(config).to(device)
-    
-    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=config['lr_prewarm'])
+
+    optimizer_groups, group_map = build_param_groups(model, config)
+    optimizer = bnb.optim.AdamW8bit(optimizer_groups, lr=config.get("base_lr", 1e-4))
 
     # ==========================================
     # 断点续训逻辑
@@ -394,6 +513,19 @@ def main() -> None:
         # 3. 既没 Resume 也没 Init，才去加载 RWKV 底模
         print("🌱 No checkpoint found. Loading RWKV backbone...")
         load_backbone(model, config['weights_path'])
+
+    # ==========================================
+    # 按当前 step 对齐阶段与数据 profile
+    # ==========================================
+    current_phase = get_phase(start_step, phase_plan)
+    current_profile = current_phase.get("data_profile", "default")
+    print(f"🚀 Loading datasets for phase={current_phase.get('name')} profile={current_profile} ...")
+    try:
+        train_loader, val_loader = build_loader_for_profile(current_profile, config, simple_collate)
+    except Exception as e:
+        print(f"❌ Error loading dataset profile '{current_profile}': {e}")
+        return
+    train_iter = infinite_loader(train_loader)
     
     # ==========================================
     # [新增] 评估函数
@@ -484,16 +616,26 @@ def main() -> None:
     # Logging 逻辑 (回滚到瞬时值 + 修复Step显示)
     # ==========================================
     log_interval = config.get('log_interval', 10)
-    last_phase = None
+    last_phase_name = None
+    active_profile = current_profile
     
     # 5. Training Loop
     for step in range(start_step, config['total_steps']):
         t0 = time.time()
         
-        phase = get_phase(step, config)
-        if phase != last_phase:
-            apply_phase(model, optimizer, phase, config)
-            last_phase = phase
+        phase = get_phase(step, phase_plan)
+        phase_name = phase.get("name", "normal")
+        if phase_name != last_phase_name:
+            apply_phase_policy(optimizer, phase, config, group_map)
+            last_phase_name = phase_name
+            print(f"🔁 Phase switched -> {phase_name} [{phase.get('start_step', step)}:{phase.get('end_step', step)}]")
+
+            phase_profile = phase.get("data_profile", "default")
+            if phase_profile != active_profile:
+                print(f"🧭 Rebuilding dataloaders for profile={phase_profile}")
+                train_loader, val_loader = build_loader_for_profile(phase_profile, config, simple_collate)
+                train_iter = infinite_loader(train_loader)
+                active_profile = phase_profile
         
         try:
             x_batch = next(train_iter)
@@ -508,11 +650,11 @@ def main() -> None:
         
         try:
             with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=train_use_amp):
-                logits, info = model(x, step=step, phase=phase)
+                logits, info = model(x, step=step, phase=phase_name)
                 total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
                 loss_to_backward = total_loss / config['grad_accum']
         except RuntimeError as e:
-            print(f"💥 Forward/LOSS failed at step={step}, phase={phase}: {e}")
+            print(f"💥 Forward/LOSS failed at step={step}, phase={phase_name}: {e}")
             raise
 
         if not torch.isfinite(loss_to_backward):
@@ -527,8 +669,8 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad()
             
-            if phase == "normal" and step > 100:
-                model.update_market(info, token_losses, step)
+            if phase.get("market_update", True) and step > 100:
+                model.update_market(info, token_losses, step, phase=phase_name, critic_loss=critic_loss)
         
         # [修改] 日志与评估逻辑
         if step % log_interval == 0:
@@ -548,7 +690,7 @@ def main() -> None:
             log_str = f"Step {step} | Loss: {main_loss.item():.3f}"
             if val_loss:
                 log_str += f" | ValLoss: {val_loss:.3f}"
-            log_str += f" | TPS: {tps:.0f} | [{phase.upper()}]"
+            log_str += f" | TPS: {tps:.0f} | [{phase_name.upper()}]"
             print(log_str)
             
             # SwanLab Log (关键修正：传入 step 参数)
@@ -557,6 +699,7 @@ def main() -> None:
                     "Loss/Train_Main": main_loss.item(),
                     "Loss/Train_Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
                     "Speed/TPS": tps,
+                    "Phase/Name": phase_name,
                     **stats
                 }
                 if val_loss:

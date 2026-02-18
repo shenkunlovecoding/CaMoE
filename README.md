@@ -6,11 +6,24 @@
 [![Model Architecture](https://img.shields.io/badge/Architecture-Hybrid_MoE-blueviolet)](https://github.com/shenkunlovecoding/CaMoE)
 [![Speed](https://img.shields.io/badge/Speed-7k_TPS-orange)](https://github.com/shenkunlovecoding/CaMoE)
 
-**CaMoE (Capital-driven Mixture of Experts)** 是一个基于**市场经济机制**的混合专家语言模型架构，目前主力版本为 **v18 · MiniPile-0.4B · 6R2T-Top2**。
+**CaMoE (Capital-driven Mixture of Experts)** 是一个基于**市场经济机制**的混合专家语言模型架构，目前主力版本为 **v20 · 0.4B · 6R2T-Top2**。
 
 不同于传统 MoE 依赖静态门控或辅助损失（Auxiliary Loss），CaMoE 引入了 **Vickrey 拍卖**、**资本动态** 和 **做空机制**，让 RWKV（线性状态机）和 Transformer（注意力机制）专家通过自由市场竞争实现算力的自然分工。
 
-## ✅ 近期更新（v18.5-test / 2026-02）
+## ✅ 近期更新（v20 / 2026-02）
+
+1. **七阶段训练调度（SFT/RLHF 占位）**
+- `prewarm(2k) -> warm(3k) -> criticwarm(4k) -> prenormal(3k) -> normal(40k) -> sft(0) -> rlhf(0)`。
+- Prewarm 仅训练 `Transformer experts + Bridge`。
+- CriticWarm 采用高学习率 + 新手保护（低惩罚高奖励 + CriticLoss 奖励）。
+- 前 5 阶段数据默认 `FineWeb-Edu 70% + Cosmopedia 30%`，SFT 占位配置为 `UltraChat 100%`。
+
+2. **经济系统 v20**
+- 新增中央银行与 QE/QT：按层总资本偏离阈值注入/回收流动性。
+- 新增基础算力保障：每个专家维持最低资本线。
+- 新增破产保护与债务重组：Critic 触发救助后记录债务并自动偿还。
+- 新增破产权重漂移：向高表现 donor 层 Critic 参数做插值迁移。
+- 新增闲置税与资产折旧、分红制以及资产流速监控指标。
 
 以下内容已在当前代码中落地，用于解决云端训练中出现的 `NaN loss`、CUDA 扩展不兼容和日志失真问题：
 
