@@ -217,6 +217,20 @@ def apply_phase_policy(
         pg["lr"] = base_lr * mult
 
 
+def apply_route_grad_policy(model: CaMoE_System, phase_name: str, config: Dict) -> None:
+    r"""apply_route_grad_policy(model, phase_name, config) -> None
+
+    criticwarm 期间开启 route grad（训练 critic），其它阶段恢复默认 route_no_grad。
+    """
+    default_route_no_grad = bool(config.get("route_no_grad", True))
+    route_no_grad = default_route_no_grad
+    if phase_name == "criticwarm":
+        route_no_grad = False
+
+    for block in model.blocks:
+        block.route_no_grad = route_no_grad
+
+
 def _load_profile_datasets(config: Dict, profile_name: str) -> Tuple[Dataset, Dataset]:
     data_profiles = config.get("data_profiles") or {}
     profile = data_profiles.get(profile_name, {})
@@ -368,7 +382,7 @@ def main() -> None:
     训练主入口，包含数据加载、断点续训、阶段训练、评估与保存。
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b", "0.4b_toy"])
+    parser.add_argument("--scale", default="0.4b")
     parser.add_argument(
         "--diag",
         default="baseline",
@@ -418,6 +432,7 @@ def main() -> None:
     total_steps_from_schedule = _phase_total_steps(phase_plan)
     if total_steps_from_schedule > 0:
         config["total_steps"] = total_steps_from_schedule
+    phase_to_id = {p.get("name", f"phase_{i}"): i for i, p in enumerate(phase_plan)}
 
     # 2. DataLoader Collate
     def simple_collate(batch) -> torch.Tensor:
@@ -627,6 +642,7 @@ def main() -> None:
         phase_name = phase.get("name", "normal")
         if phase_name != last_phase_name:
             apply_phase_policy(optimizer, phase, config, group_map)
+            apply_route_grad_policy(model, phase_name, config)
             last_phase_name = phase_name
             print(f"🔁 Phase switched -> {phase_name} [{phase.get('start_step', step)}:{phase.get('end_step', step)}]")
 
@@ -699,7 +715,8 @@ def main() -> None:
                     "Loss/Train_Main": main_loss.item(),
                     "Loss/Train_Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
                     "Speed/TPS": tps,
-                    "Phase/Name": phase_name,
+                    "Phase/ID": float(phase_to_id.get(phase_name, -1)),
+                    f"Phase/{phase_name}": 1.0,
                     **stats
                 }
                 if val_loss:

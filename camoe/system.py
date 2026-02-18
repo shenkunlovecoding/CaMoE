@@ -175,7 +175,13 @@ class CaMoE_Block(nn.Module):
                 self._assert_finite(costs, "costs", step)
                 self._assert_finite(bids, "bids", step)
 
-        return winners.detach(), weights.detach(), costs.detach(), difficulty.detach(), affinity.detach()
+        if self.route_no_grad:
+            diff_out = difficulty.detach()
+        else:
+            # criticwarm 需要 difficulty 保留计算图来训练 critic
+            diff_out = difficulty
+
+        return winners.detach(), weights.detach(), costs.detach(), diff_out, affinity.detach()
 
     def _build_trans_prefix_union(
         self,
