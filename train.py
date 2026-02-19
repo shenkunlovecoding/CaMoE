@@ -678,6 +678,15 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             continue
 
+        if not loss_to_backward.requires_grad:
+            critic_req = critic_loss.requires_grad if isinstance(critic_loss, torch.Tensor) else False
+            print(
+                f"⚠️ No grad graph at step={step}, phase={phase_name} "
+                f"(total_loss.requires_grad={total_loss.requires_grad}, critic_loss.requires_grad={critic_req})."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         loss_to_backward.backward()
         
         if (step + 1) % config['grad_accum'] == 0:

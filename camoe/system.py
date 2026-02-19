@@ -471,7 +471,9 @@ class CaMoE_System(nn.Module):
             
             all_info["winners"].append(info["winners"].detach())
             all_info["costs"].append(info["costs"].detach())
-            all_info["difficulties"].append(info["difficulty"].detach())
+            # criticwarm 需要 difficulty 保留 autograd 图来训练 Critic
+            # 其它阶段在 block 内 route_no_grad=True 时 difficulty 已是 detached tensor
+            all_info["difficulties"].append(info["difficulty"])
             all_info["affinities"].append(info["affinity"].detach())
         
         x = self.ln_out(x)
@@ -611,7 +613,13 @@ class CaMoE_System(nn.Module):
         k = min(donor_topk, self.n_layer - 1)
         donor_indices = torch.topk(scores, k=k).indices
         donor_state = self._build_donor_state(donor_indices)
-        critic.restructure_from_donors(donor_state, alpha=alpha)
+        if donor_state:
+            critic.restructure_from_donors(donor_state, alpha=alpha)
+            print(
+                f"🔁 CriticRestructure | step={step} | layer={layer_idx} | "
+                f"donors={donor_indices.tolist()} | alpha={alpha:.3f} | "
+                f"bailout={bailout:.2f} | debt={float(critic.debt.item()):.2f}"
+            )
 
         if step % 100 == 0:
             print(f"🏛️ Layer {layer_idx}: Critic bailout={bailout:.2f}, debt={float(critic.debt.item()):.2f}")

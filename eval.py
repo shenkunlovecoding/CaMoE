@@ -30,8 +30,8 @@ except ImportError:
 
 # ================= 配置 =================
 # [请确认] 模型路径
-MODEL_PATH = "checkpoints/v19_step38000-infer.pth" # 你的 Pilot 路径
-SCALE = "0.4b"  # "0.4b" or "pilot" or "0.1b"
+MODEL_PATH = "checkpoints/v20-final.pth" # 你的 Pilot 路径
+SCALE = "pilot"  # "0.4b" or "pilot" or "0.1b"
 DEVICE = "cuda"
 
 # ================= 加载逻辑 =================
@@ -285,47 +285,7 @@ def generate_and_visualize(
 
 # ================= 测试 =================
 prompts = [
-    format_prompt("2 + 2 ="),  # Story 模式不用包
-    "2 + 2 =",
-    format_prompt("print('Hello '' +"),
-    "print('Hello '' +",
-    format_prompt("The chemical symbol for water is H2"),
-    "The chemical symbol for water is H2",
-    format_prompt('Once upon a time, there was a little girl named Lily.'),
     'Once upon a time, there was a little girl named Lily.',
-    format_prompt('The capital of France is Paris, but the capital of Japan is'),
-    # 文学
-    "It was the best of times, it was the worst of times,",
-    "Call me Ishmael.",
-    "All happy families are alike;",
-    "In a hole in the ground there lived",
-    
-    # 诗歌
-    "Shall I compare thee to a summer's day?",
-    "Two roads diverged in a yellow wood,",
-    "I wandered lonely as a cloud",
-    
-    # 名言
-    "To be, or not to be,",
-    "I have a dream that one day",
-    "The only thing we have to fear is",
-    
-    # 童话
-    "In a galaxy far, far away,",
-    "Mirror, mirror on the wall,",
-    
-    # 哲学
-    "I think, therefore",
-    "The meaning of life is",
-    
-    # 科学
-    "The Earth revolves around the",
-    "Einstein's famous equation is E =",
-    
-    # 流行文化
-    "Winter is coming, said",
-    "May the Force be",
-    "You shall not",
 ]
 
 if __name__ == "__main__":
