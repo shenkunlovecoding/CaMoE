@@ -14,6 +14,7 @@ from contextlib import nullcontext
 from torch.utils.checkpoint import checkpoint
 
 from .backbone import RWKV7_TimeMix, DeepEmbedAttention, SharedDeepEmbed
+from .rosa import ROSA1bitLayer
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
@@ -74,6 +75,17 @@ class CaMoE_Block(nn.Module):
             )
         else:
             self.dea = None
+
+        # ROSA experimental branch (optional)
+        self.use_rosa = config.get("use_rosa", False)
+        if self.use_rosa:
+            self.rosa = ROSA1bitLayer(
+                n_embd=n_embd,
+                num_streams=config.get("rosa_num_streams", 32),
+                rosa_emb_dim=config.get("rosa_emb_dim", 64),
+            )
+        else:
+            self.rosa = None
         
         # 专家组
         self.experts = nn.ModuleList()
@@ -129,12 +141,15 @@ class CaMoE_Block(nn.Module):
         self._assert_finite(att_out, "att_out", step)
         self._assert_finite(v_first, "v_first_att", step)
         self._assert_finite(rwkv_state, "rwkv_state", step)
+        rosa_out = self.rosa(x_ln) if self.rosa is not None else 0.0
+        if isinstance(rosa_out, torch.Tensor):
+            self._assert_finite(rosa_out, "rosa_out", step)
         if self.dea is not None and idx is not None:
             dea_out = self.dea(x_ln, idx)
             self._assert_finite(dea_out, "dea_out", step)
-            x_after_att = x + att_out + dea_out
+            x_after_att = x + att_out + dea_out + rosa_out
         else:
-            x_after_att = x + att_out
+            x_after_att = x + att_out + rosa_out
         self._assert_finite(x_after_att, "x_after_att", step)
         h = self.ln2(x_after_att)
         self._assert_finite(h, "h_ln2", step)

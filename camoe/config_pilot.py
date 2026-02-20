@@ -118,6 +118,10 @@ CONFIG_PILOT = {
     "tied_embeddings": True,
     "use_deep_embed_attention": False,
     "use_shared_deep_embed": True,
+    # ROSA experimental branch (default off)
+    "use_rosa": False,
+    "rosa_num_streams": 32,
+    "rosa_emb_dim": 64,
 
     # ===== 专家配置 =====
     "num_rwkv_experts": 3,

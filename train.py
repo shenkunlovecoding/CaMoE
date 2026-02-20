@@ -160,6 +160,10 @@ def get_phase(step: int, phase_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _classify_param_group(name: str, num_rwkv: int) -> str:
+    # Keep ROSA branch trainable in prewarm (legacy ROSA behavior)
+    # by attaching it to the bridge group.
+    if ".rosa." in name:
+        return "bridge"
     if ".experts." in name and ".confidence." in name:
         return "router_conf"
     if ".critic." in name:

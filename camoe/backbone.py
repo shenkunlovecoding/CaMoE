@@ -73,7 +73,7 @@ def init_rwkv7_cuda():
                 
                 torch.ops.rwkv7_clampw.forward(r, w, k, v, a, b, y, s, sa)
                 ctx.save_for_backward(r, w, k, v, a, b, s, sa)
-                return y
+                return y, sa
             
             @staticmethod
             def backward(ctx, dy):
@@ -85,6 +85,7 @@ def init_rwkv7_cuda():
         def _run_cuda(r, w, k, v, a, b):
             B, T, HC = r.shape
             H = HC // HEAD_SIZE
+            orig_dtype = r.dtype
             
             # View 变换
             # 关键改动：不再强制转 .float() (FP32)
@@ -94,9 +95,10 @@ def init_rwkv7_cuda():
                 for x in [r, w, k, v, a, b]
             ]
             
-            out = RWKV7_ClampW.apply(r, w, k, v, a, b)
+            out, sa = RWKV7_ClampW.apply(r, w, k, v, a, b)
             out = out.view(B, T, HC)
-            return out
+            sa = sa.view(B, T, HC).to(orig_dtype)
+            return out, sa
         
         RUN_CUDA_RWKV7 = _run_cuda
         USE_CUDA = True
@@ -194,6 +196,7 @@ class RWKV7_TimeMix(nn.Module):
         self.value = nn.Linear(C, C, bias=False)
         self.output = nn.Linear(C, C, bias=False)
         self.ln_x = nn.GroupNorm(H, C, eps=64e-5)
+        self.ln_sa = nn.LayerNorm(n_embd)
         
         # 初始化权重
         with torch.no_grad():
@@ -252,10 +255,9 @@ class RWKV7_TimeMix(nn.Module):
         
         # RWKV-7 动态状态演化
         assert USE_CUDA and RUN_CUDA_RWKV7 is not None
-        x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+        x_att, sa = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
         
-            
-        state_representation = x_att.clone() 
+        state_representation = self.ln_sa(sa)
         x_att = self.ln_x(x_att.view(B * T, C)).view(B, T, C)
         
         # Bonus term

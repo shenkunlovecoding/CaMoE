@@ -189,6 +189,10 @@ CONFIG_04B = {
     "dea_kv_dim": 32,
     "dea_score_scale": 1024.0,
     "dea_cap_scale": 64.0,
+    # ROSA experimental branch (default off)
+    "use_rosa": False,
+    "rosa_num_streams": 32,
+    "rosa_emb_dim": 64,
     # ===== 专家配置 =====
     "num_rwkv_experts": 6,
     "num_trans_experts": 2,
