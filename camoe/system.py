@@ -1,19 +1,19 @@
 """
-CaMoE v18 主系统 (Final Fix)
+CaMoE v21 主系统
 Changes:
-1. 强制全程开启 Router (use_market=True)，拒绝随机路由。
-2. 修复 LinearTransformerExpert 初始化。
-3. 保持 Rescale Trick 和 GC。
+1. 双通道路由：Gradient Gate + Market Bias。
+2. winners 离散选择（detach），weights 连续可微（不 detach）。
+3. 支持 phase 级 use_market_override 与 route_grad 策略。
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import Dict, Tuple, List
+from contextlib import nullcontext
 from torch.utils.checkpoint import checkpoint
 
 from .backbone import RWKV7_TimeMix, DeepEmbedAttention, SharedDeepEmbed
-from .rosa import ROSA1bitLayer
 from .bridge import UltimateBridge
 from .experts import SparseRWKVFFN, LinearTransformerExpert
 from .critic import CriticVC
@@ -41,6 +41,14 @@ class CaMoE_Block(nn.Module):
         self.num_experts = self.num_rwkv + self.num_trans
         self.n_embd = n_embd
         self.bridge = bridge
+        self.nan_debug = config.get("nan_debug", False)
+        use_gc = config.get("use_gradient_checkpoint", True)
+        self.checkpoint_att_stage = use_gc and config.get("checkpoint_att_stage", True)
+        self.checkpoint_expert_stage = use_gc and config.get("checkpoint_expert_stage", True)
+        self.route_no_grad = config.get("route_no_grad", True)
+        self.lazy_prefix_union = config.get("lazy_prefix_union", True)
+        market_alpha_init = float(config.get("market_alpha_init", 0.05))
+        self.register_buffer("market_alpha", torch.tensor([market_alpha_init], dtype=torch.float32))
         
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -66,17 +74,6 @@ class CaMoE_Block(nn.Module):
             )
         else:
             self.dea = None
-
-        # ROSA experimental branch (optional)
-        self.use_rosa = config.get("use_rosa", False)
-        if self.use_rosa:
-            self.rosa = ROSA1bitLayer(
-                n_embd=n_embd,
-                num_streams=config.get("rosa_num_streams", 32),
-                rosa_emb_dim=config.get("rosa_emb_dim", 64),
-            )
-        else:
-            self.rosa = None
         
         # 专家组
         self.experts = nn.ModuleList()
@@ -92,7 +89,218 @@ class CaMoE_Block(nn.Module):
         
         # Critic
         self.critic = CriticVC(n_embd, self.num_experts)
+
+    def _assert_finite(self, x: torch.Tensor, name: str, step: int) -> None:
+        if (not self.nan_debug) or (x is None):
+            return
+        if not torch.is_floating_point(x):
+            return
+        if torch.isfinite(x).all():
+            return
+        with torch.no_grad():
+            bad = ~torch.isfinite(x)
+            bad_count = int(bad.sum().item())
+            total = x.numel()
+            finite_x = x[torch.isfinite(x)]
+            if finite_x.numel() > 0:
+                vmin = float(finite_x.min().item())
+                vmax = float(finite_x.max().item())
+            else:
+                vmin = float("nan")
+                vmax = float("nan")
+            print(
+                f"❌ NaNDebug-Block | step={step} | block={self.layer_id} | tensor={name} | "
+                f"bad={bad_count}/{total} | finite_min={vmin:.6e} | finite_max={vmax:.6e}"
+            )
+        raise RuntimeError(f"NaN/Inf in block {self.layer_id}, tensor={name}, step={step}")
     
+    def _forward_att_stage(
+        self,
+        x: torch.Tensor,
+        v_first: torch.Tensor,
+        idx: torch.Tensor,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""执行 TimeMix(+DEA) 与 ln2，返回 x_after_att/h/v_first/rwkv_state。"""
+        self._assert_finite(x, "x_in", step)
+        x_ln = self.ln1(x)
+        self._assert_finite(x_ln, "x_ln", step)
+        att_out, v_first, rwkv_state = self.att(x_ln, v_first)
+        self._assert_finite(att_out, "att_out", step)
+        self._assert_finite(v_first, "v_first_att", step)
+        self._assert_finite(rwkv_state, "rwkv_state", step)
+        if self.dea is not None and idx is not None:
+            dea_out = self.dea(x_ln, idx)
+            self._assert_finite(dea_out, "dea_out", step)
+            x_after_att = x + att_out + dea_out
+        else:
+            x_after_att = x + att_out
+        self._assert_finite(x_after_att, "x_after_att", step)
+        h = self.ln2(x_after_att)
+        self._assert_finite(h, "h_ln2", step)
+        return x_after_att, h, v_first, rwkv_state
+
+    def _forward_route_stage(
+        self,
+        h: torch.Tensor,
+        capital_shares: torch.Tensor,
+        router: SparseRouter,
+        use_market: bool,
+        training: bool,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""执行 confidence/critic/router，返回 winners/weights/costs/difficulty/affinity。"""
+        # Gate logits 始终可导：用于训练 confidence / router
+        conf_list = [exp.get_confidence(h) for exp in self.experts]
+        gate_logits = torch.stack(conf_list, dim=-1)  # [B, T, E]
+        self._assert_finite(gate_logits, "gate_logits", step)
+
+        if not use_market:
+            B, T, _E = gate_logits.shape
+            capital_bias = torch.zeros_like(gate_logits)
+            winners, weights, costs, adjusted_logits = router.route(
+                gate_logits=gate_logits,
+                capital_bias=capital_bias,
+                market_enabled=False,
+                training=training,
+            )
+            difficulty = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+            affinity = torch.zeros(B, T, self.num_experts, device=h.device, dtype=h.dtype)
+        else:
+            route_ctx = torch.no_grad if self.route_no_grad else nullcontext
+            with route_ctx():
+                route_h = h.detach() if self.route_no_grad else h
+                difficulty, affinity = self.critic(route_h)
+                self._assert_finite(difficulty, "difficulty", step)
+                self._assert_finite(affinity, "affinity", step)
+                critic_subsidy = self.critic.subsidy_from_affinity(affinity)
+                self._assert_finite(critic_subsidy, "critic_subsidy", step)
+                alpha = self.market_alpha.to(device=h.device, dtype=gate_logits.dtype)
+                capital_bias = capital_shares.view(1, 1, -1)
+                capital_bias = capital_bias * (1.0 + difficulty.detach()) + critic_subsidy.detach()
+                capital_bias = alpha * capital_bias.detach()
+                self._assert_finite(capital_bias, "capital_bias", step)
+                winners, weights, costs, adjusted_logits = router.route(
+                    gate_logits=gate_logits,
+                    capital_bias=capital_bias,
+                    market_enabled=True,
+                    training=training,
+                )
+            self._assert_finite(weights, "weights", step)
+            self._assert_finite(costs, "costs", step)
+            self._assert_finite(adjusted_logits, "adjusted_logits", step)
+
+        if self.route_no_grad:
+            diff_out = difficulty.detach()
+            adjusted_out = adjusted_logits.detach()
+        else:
+            diff_out = difficulty
+            adjusted_out = adjusted_logits
+
+        return (
+            winners.detach(),
+            weights,
+            costs.detach(),
+            diff_out,
+            affinity.detach(),
+            adjusted_out,
+            gate_logits.detach(),
+            capital_bias.detach(),
+        )
+
+    def _build_trans_prefix_union(
+        self,
+        h: torch.Tensor,
+        rwkv_state: torch.Tensor,
+        winners: torch.Tensor,
+        step: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""仅为 Transformer 命中 token 构建 prefix；返回 prefix_union 与索引映射。"""
+        B, T, C = h.shape
+        flat_bt = B * T
+        flat_h = h.reshape(flat_bt, C)
+        flat_state = rwkv_state.reshape(flat_bt, C)
+
+        if not self.lazy_prefix_union:
+            bridge_prefix = self.bridge(flat_h, flat_state)  # [B*T, P, C]
+            self._assert_finite(bridge_prefix, "bridge_prefix_full", step)
+            prefix_indices = torch.arange(flat_bt, device=h.device, dtype=torch.long)
+            return bridge_prefix, prefix_indices
+
+        trans_mask = (winners[:, :, 0] >= self.num_rwkv) | (winners[:, :, 1] >= self.num_rwkv)
+        flat_mask = trans_mask.reshape(-1)
+        prefix_indices = torch.full((flat_bt,), -1, device=h.device, dtype=torch.long)
+
+        if not flat_mask.any():
+            empty_prefix = torch.empty(
+                0,
+                self.bridge.max_prefix_len,
+                C,
+                device=h.device,
+                dtype=h.dtype,
+            )
+            return empty_prefix, prefix_indices
+
+        prefix_union = self.bridge(flat_h[flat_mask], flat_state[flat_mask])  # [N_u, P, C]
+        self._assert_finite(prefix_union, "bridge_prefix_union", step)
+        prefix_indices[flat_mask] = torch.arange(prefix_union.shape[0], device=h.device, dtype=torch.long)
+        return prefix_union, prefix_indices
+
+    def _forward_expert_stage(
+        self,
+        x_after_att: torch.Tensor,
+        h: torch.Tensor,
+        rwkv_state: torch.Tensor,
+        winners: torch.Tensor,
+        weights: torch.Tensor,
+        step: int,
+    ) -> torch.Tensor:
+        r"""执行 Top-2 专家混合并返回 block 输出。"""
+        B, T, C = h.shape
+        prefix_union, prefix_indices = self._build_trans_prefix_union(h, rwkv_state, winners, step)
+        final_out = torch.zeros_like(h)  # [B, T, C]
+
+        for rank in range(2):
+            rank_winners = winners[:, :, rank]  # [B, T]
+            rank_weights = weights[:, :, rank].unsqueeze(-1)  # [B, T, 1]
+
+            for e in range(self.num_experts):
+                mask = (rank_winners == e)  # [B, T]
+                if not mask.any():
+                    continue
+
+                selected_h = h[mask]  # [N, C]
+                selected_weights = rank_weights[mask]  # [N, 1]
+
+                if e >= self.num_rwkv:
+                    flat_mask = mask.reshape(-1)
+                    if self.lazy_prefix_union:
+                        sel_idx = prefix_indices[flat_mask]
+                        valid = sel_idx >= 0
+                        if not valid.any():
+                            continue
+                        expert_out = torch.zeros_like(selected_h)
+                        expert_valid = self.experts[e](selected_h[valid], prefix_union[sel_idx[valid]])
+                        if expert_valid.dtype != expert_out.dtype:
+                            expert_valid = expert_valid.to(expert_out.dtype)
+                        expert_out[valid] = expert_valid
+                    else:
+                        expert_out = self.experts[e](selected_h, prefix_union[flat_mask])
+                else:
+                    expert_out = self.experts[e](selected_h, None)
+                if expert_out.dtype != selected_h.dtype:
+                    expert_out = expert_out.to(selected_h.dtype)
+                self._assert_finite(expert_out, f"expert_out_e{e}", step)
+
+                weighted_out = expert_out * selected_weights
+                self._assert_finite(weighted_out, f"weighted_out_e{e}", step)
+                final_out[mask] += weighted_out
+
+        self._assert_finite(final_out, "final_out", step)
+        x_out = x_after_att + final_out
+        self._assert_finite(x_out, "x_out", step)
+        return x_out
+
     def forward(self, 
                 x: torch.Tensor, 
                 v_first: torch.Tensor,
@@ -103,102 +311,46 @@ class CaMoE_Block(nn.Module):
                 use_market: bool = True,
                 training: bool = True,
                 idx: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        r"""forward(x, v_first, capital_shares, router, step, warmup_steps, use_market=True, training=True, idx=None) -> Tuple[Tensor, Tensor, Dict]
+        r"""forward(x, v_first, capital_shares, router, step, warmup_steps, use_market=True, training=True, idx=None) -> Tuple[Tensor, Tensor, Dict]"""
+        del warmup_steps
 
-        执行单层前向：并行 TimeMix/DEA、市场路由、专家执行与残差融合。
-
-        Args:
-          x (Tensor): 形状 ``[B, T, C]`` 的输入隐藏状态。
-          v_first (Tensor): RWKV 首层 value 缓存。
-          capital_shares (Tensor): 形状 ``[E]`` 的专家资本占比。
-          router (SparseRouter): 路由器实例。
-          step (int): 当前训练步。
-          warmup_steps (int): warmup 阶段边界。
-          use_market (bool, optional): 是否使用市场路由。Default: ``True``。
-          training (bool, optional): 是否训练模式。Default: ``True``。
-          idx (Tensor, optional): 形状 ``[B, T]`` 的 token id。Default: ``None``。
-
-        Returns:
-          Tuple[Tensor, Tensor, Dict]:
-          更新后的隐藏状态、``v_first`` 与路由信息字典。
-        """
-        
-        B, T, C = x.shape
-        
-        # 1. TimeMix + DEA 并行分支（同一份 pre-norm 输入）
-        x_ln = self.ln1(x)
-        att_out, v_first, rwkv_state = self.att(x_ln, v_first)
-        rosa_out = self.rosa(x_ln) if self.rosa is not None else 0.0
-        if self.dea is not None and idx is not None:
-            dea_out = self.dea(x_ln, idx)
-            x = x + att_out + dea_out + rosa_out
-        else:
-            x = x + att_out + rosa_out
-        
-        h = self.ln2(x)
-        
-        # 2. 计算所有专家的 Confidence
-        conf_list = [exp.get_confidence(h) for exp in self.experts]
-        confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
-        
-        # 3. Market Routing (关键逻辑)
-        if not use_market:
-            # 只有在极罕见的 Debug 模式下才用随机，训练时严禁进入此分支！
-            winners = torch.randint(0, self.num_experts, (B, T, 2), device=x.device)
-            weights = torch.ones(B, T, 2, device=x.device) * 0.5
-            costs = torch.zeros(B, T, device=x.device)
-            difficulty = torch.ones(B, T, 1, device=x.device)
-            affinity = torch.zeros(B, T, self.num_experts, device=x.device)
-        else:
-            difficulty, affinity = self.critic(h)
-            critic_subsidy = self.critic.apply_to_bids(torch.zeros_like(confidences), affinity)
-            winners, weights, costs, bids = router.route(
-                confidences, capital_shares, difficulty, critic_subsidy, training
+        if self.training and self.checkpoint_att_stage:
+            x_after_att, h, v_first, rwkv_state = checkpoint(
+                lambda xx, vv, ii: self._forward_att_stage(xx, vv, ii, step),
+                x,
+                v_first,
+                idx,
+                use_reentrant=False,
             )
-        
-        # 4. 生成 Bridge Prefix (一次性，供所有 Trans 专家使用)
-        flat_h = h.reshape(-1, C)
-        flat_state = rwkv_state.reshape(-1, C)
-        bridge_prefix = self.bridge(flat_h, flat_state)  # [B*T, P, C]
-        
-        # 5. Top-2 Expert Execution (双路混合)
-        final_out = torch.zeros_like(h)  # [B, T, C]
-        
-        for rank in range(2):
-            rank_winners = winners[:, :, rank]  # [B, T]
-            rank_weights = weights[:, :, rank].unsqueeze(-1)  # [B, T, 1]
-            
-            for e in range(self.num_experts):
-                mask = (rank_winners == e)  # [B, T]
-                if not mask.any():
-                    continue
-                
-                # Gather 被选中的 Token
-                selected_h = h[mask]  # [N, C]
-                selected_weights = rank_weights[mask]  # [N, 1]
-                
-                # 执行专家
-                if e >= self.num_rwkv:
-                    # Transformer: 需要 Prefix
-                    flat_mask = mask.reshape(-1)
-                    selected_prefix = bridge_prefix[flat_mask]  # [N, P, C]
-                    expert_out = self.experts[e](selected_h, selected_prefix)
-                else:
-                    # RWKV: 不需要 Prefix
-                    expert_out = self.experts[e](selected_h, None)
-                
-                # 加权累加
-                weighted_out = expert_out * selected_weights
-                final_out[mask] += weighted_out
+        else:
+            x_after_att, h, v_first, rwkv_state = self._forward_att_stage(x, v_first, idx, step)
 
-        # 残差连接
-        x = x + final_out
-        
+        winners, weights, costs, difficulty, affinity, adjusted_logits, gate_logits, capital_bias = self._forward_route_stage(
+            h, capital_shares, router, use_market, training, step
+        )
+
+        if self.training and self.checkpoint_expert_stage:
+            x = checkpoint(
+                lambda x0, h0, s0, w0, wt0: self._forward_expert_stage(x0, h0, s0, w0, wt0, step),
+                x_after_att,
+                h,
+                rwkv_state,
+                winners,
+                weights,
+                use_reentrant=False,
+            )
+        else:
+            x = self._forward_expert_stage(x_after_att, h, rwkv_state, winners, weights, step)
+
         info = {
             "winners": winners,
+            "weights": weights,
             "costs": costs,
             "difficulty": difficulty,
             "affinity": affinity,
+            "adjusted_logits": adjusted_logits,
+            "gate_logits": gate_logits,
+            "capital_bias": capital_bias,
         }
         return x, v_first, info
 
@@ -213,6 +365,9 @@ class CaMoE_System(nn.Module):
         self.n_embd = config['n_embd']
         self.n_layer = config['n_layer']
         self.vocab_size = config['vocab_size']
+        self.use_gradient_checkpoint = config.get("use_gradient_checkpoint", True)
+        self.nan_debug = config.get("nan_debug", False)
+        self.economy_cfg = config.get("economy", {})
         
         self.num_rwkv_experts = config.get('num_rwkv_experts', 6)
         self.num_trans_experts = config.get('num_trans_experts', 2)
@@ -264,14 +419,50 @@ class CaMoE_System(nn.Module):
             total_capital=config.get('total_capital', 10000.0),
             min_share=config.get('min_capital_share', 0.05),
             tax_threshold=config.get('tax_threshold', 2.0),
-            tax_rate=config.get('tax_rate', 0.1)
+            tax_rate=config.get('tax_rate', 0.1),
+            economy=self.economy_cfg,
         )
         
-        self.router = SparseRouter()
+        self.router = SparseRouter(noise_std=float(config.get("router_noise_std", 0.02)))
+        self.register_buffer("layer_performance_ema", torch.zeros(self.n_layer))
+        self.register_buffer("last_winner_entropy", torch.zeros(self.n_layer))
+        self.register_buffer("last_weight_entropy", torch.zeros(self.n_layer))
+        self.register_buffer("last_market_alpha", torch.zeros(self.n_layer))
+        self._critic_loss_ema = None
+        self._last_critic_bonus_signal = 0.0
+
+    def _assert_finite(self, x: torch.Tensor, name: str, step: int, layer_id: int = -1) -> None:
+        r"""_assert_finite(x, name, step, layer_id=-1) -> None
+
+        在调试模式下校验张量数值合法性，出现 NaN/Inf 立即抛错并输出定位信息。
+        """
+        if (not self.nan_debug) or (x is None):
+            return
+        if not torch.is_floating_point(x):
+            return
+        if torch.isfinite(x).all():
+            return
+
+        with torch.no_grad():
+            bad = ~torch.isfinite(x)
+            bad_count = int(bad.sum().item())
+            total = x.numel()
+            finite_x = x[torch.isfinite(x)]
+            if finite_x.numel() > 0:
+                vmin = float(finite_x.min().item())
+                vmax = float(finite_x.max().item())
+            else:
+                vmin = float("nan")
+                vmax = float("nan")
+            print(
+                f"❌ NaNDebug | step={step} | layer={layer_id} | tensor={name} | "
+                f"bad={bad_count}/{total} | finite_min={vmin:.6e} | finite_max={vmax:.6e}"
+            )
+        raise RuntimeError(f"NaN/Inf detected at step={step}, layer={layer_id}, tensor={name}")
     
     def forward(self, idx: torch.Tensor, step: int = 0, 
-                phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
-        r"""forward(idx, step=0, phase="normal") -> Tuple[Tensor, Dict]
+                phase: str = "normal", use_market_override: bool = None) -> Tuple[torch.Tensor, Dict]:
+        r"""forward(idx, step=0, phase="normal", use_market_override=None) -> Tuple[Tensor, Dict]
 
         执行整网前向并收集各层路由信息。
 
@@ -284,47 +475,66 @@ class CaMoE_System(nn.Module):
           Tuple[Tensor, Dict]: ``logits`` 与各层 ``info``。
         """
         x = self.emb(idx)
+        self._assert_finite(x, "emb_out", step, -1)
         v_first = None
         
-        # [CRITICAL FIX] 始终开启 Market Routing
-        # 即使在 Prewarm/Warmup，我们也需要 Router 选出最好的专家，让专家获得正确的梯度
-        # 资本的更新 (Update) 由 train.py 控制，这里只管路由 (Selection)
-        use_market = True 
+        use_market = True if use_market_override is None else bool(use_market_override)
         
         all_info = {
-            "winners": [], "costs": [], "difficulties": [], "affinities": []
+            "winners": [],
+            "costs": [],
+            "difficulties": [],
+            "affinities": [],
+            "gate_logits": [],
+            "capital_bias": [],
         }
         warmup_steps = self.config.get('warmup_steps', 2000)
 
         for i, block in enumerate(self.blocks):
             shares = self.capital_manager.get_shares(i)
-            if self.training:
-                # 开启 Checkpoint 以节省显存
-                x, v_first, info = checkpoint(
-                    block, 
-                    x, v_first, shares, self.router, 
-                    step, warmup_steps, use_market, True, idx,
-                    use_reentrant=False
-                )
-            else:
-                x, v_first, info = block(
-                    x, v_first, shares, self.router,
-                    step, warmup_steps, use_market, self.training, idx
-                )
+            x, v_first, info = block(
+                x, v_first, shares, self.router,
+                step, warmup_steps, use_market, self.training, idx
+            )
+
+            self._assert_finite(x, "block_out", step, i)
+            self._assert_finite(v_first, "v_first", step, i)
+            self._assert_finite(info["costs"], "costs", step, i)
+            self._assert_finite(info["difficulty"], "difficulty", step, i)
+            self._assert_finite(info["affinity"], "affinity", step, i)
+            self._assert_finite(info["weights"], "weights", step, i)
+            self._assert_finite(info["adjusted_logits"], "adjusted_logits", step, i)
             
             all_info["winners"].append(info["winners"].detach())
             all_info["costs"].append(info["costs"].detach())
-            all_info["difficulties"].append(info["difficulty"].detach())
+            # criticwarm 需要 difficulty 保留 autograd 图来训练 Critic
+            # 其它阶段在 block 内 route_no_grad=True 时 difficulty 已是 detached tensor
+            all_info["difficulties"].append(info["difficulty"])
             all_info["affinities"].append(info["affinity"].detach())
+            all_info["gate_logits"].append(info["gate_logits"].detach())
+            all_info["capital_bias"].append(info["capital_bias"].detach())
+
+            with torch.no_grad():
+                adj_prob = F.softmax(info["adjusted_logits"].float(), dim=-1)
+                adj_ent = -(adj_prob * torch.log(adj_prob + 1e-9)).sum(dim=-1).mean()
+                wt_prob = info["weights"].float()
+                wt_ent = -(wt_prob * torch.log(wt_prob + 1e-9)).sum(dim=-1).mean()
+                alpha = block.market_alpha.detach().mean()
+                self.last_winner_entropy[i] = adj_ent.to(self.last_winner_entropy.dtype)
+                self.last_weight_entropy[i] = wt_ent.to(self.last_weight_entropy.dtype)
+                self.last_market_alpha[i] = alpha.to(self.last_market_alpha.dtype)
         
         x = self.ln_out(x)
+        self._assert_finite(x, "ln_out", step, self.n_layer)
         
         # Output (Tied Embedding Rescale Trick)
         if self.head is not None:
             logits = self.head(x)
         else:
-            #x = x * (self.n_embd ** -0.5) 
+            # Tied embedding 需缩放，避免 logits 幅度过大导致 CE 量纲异常
+            x = x * (self.n_embd ** -0.5)
             logits = F.linear(x, self.emb.weight)
+        self._assert_finite(logits, "logits", step, self.n_layer)
         
         return logits, all_info
     
@@ -344,19 +554,34 @@ class CaMoE_System(nn.Module):
           all_info (Dict): 各层难度/路由信息。
 
         Returns:
-          Tuple[Tensor, Tensor, Tensor, Tensor, float]:
-          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``bridge_loss``。
+          Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``aux_loss``。
         """
+        if self.config.get("stabilize_logits", False):
+            # 训练稳定性保护：避免上游极端值导致 CE 直接 NaN/Inf
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+
         B, T = targets.shape
         
         # Main Loss
-        main_loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
+        main_loss = F.cross_entropy(
+            logits.reshape(-1, self.vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
         
         # Token Losses (for Market Update)
         with torch.no_grad():
             token_losses = F.cross_entropy(
-                logits.reshape(-1, self.vocab_size), targets.reshape(-1), reduction='none'
+                logits.reshape(-1, self.vocab_size),
+                targets.reshape(-1),
+                reduction='none',
+                ignore_index=-100,
             ).reshape(B, T)
+            if self.config.get("stabilize_logits", False):
+                token_losses = torch.nan_to_num(token_losses, nan=0.0, posinf=100.0, neginf=0.0)
+            # ignore_index 位置本身为 0 loss，这里再显式归零，避免后续市场更新误用
+            token_losses = token_losses.masked_fill(targets.eq(-100), 0.0)
         
         # Critic Loss
         critic_loss = 0.0
@@ -368,55 +593,207 @@ class CaMoE_System(nn.Module):
         if len(all_info.get("difficulties", [])) > 0:
             critic_loss /= len(all_info["difficulties"])
 
-        total_loss = main_loss + 0.1 * critic_loss
-        bridge_loss = 0.0 # No longer used
+        # Router Load Balance Loss
+        aux_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        n_counted = 0
+        valid_mask = targets.ne(-100)
+        valid_count = valid_mask.sum().item()
+        if valid_count > 0:
+            for i, winners_i in enumerate(all_info.get("winners", [])):
+                if i >= self.n_layer:
+                    break
+                freq = torch.zeros(self.num_experts, device=logits.device, dtype=logits.dtype)
+                for k in range(2):
+                    one_hot = F.one_hot(winners_i[:, :, k], self.num_experts).to(dtype=logits.dtype)
+                    one_hot = one_hot * valid_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    freq = freq + one_hot.sum(dim=(0, 1))
+                denom = valid_mask.sum().to(dtype=logits.dtype) * 2.0 + 1e-6
+                freq = freq / denom
+                target_freq = torch.tensor(1.0 / self.num_experts, device=logits.device, dtype=logits.dtype)
+                aux_loss = aux_loss + ((freq - target_freq) ** 2).sum() * self.num_experts
+                n_counted += 1
+            if n_counted > 0:
+                aux_loss = aux_loss / float(n_counted)
+
+        aux_coeff = float(self.config.get("aux_loss_coeff", 0.01))
+        total_loss = main_loss + 0.1 * critic_loss + aux_coeff * aux_loss
         
-        return total_loss, token_losses, main_loss, critic_loss, bridge_loss
+        return total_loss, token_losses, main_loss, critic_loss, aux_loss
     
-    def update_market(self, all_info: Dict, token_losses: torch.Tensor, step: int) -> None:
-        r"""update_market(all_info, token_losses, step) -> None
+    def _compute_critic_bonus_signal(self, critic_loss) -> float:
+        if critic_loss is None:
+            return 0.0
+        curr = float(critic_loss.detach().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+        eps = 1e-6
+        momentum = float(self.economy_cfg.get("critic_bonus_ema_momentum", 0.95))
 
-        根据 token 级损失结算市场状态与 Critic 资本。
+        if self._critic_loss_ema is None:
+            self._critic_loss_ema = curr
+            return 0.0
 
-        Args:
-          all_info (Dict): 前向收集的市场信息。
-          token_losses (Tensor): 形状 ``[B, T]``。
-          step (int): 当前训练步。
-        """
+        prev = self._critic_loss_ema
+        signal = (prev - curr) / (abs(prev) + eps)
+        self._critic_loss_ema = momentum * prev + (1.0 - momentum) * curr
+        return float(signal)
+
+    def _build_donor_state(self, donor_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
+        donor_state = {}
+        if donor_indices.numel() == 0:
+            return donor_state
+
+        weights = []
+        for idx in donor_indices.tolist():
+            cap = torch.clamp(self.blocks[idx].critic.capital, min=1.0)
+            weights.append(cap)
+        weight_tensor = torch.stack(weights)
+        norm_w = weight_tensor / (weight_tensor.sum() + 1e-6)
+
+        for name, _p in self.blocks[0].critic.named_parameters():
+            acc = None
+            for w, idx in zip(norm_w, donor_indices.tolist()):
+                src = dict(self.blocks[idx].critic.named_parameters())[name].detach()
+                term = src * w.to(src.dtype)
+                acc = term if acc is None else (acc + term)
+            donor_state[name] = acc
+        return donor_state
+
+    def _handle_critic_bankruptcy_and_restructure(self, layer_idx: int, step: int) -> None:
+        critic = self.blocks[layer_idx].critic
+        threshold = float(self.economy_cfg.get("critic_bankrupt_threshold_ratio", 0.2)) * critic.init_capital
+        bailout_base = float(self.economy_cfg.get("bailout_base", 1000.0))
+        bailout_decay = float(self.economy_cfg.get("bailout_decay", 0.65))
+        bailout_min = float(self.economy_cfg.get("bailout_min", 200.0))
+        alpha = float(self.economy_cfg.get("restructure_alpha", 0.12))
+        donor_topk = int(self.economy_cfg.get("donor_topk", 2))
+
+        if float(critic.capital.item()) >= threshold:
+            return
+
+        bcount = float(critic.bailout_count.item())
+        bailout = max(bailout_min, bailout_base * (bailout_decay ** bcount))
+        critic.capital = critic.capital + bailout
+        critic.debt = critic.debt + bailout
+        critic.bailout_count = critic.bailout_count + 1
+
+        if self.n_layer <= 1:
+            return
+
+        scores = self.layer_performance_ema.clone()
+        scores[layer_idx] = -1e9
+        k = min(donor_topk, self.n_layer - 1)
+        donor_indices = torch.topk(scores, k=k).indices
+        donor_state = self._build_donor_state(donor_indices)
+        if donor_state:
+            critic.restructure_from_donors(donor_state, alpha=alpha)
+            print(
+                f"🔁 CriticRestructure | step={step} | layer={layer_idx} | "
+                f"donors={donor_indices.tolist()} | alpha={alpha:.3f} | "
+                f"bailout={bailout:.2f} | debt={float(critic.debt.item()):.2f}"
+            )
+
+        if step % 100 == 0:
+            print(f"🏛️ Layer {layer_idx}: Critic bailout={bailout:.2f}, debt={float(critic.debt.item()):.2f}")
+
+    def update_market(
+        self,
+        all_info: Dict,
+        token_losses: torch.Tensor,
+        step: int,
+        phase: str = "normal",
+        critic_loss=None,
+    ) -> None:
+        r"""update_market(all_info, token_losses, step, phase="normal", critic_loss=None) -> None"""
         with torch.no_grad():
+            bonus_signal = self._compute_critic_bonus_signal(critic_loss)
+            bonus_clip = self.economy_cfg.get("critic_bonus_clip", (-0.1, 0.3))
+            clipped_signal = float(max(float(bonus_clip[0]), min(float(bonus_clip[1]), bonus_signal)))
+            self._last_critic_bonus_signal = clipped_signal
+
+            if phase == "criticwarm":
+                reward_scale = float(self.economy_cfg.get("criticwarm_reward_scale", 2.0))
+                penalty_scale = float(self.economy_cfg.get("criticwarm_penalty_scale", 0.4))
+                critic_bonus_scale = float(self.economy_cfg.get("critic_bonus_scale", 0.2))
+            else:
+                reward_scale = 1.0
+                penalty_scale = 1.0
+                critic_bonus_scale = 0.0
+
+            base_commission = float(self.economy_cfg.get("base_commission", 0.8))
+            dividend_scale = float(self.economy_cfg.get("dividend_scale", 0.6))
+            dividend_std_factor = float(self.economy_cfg.get("dividend_std_factor", 0.5))
+            repay_ratio = float(self.economy_cfg.get("repay_ratio", 0.25))
+            alpha_ema = float(self.economy_cfg.get("market_alpha_ema", 0.98))
+            alpha_step = float(self.economy_cfg.get("market_alpha_step", 0.2))
+            alpha_min = float(self.economy_cfg.get("market_alpha_min", 0.0))
+            alpha_max = float(self.economy_cfg.get("market_alpha_max", 1.0))
+
             for i in range(self.n_layer):
-                if i >= len(all_info.get("winners", [])): 
+                if i >= len(all_info.get("winners", [])):
                     continue
-                
-                self.capital_manager.update(
-                    i, all_info["winners"][i], token_losses, all_info["costs"][i]
-                )
-                
-                baseline = self.capital_manager.baseline_losses[i].item()
-                self.blocks[i].critic.settle(
-                    all_info["affinities"][i], all_info["winners"][i],
-                    token_losses, baseline
+
+                _cap_stats = self.capital_manager.update(
+                    i,
+                    all_info["winners"][i],
+                    token_losses,
+                    all_info["costs"][i],
+                    affinity=all_info["affinities"][i],
                 )
 
-                # Bailout logic
-                if self.blocks[i].critic.capital < 200:
-                    self.blocks[i].critic.capital.fill_(2000.0)
-                    if step % 100 == 0:
-                        print(f"🏛️  Layer {i}: Critic Bailout (Step {step})")
+                baseline = float(self.capital_manager.baseline_losses[i].item())
+                perf = baseline - float(token_losses.mean().item())
+                self.layer_performance_ema[i] = 0.95 * self.layer_performance_ema[i] + 0.05 * perf
+
+                # Alpha EMA 自适应（非梯度）:
+                # gate 与 market bias 越一致，alpha 目标越高；越冲突，alpha 目标越低。
+                if i < len(all_info.get("gate_logits", [])) and i < len(all_info.get("capital_bias", [])):
+                    gate_logits_i = all_info["gate_logits"][i]     # [B,T,E]
+                    capital_bias_i = all_info["capital_bias"][i]   # [B,T,E]
+                    gate_top1 = gate_logits_i.argmax(dim=-1)
+                    market_top1 = capital_bias_i.argmax(dim=-1)
+                    agree = (gate_top1 == market_top1).float()
+                    agree_ratio = float(agree.mean().item()) if agree.numel() > 0 else 0.5
+                    curr_alpha = float(self.blocks[i].market_alpha.item())
+                    alpha_target = curr_alpha + alpha_step * (agree_ratio - 0.5) * 2.0
+                    alpha_target = max(alpha_min, min(alpha_max, alpha_target))
+                    new_alpha = alpha_ema * curr_alpha + (1.0 - alpha_ema) * alpha_target
+                    new_alpha = max(alpha_min, min(alpha_max, new_alpha))
+                    self.blocks[i].market_alpha.fill_(new_alpha)
+
+                self.blocks[i].critic.settle(
+                    all_info["affinities"][i],
+                    all_info["winners"][i],
+                    token_losses,
+                    baseline,
+                    reward_scale=reward_scale,
+                    penalty_scale=penalty_scale,
+                    critic_bonus_scale=critic_bonus_scale,
+                    bonus_clip=bonus_clip,
+                    critic_loss_signal=clipped_signal,
+                    base_commission=base_commission,
+                    dividend_scale=dividend_scale,
+                    dividend_std_factor=dividend_std_factor,
+                )
+
+                # 债务自动偿还
+                critic = self.blocks[i].critic
+                if float(critic.debt.item()) > 0:
+                    repay_base = torch.clamp(critic.capital - critic.init_capital * 0.2, min=0.0)
+                    repay = torch.clamp(repay_base * repay_ratio, min=0.0, max=critic.debt)
+                    critic.capital = critic.capital - repay
+                    critic.debt = critic.debt - repay
+
+                self._handle_critic_bankruptcy_and_restructure(i, step)
     
     def log_market_health(self) -> Dict:
         r"""log_market_health() -> Dict
 
-        汇总若干关键层的市场健康指标。
+        汇总所有层的市场健康指标。
 
         Returns:
           Dict: 包含 RWKV/Transformer 份额、Gini、Critic 资本等指标。
         """
         metrics = {}
-        check_layers = [0, self.n_layer // 2, self.n_layer - 1]
-        check_layers = sorted(list(set([i for i in check_layers if i < self.n_layer])))
-
-        for i in check_layers:
+        for i in range(self.n_layer):
             caps = self.capital_manager.capitals[i]
             total_cap = caps.sum() + 1e-6
             
@@ -432,5 +809,20 @@ class CaMoE_System(nn.Module):
             metrics[f"L{i}/RWKVShare"] = rwkv_share.item()
             metrics[f"L{i}/Gini"] = gini.item()
             metrics[f"L{i}/CriticCap"] = self.blocks[i].critic.capital.item()
+            metrics[f"L{i}/CriticDebt"] = self.blocks[i].critic.debt.item()
+            metrics[f"L{i}/BailoutCount"] = self.blocks[i].critic.bailout_count.item()
+            metrics[f"L{i}/AssetVelocity"] = self.capital_manager.get_asset_velocity(i).item()
+            metrics[f"L{i}/QEInject"] = self.capital_manager.last_qe_inject[i].item()
+            metrics[f"L{i}/QEDrain"] = self.capital_manager.last_qe_drain[i].item()
+            metrics[f"L{i}/VCInject"] = self.capital_manager.last_vc_inject[i].item()
+            metrics[f"L{i}/IdleTax"] = self.capital_manager.last_idle_tax[i].item()
+            metrics[f"L{i}/Depreciation"] = self.capital_manager.last_depreciation[i].item()
+            metrics[f"L{i}/ProfitFlow"] = self.capital_manager.last_profit_flow[i].item()
+            metrics[f"L{i}/WealthTax"] = self.capital_manager.last_wealth_tax[i].item()
+            metrics[f"L{i}/PerfEMA"] = self.layer_performance_ema[i].item()
+            metrics[f"L{i}/CriticBonusSignal"] = float(self._last_critic_bonus_signal)
+            metrics[f"L{i}/MarketAlpha"] = self.last_market_alpha[i].item()
+            metrics[f"L{i}/WinnerFromAdjustedEntropy"] = self.last_winner_entropy[i].item()
+            metrics[f"L{i}/WeightEntropy"] = self.last_weight_entropy[i].item()
         
         return metrics
