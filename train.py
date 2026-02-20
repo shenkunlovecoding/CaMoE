@@ -1,5 +1,5 @@
 """
-CaMoE v20 训练脚本
+CaMoE v21 训练脚本
 支持: 七阶段调度 / 分组学习率 / 分阶段数据 profile / 经济系统增强 / Eval Loss
 """
 
@@ -85,6 +85,8 @@ def _build_phase_plan(config: Dict) -> List[Dict[str, Any]]:
             item["steps"] = steps
             item["start_step"] = cursor
             item["end_step"] = cursor + steps
+            item.setdefault("use_market", True)
+            item.setdefault("route_grad", True)
             plan.append(item)
             cursor += steps
         return plan
@@ -105,6 +107,8 @@ def _build_phase_plan(config: Dict) -> List[Dict[str, Any]]:
             "train_groups": ["all"],
             "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
             "market_update": False,
+            "use_market": False,
+            "route_grad": True,
         },
         {
             "name": "warmup",
@@ -115,6 +119,8 @@ def _build_phase_plan(config: Dict) -> List[Dict[str, Any]]:
             "train_groups": ["all"],
             "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
             "market_update": False,
+            "use_market": True,
+            "route_grad": True,
         },
         {
             "name": "normal",
@@ -125,6 +131,8 @@ def _build_phase_plan(config: Dict) -> List[Dict[str, Any]]:
             "train_groups": ["all"],
             "lr_mult": {g: 1.0 for g in config.get("param_groups", [])},
             "market_update": True,
+            "use_market": True,
+            "route_grad": True,
         },
     ]
 
@@ -142,10 +150,18 @@ def get_phase(step: int, phase_plan: List[Dict[str, Any]]) -> Dict[str, Any]:
     for phase in reversed(phase_plan):
         if phase.get("steps", 0) > 0:
             return phase
-    return phase_plan[-1] if phase_plan else {"name": "normal", "data_profile": "default", "market_update": True}
+    return phase_plan[-1] if phase_plan else {
+        "name": "normal",
+        "data_profile": "default",
+        "market_update": True,
+        "use_market": True,
+        "route_grad": True,
+    }
 
 
 def _classify_param_group(name: str, num_rwkv: int) -> str:
+    if ".experts." in name and ".confidence." in name:
+        return "router_conf"
     if ".critic." in name:
         return "critic"
     if name.startswith("bridge."):
@@ -169,7 +185,7 @@ def _classify_param_group(name: str, num_rwkv: int) -> str:
 def build_param_groups(model: CaMoE_System, config: Dict) -> Tuple[List[Dict[str, Any]], Dict[str, List[torch.nn.Parameter]]]:
     r"""build_param_groups(model, config) -> (optimizer_param_groups, group_map)"""
     groups = {g: [] for g in config.get("param_groups", [
-        "rwkv_backbone", "rwkv_experts", "trans_experts", "bridge", "critic", "emb_head"
+        "rwkv_backbone", "router_conf", "rwkv_experts", "trans_experts", "bridge", "critic", "emb_head"
     ])}
     num_rwkv = int(config.get("num_rwkv_experts", 6))
 
@@ -217,15 +233,11 @@ def apply_phase_policy(
         pg["lr"] = base_lr * mult
 
 
-def apply_route_grad_policy(model: CaMoE_System, phase_name: str, config: Dict) -> None:
-    r"""apply_route_grad_policy(model, phase_name, config) -> None
-
-    criticwarm 期间开启 route grad（训练 critic），其它阶段恢复默认 route_no_grad。
-    """
+def apply_route_grad_policy(model: CaMoE_System, phase: Dict[str, Any], config: Dict) -> None:
+    r"""apply_route_grad_policy(model, phase, config) -> None"""
     default_route_no_grad = bool(config.get("route_no_grad", True))
-    route_no_grad = default_route_no_grad
-    if phase_name == "criticwarm":
-        route_no_grad = False
+    route_grad = bool(phase.get("route_grad", not default_route_no_grad))
+    route_no_grad = not route_grad
 
     for block in model.blocks:
         block.route_no_grad = route_no_grad
@@ -640,11 +652,15 @@ def main() -> None:
         
         phase = get_phase(step, phase_plan)
         phase_name = phase.get("name", "normal")
+        phase_use_market = bool(phase.get("use_market", True))
         if phase_name != last_phase_name:
             apply_phase_policy(optimizer, phase, config, group_map)
-            apply_route_grad_policy(model, phase_name, config)
+            apply_route_grad_policy(model, phase, config)
             last_phase_name = phase_name
-            print(f"🔁 Phase switched -> {phase_name} [{phase.get('start_step', step)}:{phase.get('end_step', step)}]")
+            print(
+                f"🔁 Phase switched -> {phase_name} [{phase.get('start_step', step)}:{phase.get('end_step', step)}] "
+                f"| use_market={phase_use_market} | route_grad={phase.get('route_grad', True)}"
+            )
 
             phase_profile = phase.get("data_profile", "default")
             if phase_profile != active_profile:
@@ -666,8 +682,13 @@ def main() -> None:
         
         try:
             with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=train_use_amp):
-                logits, info = model(x, step=step, phase=phase_name)
-                total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
+                logits, info = model(
+                    x,
+                    step=step,
+                    phase=phase_name,
+                    use_market_override=phase_use_market,
+                )
+                total_loss, token_losses, main_loss, critic_loss, aux_loss = model.compute_losses(logits, y, info)
                 loss_to_backward = total_loss / config['grad_accum']
         except RuntimeError as e:
             print(f"💥 Forward/LOSS failed at step={step}, phase={phase_name}: {e}")
@@ -723,6 +744,7 @@ def main() -> None:
                 logs = {
                     "Loss/Train_Main": main_loss.item(),
                     "Loss/Train_Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
+                    "Loss/Aux_Balance": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
                     "Speed/TPS": tps,
                     "Phase/ID": float(phase_to_id.get(phase_name, -1)),
                     f"Phase/{phase_name}": 1.0,

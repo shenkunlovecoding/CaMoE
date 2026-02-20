@@ -1,0 +1,180 @@
+commit 63ca422327f1dfb5c35fbbaf5168ecd1bab90e8a
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Thu Feb 19 10:17:55 2026 +0800
+
+    prepare_data
+
+commit 55734ba33b529f8a72e5357a4bc82cd841f6606f
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Wed Feb 18 20:24:31 2026 +0800
+
+    critic warm
+
+commit b3d425a00d2db12eec2de21d4a05d4c761d76f6f
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Wed Feb 18 17:00:27 2026 +0800
+
+    a little change
+
+commit a8ac6b66dc78d9b09d79527de21c01e22e9576f8
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Wed Feb 18 14:32:13 2026 +0800
+
+    v20
+
+commit 56b7064e7d156b0701f1bbf08cecc69b3c2092db
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Mon Feb 16 16:22:33 2026 +0800
+
+    data
+
+commit 1cfdfc9f6e2c970f333846398477c637d18dd8af
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Mon Feb 16 15:52:28 2026 +0800
+
+    version number
+
+commit db69caa35e6045976ae1dd90579833c1e31b3900
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Mon Feb 16 15:51:30 2026 +0800
+
+    v19
+
+commit c362007c470835fbe97f025d937ae0ddce6324c0
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Mon Feb 16 09:49:50 2026 +0800
+
+    docs: update README with v18.5 stability and kernel compatibility notes
+
+commit d178cc32b9b97cb42cba22e6fa0f56504724637c
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 22:55:41 2026 +0800
+
+    config
+
+commit 6fcd039a41d9e9f6cadfe7e5c3764e7afb2f77b4
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 22:54:45 2026 +0800
+
+    fix 2
+
+commit d6402fcdb519cdf3c1a7a4bb5a0f924cebcabc30
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 22:45:46 2026 +0800
+
+    fix
+
+commit a640ad5203c809b048d189cfcbdf906f670b4ea8
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 21:57:50 2026 +0800
+
+    cuda
+
+commit 94b8374a57df0cb65d0a61138697922798e2366f
+Merge: 757dda8 ae66c5b
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 20:17:50 2026 +0800
+
+    Merge branch 'v18.5-test' of https://github.com/shenkunlovecoding/CaMoE into v18.5-test
+
+commit 757dda879cb3506ec6b270c3be13b19a862c4d67
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 19:12:40 2026 +0800
+
+    small update1
+
+commit ae66c5b05b843ae9421d5cfe32a9b4770c83ac68
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 19:12:40 2026 +0800
+
+    small update
+
+commit 9fac12c80f5f6f640935963857a0e760c79c9136
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sun Feb 15 16:40:30 2026 +0800
+
+    v18.5.1
+
+commit db247b8816838fcdac35a4613ebf2eb89d0593cd
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sat Feb 14 19:31:23 2026 +0800
+
+    v18.5-test
+
+commit f14aec4f541e8662c8647088bfc08fabc9582b0d
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sat Feb 14 18:39:15 2026 +0800
+
+    fix
+
+commit edad2638a37004f2976d0682de0f8b09df9c8a14
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sat Feb 7 20:09:09 2026 +0800
+
+    update to v18 stable version
+
+commit 3fb83f0227ada8829ec1cbfb4931137fa1932d5d
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Sat Feb 7 16:26:59 2026 +0800
+
+    v18 stable
+
+commit 1142763f5b6c80a5afb90cd27158c6236dbc7f74
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Fri Feb 6 23:37:45 2026 +0800
+
+    update v18
+
+commit 03a8a6d060eeb96a14eb55335e43c78548c7a1c1
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Fri Feb 6 23:09:56 2026 +0800
+
+    first v18 test
+
+commit 4384a8f831a56303aefa4abd414c6c7597d09b04
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Thu Feb 5 18:30:51 2026 +0800
+
+    v16
+
+commit 1053a89d20fcac1def324ebad0088f67322bb6e5
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Wed Feb 4 23:55:56 2026 +0800
+
+    v15
+
+commit fa14b6061c98f9d6f283bb440a1b008d44bc3506
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 22:19:49 2026 +0800
+
+    v12
+
+commit 85fa87369134ab3dd6728fd0a8d128ffa73c8f37
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 20:04:52 2026 +0800
+
+    clean,ver12.0
+
+commit 44d5598ae4cef69948e9dd1bb5ff390593df52c7
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 18:56:36 2026 +0800
+
+    修改了强行覆盖参数的问题，并修改了eval
+
+commit 3bb3f485956f806845c4e93d2b4b97582ce2f003
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 16:44:27 2026 +0800
+
+    1+1 test
+
+commit 4719717a750bad81cb253c5b0612c806bf86bec1
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 15:40:23 2026 +0800
+
+    fix README
+
+commit 1151e096985da51bf898cab75a7d35995deae7fa
+Author: shenziqian <shenziqian666@outlook.com>
+Date:   Tue Feb 3 15:38:25 2026 +0800
+
+    Initial commit: CaMoE v11.0 Release

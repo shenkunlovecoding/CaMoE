@@ -1,9 +1,9 @@
 """
-CaMoE v18 主系统 (Final Fix)
+CaMoE v21 主系统
 Changes:
-1. 强制全程开启 Router (use_market=True)，拒绝随机路由。
-2. 修复 LinearTransformerExpert 初始化。
-3. 保持 Rescale Trick 和 GC。
+1. 双通道路由：Gradient Gate + Market Bias。
+2. winners 离散选择（detach），weights 连续可微（不 detach）。
+3. 支持 phase 级 use_market_override 与 route_grad 策略。
 """
 
 import torch
@@ -47,6 +47,8 @@ class CaMoE_Block(nn.Module):
         self.checkpoint_expert_stage = use_gc and config.get("checkpoint_expert_stage", True)
         self.route_no_grad = config.get("route_no_grad", True)
         self.lazy_prefix_union = config.get("lazy_prefix_union", True)
+        market_alpha_init = float(config.get("market_alpha_init", 0.05))
+        self.register_buffer("market_alpha", torch.tensor([market_alpha_init], dtype=torch.float32))
         
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -146,42 +148,65 @@ class CaMoE_Block(nn.Module):
         use_market: bool,
         training: bool,
         step: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""执行 confidence/critic/router，返回 winners/weights/costs/difficulty/affinity。"""
-        route_ctx = torch.no_grad if self.route_no_grad else nullcontext
-        with route_ctx():
-            route_h = h.detach() if self.route_no_grad else h
-            conf_list = [exp.get_confidence(route_h) for exp in self.experts]
-            confidences = torch.stack(conf_list, dim=-1)  # [B, T, E]
-            self._assert_finite(confidences, "confidences", step)
+        # Gate logits 始终可导：用于训练 confidence / router
+        conf_list = [exp.get_confidence(h) for exp in self.experts]
+        gate_logits = torch.stack(conf_list, dim=-1)  # [B, T, E]
+        self._assert_finite(gate_logits, "gate_logits", step)
 
-            if not use_market:
-                B, T, _E = confidences.shape
-                winners = torch.randint(0, self.num_experts, (B, T, 2), device=h.device)
-                weights = torch.ones(B, T, 2, device=h.device) * 0.5
-                costs = torch.zeros(B, T, device=h.device)
-                difficulty = torch.ones(B, T, 1, device=h.device)
-                affinity = torch.zeros(B, T, self.num_experts, device=h.device)
-            else:
+        if not use_market:
+            B, T, _E = gate_logits.shape
+            capital_bias = torch.zeros_like(gate_logits)
+            winners, weights, costs, adjusted_logits = router.route(
+                gate_logits=gate_logits,
+                capital_bias=capital_bias,
+                market_enabled=False,
+                training=training,
+            )
+            difficulty = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+            affinity = torch.zeros(B, T, self.num_experts, device=h.device, dtype=h.dtype)
+        else:
+            route_ctx = torch.no_grad if self.route_no_grad else nullcontext
+            with route_ctx():
+                route_h = h.detach() if self.route_no_grad else h
                 difficulty, affinity = self.critic(route_h)
                 self._assert_finite(difficulty, "difficulty", step)
                 self._assert_finite(affinity, "affinity", step)
                 critic_subsidy = self.critic.subsidy_from_affinity(affinity)
                 self._assert_finite(critic_subsidy, "critic_subsidy", step)
-                winners, weights, costs, bids = router.route(
-                    confidences, capital_shares, difficulty, critic_subsidy, training
+                alpha = self.market_alpha.to(device=h.device, dtype=gate_logits.dtype)
+                capital_bias = capital_shares.view(1, 1, -1)
+                capital_bias = capital_bias * (1.0 + difficulty.detach()) + critic_subsidy.detach()
+                capital_bias = alpha * capital_bias.detach()
+                self._assert_finite(capital_bias, "capital_bias", step)
+                winners, weights, costs, adjusted_logits = router.route(
+                    gate_logits=gate_logits,
+                    capital_bias=capital_bias,
+                    market_enabled=True,
+                    training=training,
                 )
-                self._assert_finite(weights, "weights", step)
-                self._assert_finite(costs, "costs", step)
-                self._assert_finite(bids, "bids", step)
+            self._assert_finite(weights, "weights", step)
+            self._assert_finite(costs, "costs", step)
+            self._assert_finite(adjusted_logits, "adjusted_logits", step)
 
         if self.route_no_grad:
             diff_out = difficulty.detach()
+            adjusted_out = adjusted_logits.detach()
         else:
-            # criticwarm 需要 difficulty 保留计算图来训练 critic
             diff_out = difficulty
+            adjusted_out = adjusted_logits
 
-        return winners.detach(), weights.detach(), costs.detach(), diff_out, affinity.detach()
+        return (
+            winners.detach(),
+            weights,
+            costs.detach(),
+            diff_out,
+            affinity.detach(),
+            adjusted_out,
+            gate_logits.detach(),
+            capital_bias.detach(),
+        )
 
     def _build_trans_prefix_union(
         self,
@@ -300,7 +325,7 @@ class CaMoE_Block(nn.Module):
         else:
             x_after_att, h, v_first, rwkv_state = self._forward_att_stage(x, v_first, idx, step)
 
-        winners, weights, costs, difficulty, affinity = self._forward_route_stage(
+        winners, weights, costs, difficulty, affinity, adjusted_logits, gate_logits, capital_bias = self._forward_route_stage(
             h, capital_shares, router, use_market, training, step
         )
 
@@ -319,9 +344,13 @@ class CaMoE_Block(nn.Module):
 
         info = {
             "winners": winners,
+            "weights": weights,
             "costs": costs,
             "difficulty": difficulty,
             "affinity": affinity,
+            "adjusted_logits": adjusted_logits,
+            "gate_logits": gate_logits,
+            "capital_bias": capital_bias,
         }
         return x, v_first, info
 
@@ -394,8 +423,11 @@ class CaMoE_System(nn.Module):
             economy=self.economy_cfg,
         )
         
-        self.router = SparseRouter()
+        self.router = SparseRouter(noise_std=float(config.get("router_noise_std", 0.02)))
         self.register_buffer("layer_performance_ema", torch.zeros(self.n_layer))
+        self.register_buffer("last_winner_entropy", torch.zeros(self.n_layer))
+        self.register_buffer("last_weight_entropy", torch.zeros(self.n_layer))
+        self.register_buffer("last_market_alpha", torch.zeros(self.n_layer))
         self._critic_loss_ema = None
         self._last_critic_bonus_signal = 0.0
 
@@ -429,8 +461,8 @@ class CaMoE_System(nn.Module):
         raise RuntimeError(f"NaN/Inf detected at step={step}, layer={layer_id}, tensor={name}")
     
     def forward(self, idx: torch.Tensor, step: int = 0, 
-                phase: str = "normal") -> Tuple[torch.Tensor, Dict]:
-        r"""forward(idx, step=0, phase="normal") -> Tuple[Tensor, Dict]
+                phase: str = "normal", use_market_override: bool = None) -> Tuple[torch.Tensor, Dict]:
+        r"""forward(idx, step=0, phase="normal", use_market_override=None) -> Tuple[Tensor, Dict]
 
         执行整网前向并收集各层路由信息。
 
@@ -446,13 +478,15 @@ class CaMoE_System(nn.Module):
         self._assert_finite(x, "emb_out", step, -1)
         v_first = None
         
-        # [CRITICAL FIX] 始终开启 Market Routing
-        # 即使在 Prewarm/Warmup，我们也需要 Router 选出最好的专家，让专家获得正确的梯度
-        # 资本的更新 (Update) 由 train.py 控制，这里只管路由 (Selection)
-        use_market = True 
+        use_market = True if use_market_override is None else bool(use_market_override)
         
         all_info = {
-            "winners": [], "costs": [], "difficulties": [], "affinities": []
+            "winners": [],
+            "costs": [],
+            "difficulties": [],
+            "affinities": [],
+            "gate_logits": [],
+            "capital_bias": [],
         }
         warmup_steps = self.config.get('warmup_steps', 2000)
 
@@ -468,6 +502,8 @@ class CaMoE_System(nn.Module):
             self._assert_finite(info["costs"], "costs", step, i)
             self._assert_finite(info["difficulty"], "difficulty", step, i)
             self._assert_finite(info["affinity"], "affinity", step, i)
+            self._assert_finite(info["weights"], "weights", step, i)
+            self._assert_finite(info["adjusted_logits"], "adjusted_logits", step, i)
             
             all_info["winners"].append(info["winners"].detach())
             all_info["costs"].append(info["costs"].detach())
@@ -475,6 +511,18 @@ class CaMoE_System(nn.Module):
             # 其它阶段在 block 内 route_no_grad=True 时 difficulty 已是 detached tensor
             all_info["difficulties"].append(info["difficulty"])
             all_info["affinities"].append(info["affinity"].detach())
+            all_info["gate_logits"].append(info["gate_logits"].detach())
+            all_info["capital_bias"].append(info["capital_bias"].detach())
+
+            with torch.no_grad():
+                adj_prob = F.softmax(info["adjusted_logits"].float(), dim=-1)
+                adj_ent = -(adj_prob * torch.log(adj_prob + 1e-9)).sum(dim=-1).mean()
+                wt_prob = info["weights"].float()
+                wt_ent = -(wt_prob * torch.log(wt_prob + 1e-9)).sum(dim=-1).mean()
+                alpha = block.market_alpha.detach().mean()
+                self.last_winner_entropy[i] = adj_ent.to(self.last_winner_entropy.dtype)
+                self.last_weight_entropy[i] = wt_ent.to(self.last_weight_entropy.dtype)
+                self.last_market_alpha[i] = alpha.to(self.last_market_alpha.dtype)
         
         x = self.ln_out(x)
         self._assert_finite(x, "ln_out", step, self.n_layer)
@@ -506,8 +554,8 @@ class CaMoE_System(nn.Module):
           all_info (Dict): 各层难度/路由信息。
 
         Returns:
-          Tuple[Tensor, Tensor, Tensor, Tensor, float]:
-          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``bridge_loss``。
+          Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``aux_loss``。
         """
         if self.config.get("stabilize_logits", False):
             # 训练稳定性保护：避免上游极端值导致 CE 直接 NaN/Inf
@@ -545,10 +593,32 @@ class CaMoE_System(nn.Module):
         if len(all_info.get("difficulties", [])) > 0:
             critic_loss /= len(all_info["difficulties"])
 
-        total_loss = main_loss + 0.1 * critic_loss
-        bridge_loss = 0.0 # No longer used
+        # Router Load Balance Loss
+        aux_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        n_counted = 0
+        valid_mask = targets.ne(-100)
+        valid_count = valid_mask.sum().item()
+        if valid_count > 0:
+            for i, winners_i in enumerate(all_info.get("winners", [])):
+                if i >= self.n_layer:
+                    break
+                freq = torch.zeros(self.num_experts, device=logits.device, dtype=logits.dtype)
+                for k in range(2):
+                    one_hot = F.one_hot(winners_i[:, :, k], self.num_experts).to(dtype=logits.dtype)
+                    one_hot = one_hot * valid_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    freq = freq + one_hot.sum(dim=(0, 1))
+                denom = valid_mask.sum().to(dtype=logits.dtype) * 2.0 + 1e-6
+                freq = freq / denom
+                target_freq = torch.tensor(1.0 / self.num_experts, device=logits.device, dtype=logits.dtype)
+                aux_loss = aux_loss + ((freq - target_freq) ** 2).sum() * self.num_experts
+                n_counted += 1
+            if n_counted > 0:
+                aux_loss = aux_loss / float(n_counted)
+
+        aux_coeff = float(self.config.get("aux_loss_coeff", 0.01))
+        total_loss = main_loss + 0.1 * critic_loss + aux_coeff * aux_loss
         
-        return total_loss, token_losses, main_loss, critic_loss, bridge_loss
+        return total_loss, token_losses, main_loss, critic_loss, aux_loss
     
     def _compute_critic_bonus_signal(self, critic_loss) -> float:
         if critic_loss is None:
@@ -652,18 +722,42 @@ class CaMoE_System(nn.Module):
             dividend_scale = float(self.economy_cfg.get("dividend_scale", 0.6))
             dividend_std_factor = float(self.economy_cfg.get("dividend_std_factor", 0.5))
             repay_ratio = float(self.economy_cfg.get("repay_ratio", 0.25))
+            alpha_ema = float(self.economy_cfg.get("market_alpha_ema", 0.98))
+            alpha_step = float(self.economy_cfg.get("market_alpha_step", 0.2))
+            alpha_min = float(self.economy_cfg.get("market_alpha_min", 0.0))
+            alpha_max = float(self.economy_cfg.get("market_alpha_max", 1.0))
 
             for i in range(self.n_layer):
                 if i >= len(all_info.get("winners", [])):
                     continue
 
                 _cap_stats = self.capital_manager.update(
-                    i, all_info["winners"][i], token_losses, all_info["costs"][i]
+                    i,
+                    all_info["winners"][i],
+                    token_losses,
+                    all_info["costs"][i],
+                    affinity=all_info["affinities"][i],
                 )
 
                 baseline = float(self.capital_manager.baseline_losses[i].item())
                 perf = baseline - float(token_losses.mean().item())
                 self.layer_performance_ema[i] = 0.95 * self.layer_performance_ema[i] + 0.05 * perf
+
+                # Alpha EMA 自适应（非梯度）:
+                # gate 与 market bias 越一致，alpha 目标越高；越冲突，alpha 目标越低。
+                if i < len(all_info.get("gate_logits", [])) and i < len(all_info.get("capital_bias", [])):
+                    gate_logits_i = all_info["gate_logits"][i]     # [B,T,E]
+                    capital_bias_i = all_info["capital_bias"][i]   # [B,T,E]
+                    gate_top1 = gate_logits_i.argmax(dim=-1)
+                    market_top1 = capital_bias_i.argmax(dim=-1)
+                    agree = (gate_top1 == market_top1).float()
+                    agree_ratio = float(agree.mean().item()) if agree.numel() > 0 else 0.5
+                    curr_alpha = float(self.blocks[i].market_alpha.item())
+                    alpha_target = curr_alpha + alpha_step * (agree_ratio - 0.5) * 2.0
+                    alpha_target = max(alpha_min, min(alpha_max, alpha_target))
+                    new_alpha = alpha_ema * curr_alpha + (1.0 - alpha_ema) * alpha_target
+                    new_alpha = max(alpha_min, min(alpha_max, new_alpha))
+                    self.blocks[i].market_alpha.fill_(new_alpha)
 
                 self.blocks[i].critic.settle(
                     all_info["affinities"][i],
@@ -720,11 +814,15 @@ class CaMoE_System(nn.Module):
             metrics[f"L{i}/AssetVelocity"] = self.capital_manager.get_asset_velocity(i).item()
             metrics[f"L{i}/QEInject"] = self.capital_manager.last_qe_inject[i].item()
             metrics[f"L{i}/QEDrain"] = self.capital_manager.last_qe_drain[i].item()
+            metrics[f"L{i}/VCInject"] = self.capital_manager.last_vc_inject[i].item()
             metrics[f"L{i}/IdleTax"] = self.capital_manager.last_idle_tax[i].item()
             metrics[f"L{i}/Depreciation"] = self.capital_manager.last_depreciation[i].item()
             metrics[f"L{i}/ProfitFlow"] = self.capital_manager.last_profit_flow[i].item()
             metrics[f"L{i}/WealthTax"] = self.capital_manager.last_wealth_tax[i].item()
             metrics[f"L{i}/PerfEMA"] = self.layer_performance_ema[i].item()
             metrics[f"L{i}/CriticBonusSignal"] = float(self._last_critic_bonus_signal)
+            metrics[f"L{i}/MarketAlpha"] = self.last_market_alpha[i].item()
+            metrics[f"L{i}/WinnerFromAdjustedEntropy"] = self.last_winner_entropy[i].item()
+            metrics[f"L{i}/WeightEntropy"] = self.last_weight_entropy[i].item()
         
         return metrics

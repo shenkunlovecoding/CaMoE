@@ -1,5 +1,5 @@
 """
-CaMoE v20 Market Mechanism
+CaMoE v21 Market Mechanism
 Top-2 Vickrey Auction + Central Bank/QE + Idle Tax/Depreciation + Asset Velocity
 """
 
@@ -43,6 +43,11 @@ class CapitalManager(nn.Module):
         self.idle_threshold = float(econ.get("idle_threshold", 0.01))
         self.idle_tax_rate = float(econ.get("idle_tax_rate", 0.02))
         self.depreciation_rate = float(econ.get("depreciation_rate", 0.001))
+        self.vc_affinity_threshold = float(econ.get("vc_affinity_threshold", 0.15))
+        self.vc_low_cap_ratio = float(econ.get("vc_low_cap_ratio", 0.85))
+        self.vc_selected_threshold = float(econ.get("vc_selected_threshold", 0.01))
+        self.vc_inject_ratio = float(econ.get("vc_inject_ratio", 0.01))
+        self.vc_max_inject_ratio = float(econ.get("vc_max_inject_ratio", 0.12))
 
         init_cap = self.total_capital / self.num_experts
         self.register_buffer("capitals", torch.ones(num_layers, num_experts) * init_cap)
@@ -56,6 +61,7 @@ class CapitalManager(nn.Module):
         self.register_buffer("last_depreciation", torch.zeros(num_layers))
         self.register_buffer("last_profit_flow", torch.zeros(num_layers))
         self.register_buffer("last_wealth_tax", torch.zeros(num_layers))
+        self.register_buffer("last_vc_inject", torch.zeros(num_layers))
 
     def get_shares(self, layer_idx: int) -> torch.Tensor:
         caps = self.capitals[layer_idx]
@@ -137,6 +143,7 @@ class CapitalManager(nn.Module):
         winners: torch.Tensor,
         token_losses: torch.Tensor,
         costs: torch.Tensor,
+        affinity: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         r"""update(...) -> Dict
 
@@ -179,6 +186,8 @@ class CapitalManager(nn.Module):
             self.asset_velocity[layer_idx] = self.asset_flow_ema[layer_idx] / total_cap
             self.last_profit_flow[layer_idx] = flow
 
+            vc_inject = self.apply_venture_capital(layer_idx, winners, affinity)
+
             return {
                 "profit_flow": flow,
                 "wealth_tax": self.last_wealth_tax[layer_idx],
@@ -186,8 +195,64 @@ class CapitalManager(nn.Module):
                 "depreciation": idle_stats["depreciation"],
                 "qe_inject": qe_stats["qe_inject"],
                 "qe_drain": qe_stats["qe_drain"],
+                "vc_inject": vc_inject,
                 "asset_velocity": self.asset_velocity[layer_idx],
             }
+
+    def apply_venture_capital(
+        self,
+        layer_idx: int,
+        winners: torch.Tensor,
+        affinity: torch.Tensor = None,
+    ) -> torch.Tensor:
+        r"""apply_venture_capital(layer_idx, winners, affinity=None) -> Tensor
+
+        若专家满足「高 affinity + 低资本 + 几乎未被选中」，执行风投注资。
+        """
+        caps = self.capitals[layer_idx]
+        if affinity is None:
+            self.last_vc_inject[layer_idx] = 0.0
+            return torch.zeros((), device=caps.device, dtype=caps.dtype)
+
+        with torch.no_grad():
+            # token 级选择率：Top-2 任一命中即记为被选中
+            one_hot = F.one_hot(winners, num_classes=self.num_experts).any(dim=2).float()  # [B,T,E]
+            selected_rate = one_hot.mean(dim=(0, 1))  # [E]
+
+            # Critic 偏好强度（只保留正向看好）
+            aff_score = F.relu(affinity).mean(dim=(0, 1))  # [E]
+            aff_gate = torch.clamp(aff_score - self.vc_affinity_threshold, min=0.0)
+
+            avg_cap = caps.mean()
+            low_cap_mask = caps < (avg_cap * self.vc_low_cap_ratio)
+            low_select_mask = selected_rate < self.vc_selected_threshold
+            eligible = low_cap_mask & low_select_mask & (aff_gate > 0)
+
+            if not eligible.any():
+                self.last_vc_inject[layer_idx] = 0.0
+                return torch.zeros((), device=caps.device, dtype=caps.dtype)
+
+            # “越穷越值得投”：同等 affinity 下优先低资本专家
+            poverty_boost = (avg_cap / (caps + 1e-6)).clamp(min=0.5, max=5.0)
+            score = aff_gate * poverty_boost * eligible.to(caps.dtype)
+            score_sum = score.sum()
+            if score_sum <= 0:
+                self.last_vc_inject[layer_idx] = 0.0
+                return torch.zeros((), device=caps.device, dtype=caps.dtype)
+
+            budget = torch.tensor(self.total_capital * self.vc_inject_ratio, device=caps.device, dtype=caps.dtype)
+            alloc = budget * (score / (score_sum + 1e-6))
+            max_each = torch.tensor(
+                self.total_capital * self.vc_max_inject_ratio / self.num_experts,
+                device=caps.device,
+                dtype=caps.dtype,
+            )
+            alloc = torch.clamp(alloc, min=0.0, max=max_each)
+            inject = alloc.sum()
+
+            self.capitals[layer_idx] = caps + alloc
+            self.last_vc_inject[layer_idx] = inject
+            return inject
 
 
 class SparseRouter:
@@ -201,28 +266,32 @@ class SparseRouter:
 
     def route(
         self,
-        confidences: torch.Tensor,
-        capital_shares: torch.Tensor,
-        difficulty: torch.Tensor,
-        critic_subsidy: torch.Tensor = None,
+        gate_logits: torch.Tensor,
+        capital_bias: torch.Tensor = None,
+        market_enabled: bool = True,
         training: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, T, _E = confidences.shape
+        B, T, _E = gate_logits.shape
 
-        # 1) 计算 bids
-        bids = confidences * capital_shares.view(1, 1, -1) * (1.0 + difficulty)
-        if critic_subsidy is not None:
-            bids = bids + critic_subsidy
+        # 1) winner 分支：adjusted logits（可含市场偏置）
+        adjusted_logits = gate_logits
+        if capital_bias is not None:
+            adjusted_logits = adjusted_logits + capital_bias
+        winner_logits = adjusted_logits
         if training:
-            bids = bids + torch.randn_like(bids) * self.noise_std
+            winner_logits = winner_logits + torch.randn_like(winner_logits) * self.noise_std
 
-        # 2) Top-3 选举（Top-2 当选，Top-3 定价）
-        topk_vals, topk_idxs = torch.topk(bids, 3, dim=-1)
+        topk_vals, topk_idxs = torch.topk(winner_logits, 3, dim=-1)
         winners = topk_idxs[:, :, :2]
-        price = topk_vals[:, :, 2]
+        if market_enabled:
+            # 市场开启时沿用 Vickrey 风格第二价格（这里用 Top-3）
+            costs = topk_vals[:, :, 2]
+        else:
+            costs = torch.zeros(B, T, device=gate_logits.device, dtype=gate_logits.dtype)
 
-        # 3) Top-2 权重
-        top2_bids = topk_vals[:, :, :2]
-        weights = F.softmax(top2_bids, dim=-1)
+        # 2) weight 分支：纯 Gate 主导（不引入市场梯度）
+        top2_gate = torch.gather(gate_logits, dim=-1, index=winners)
+        weights = F.softmax(top2_gate, dim=-1)
 
-        return winners, weights, price, bids
+        # 返回无噪声 adjusted logits 作为调试信号
+        return winners, weights, costs, adjusted_logits

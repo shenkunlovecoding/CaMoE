@@ -1,5 +1,5 @@
 """
-CaMoE v20 配置文件
+CaMoE v21 配置文件
 7 阶段训练调度 + 经济系统增强版
 """
 
@@ -8,7 +8,7 @@ from .config_pilot import CONFIG_PILOT
 # ==========================================
 # 版本控制
 # ==========================================
-VERSION = "v20"
+VERSION = "v21"
 SCALE = "0.4b"
 VARIANT = "6R2T-Top2"
 
@@ -22,6 +22,7 @@ RUN_ID = f"FineWeb70-Cosmo30-{SCALE}-{VARIANT}-{VERSION}"
 # ==========================================
 PARAM_GROUPS = [
     "rwkv_backbone",
+    "router_conf",
     "rwkv_experts",
     "trans_experts",
     "bridge",
@@ -30,23 +31,26 @@ PARAM_GROUPS = [
 ]
 
 # ==========================================
-# v20 七阶段调度（SFT/RLHF 占位）
+# v21 七阶段调度（SFT/RLHF 占位）
 # ==========================================
-PHASE_SCHEDULE_V20 = [
+PHASE_SCHEDULE_V21 = [
     {
         "name": "prewarm",
         "steps": 2000,
         "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["trans_experts", "bridge"],
+        "train_groups": ["router_conf", "bridge"],
         "lr_mult": {
             "rwkv_backbone": 0.0,
+            "router_conf": 1.0,
             "rwkv_experts": 0.0,
-            "trans_experts": 1.0,
+            "trans_experts": 0.0,
             "bridge": 1.0,
             "critic": 0.0,
             "emb_head": 0.0,
         },
         "market_update": False,
+        "use_market": False,
+        "route_grad": True,
     },
     {
         "name": "warm",
@@ -55,6 +59,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.35,
+            "router_conf": 0.35,
             "rwkv_experts": 0.35,
             "trans_experts": 0.35,
             "bridge": 0.35,
@@ -62,6 +67,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.35,
         },
         "market_update": False,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "criticwarm",
@@ -70,6 +77,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["critic"],
         "lr_mult": {
             "rwkv_backbone": 0.0,
+            "router_conf": 0.0,
             "rwkv_experts": 0.0,
             "trans_experts": 0.0,
             "bridge": 0.0,
@@ -77,6 +85,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.0,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "prenormal",
@@ -85,6 +95,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.35,
+            "router_conf": 0.7,
             "rwkv_experts": 0.6,
             "trans_experts": 0.8,
             "bridge": 0.8,
@@ -92,6 +103,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.5,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "normal",
@@ -100,6 +113,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.7,
+            "router_conf": 1.0,
             "rwkv_experts": 1.0,
             "trans_experts": 1.0,
             "bridge": 1.0,
@@ -107,6 +121,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.8,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "sft",
@@ -115,6 +131,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.5,
+            "router_conf": 0.6,
             "rwkv_experts": 0.8,
             "trans_experts": 0.8,
             "bridge": 0.6,
@@ -122,6 +139,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.8,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "rlhf",
@@ -130,6 +149,7 @@ PHASE_SCHEDULE_V20 = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.3,
+            "router_conf": 0.4,
             "rwkv_experts": 0.5,
             "trans_experts": 0.5,
             "bridge": 0.4,
@@ -137,6 +157,8 @@ PHASE_SCHEDULE_V20 = [
             "emb_head": 0.6,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
 ]
 
@@ -146,7 +168,7 @@ def _total_steps(schedule):
 
 
 # ==========================================
-# 0.4B 主配置（v20）
+# 0.4B 主配置（v21）
 # ==========================================
 CONFIG_04B = {
     # ===== 元信息 =====
@@ -175,10 +197,10 @@ CONFIG_04B = {
     "low_rank_dim": 64,
     # ===== 优化器与阶段 =====
     "base_lr": 1e-4,
-    "phase_schedule": PHASE_SCHEDULE_V20,
+    "phase_schedule": PHASE_SCHEDULE_V21,
     "sft_steps": 0,
     "rlhf_steps": 0,
-    "total_steps": _total_steps(PHASE_SCHEDULE_V20),
+    "total_steps": _total_steps(PHASE_SCHEDULE_V21),
     "param_groups": PARAM_GROUPS,
     # ===== Market 参数（兼容旧键） =====
     "total_capital": 10000.0,
@@ -211,6 +233,17 @@ CONFIG_04B = {
         "base_commission": 0.8,
         "dividend_scale": 0.6,
         "dividend_std_factor": 0.5,
+        # 风投注资（VC Injection）
+        "vc_affinity_threshold": 0.15,
+        "vc_low_cap_ratio": 0.85,
+        "vc_selected_threshold": 0.01,
+        "vc_inject_ratio": 0.01,
+        "vc_max_inject_ratio": 0.12,
+        # Market alpha EMA（非梯度）
+        "market_alpha_ema": 0.98,
+        "market_alpha_step": 0.2,
+        "market_alpha_min": 0.0,
+        "market_alpha_max": 1.0,
         # CriticWarm 奖励增强（中等）
         "criticwarm_reward_scale": 2.0,
         "criticwarm_penalty_scale": 0.4,
@@ -226,6 +259,9 @@ CONFIG_04B = {
     "checkpoint_att_stage": True,
     "checkpoint_expert_stage": True,
     "route_no_grad": True,
+    "router_noise_std": 0.02,
+    "market_alpha_init": 0.05,
+    "aux_loss_coeff": 0.01,
     "lazy_prefix_union": True,
     # ===== 日志与评估 =====
     "log_interval": 10,
@@ -280,16 +316,19 @@ CONFIG_04B_TOY_PHASES = [
         "name": "prewarm",
         "steps": 100,
         "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["trans_experts", "bridge"],
+        "train_groups": ["router_conf", "bridge"],
         "lr_mult": {
             "rwkv_backbone": 0.0,
+            "router_conf": 1.0,
             "rwkv_experts": 0.0,
-            "trans_experts": 1.0,
+            "trans_experts": 0.0,
             "bridge": 1.0,
             "critic": 0.0,
             "emb_head": 0.0,
         },
         "market_update": False,
+        "use_market": False,
+        "route_grad": True,
     },
     {
         "name": "warm",
@@ -298,6 +337,8 @@ CONFIG_04B_TOY_PHASES = [
         "train_groups": ["all"],
         "lr_mult": {g: 0.35 for g in PARAM_GROUPS},
         "market_update": False,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "criticwarm",
@@ -306,6 +347,7 @@ CONFIG_04B_TOY_PHASES = [
         "train_groups": ["critic"],
         "lr_mult": {
             "rwkv_backbone": 0.0,
+            "router_conf": 0.0,
             "rwkv_experts": 0.0,
             "trans_experts": 0.0,
             "bridge": 0.0,
@@ -313,6 +355,8 @@ CONFIG_04B_TOY_PHASES = [
             "emb_head": 0.0,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "prenormal",
@@ -321,6 +365,7 @@ CONFIG_04B_TOY_PHASES = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.35,
+            "router_conf": 0.7,
             "rwkv_experts": 0.6,
             "trans_experts": 0.8,
             "bridge": 0.8,
@@ -328,6 +373,8 @@ CONFIG_04B_TOY_PHASES = [
             "emb_head": 0.5,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
     {
         "name": "normal",
@@ -336,6 +383,7 @@ CONFIG_04B_TOY_PHASES = [
         "train_groups": ["all"],
         "lr_mult": {
             "rwkv_backbone": 0.7,
+            "router_conf": 1.0,
             "rwkv_experts": 1.0,
             "trans_experts": 1.0,
             "bridge": 1.0,
@@ -343,9 +391,11 @@ CONFIG_04B_TOY_PHASES = [
             "emb_head": 0.8,
         },
         "market_update": True,
+        "use_market": True,
+        "route_grad": True,
     },
-    {"name": "sft", "steps": 0, "data_profile": "ultrachat_100", "train_groups": ["all"], "lr_mult": {}, "market_update": True},
-    {"name": "rlhf", "steps": 0, "data_profile": "rlhf_placeholder", "train_groups": ["all"], "lr_mult": {}, "market_update": True},
+    {"name": "sft", "steps": 0, "data_profile": "ultrachat_100", "train_groups": ["all"], "lr_mult": {}, "market_update": True, "use_market": True, "route_grad": True},
+    {"name": "rlhf", "steps": 0, "data_profile": "rlhf_placeholder", "train_groups": ["all"], "lr_mult": {}, "market_update": True, "use_market": True, "route_grad": True},
 ]
 
 CONFIG_04B_TOY = {
@@ -370,6 +420,9 @@ CONFIG_04B_TOY = {
     "checkpoint_att_stage": False,
     "checkpoint_expert_stage": False,
     "route_no_grad": True,
+    "router_noise_std": 0.02,
+    "market_alpha_init": 0.05,
+    "aux_loss_coeff": 0.01,
     "lazy_prefix_union": True,
     "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
 }
@@ -383,6 +436,10 @@ CONFIG_01B = {
     "version": VERSION,
     "project": f"CaMoE-{VERSION}",
     "run_name": f"Pilot-0.1b-{VERSION}",
+    "param_groups": PARAM_GROUPS,
+    "router_noise_std": 0.02,
+    "market_alpha_init": 0.05,
+    "aux_loss_coeff": 0.01,
     "save_dir": f"checkpoints/{VERSION}_0.1b",
 }
 
