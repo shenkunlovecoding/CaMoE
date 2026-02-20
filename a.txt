@@ -1,6 +1,6 @@
 train.py:
 """
-CaMoE v20 训练脚本
+CaMoE v21 训练脚本
 支持: 七阶段调度 / 分组学习率 / 分阶段数据 profile / 经济系统增强 / Eval Loss
 """
 
@@ -689,7 +689,7 @@ def main() -> None:
                     phase=phase_name,
                     use_market_override=phase_use_market,
                 )
-                total_loss, token_losses, main_loss, critic_loss, _bridge_loss = model.compute_losses(logits, y, info)
+                total_loss, token_losses, main_loss, critic_loss, aux_loss = model.compute_losses(logits, y, info)
                 loss_to_backward = total_loss / config['grad_accum']
         except RuntimeError as e:
             print(f"💥 Forward/LOSS failed at step={step}, phase={phase_name}: {e}")
@@ -745,6 +745,7 @@ def main() -> None:
                 logs = {
                     "Loss/Train_Main": main_loss.item(),
                     "Loss/Train_Critic": critic_loss.item() if isinstance(critic_loss, torch.Tensor) else critic_loss,
+                    "Loss/Aux_Balance": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
                     "Speed/TPS": tps,
                     "Phase/ID": float(phase_to_id.get(phase_name, -1)),
                     f"Phase/{phase_name}": 1.0,
@@ -841,8 +842,8 @@ class CaMoE_Block(nn.Module):
         self.checkpoint_expert_stage = use_gc and config.get("checkpoint_expert_stage", True)
         self.route_no_grad = config.get("route_no_grad", True)
         self.lazy_prefix_union = config.get("lazy_prefix_union", True)
-        market_alpha_init = float(config.get("market_alpha_init", 0.0))
-        self.raw_market_alpha = nn.Parameter(torch.tensor([market_alpha_init], dtype=torch.float32))
+        market_alpha_init = float(config.get("market_alpha_init", 0.05))
+        self.register_buffer("market_alpha", torch.tensor([market_alpha_init], dtype=torch.float32))
         
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -942,33 +943,34 @@ class CaMoE_Block(nn.Module):
         use_market: bool,
         training: bool,
         step: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""执行 confidence/critic/router，返回 winners/weights/costs/difficulty/affinity。"""
-        route_ctx = torch.no_grad if self.route_no_grad else nullcontext
-        with route_ctx():
-            route_h = h.detach() if self.route_no_grad else h
-            conf_list = [exp.get_confidence(route_h) for exp in self.experts]
-            gate_logits = torch.stack(conf_list, dim=-1)  # [B, T, E]
-            self._assert_finite(gate_logits, "gate_logits", step)
+        # Gate logits 始终可导：用于训练 confidence / router
+        conf_list = [exp.get_confidence(h) for exp in self.experts]
+        gate_logits = torch.stack(conf_list, dim=-1)  # [B, T, E]
+        self._assert_finite(gate_logits, "gate_logits", step)
 
-            if not use_market:
-                B, T, _E = gate_logits.shape
-                capital_bias = torch.zeros_like(gate_logits)
-                winners, weights, costs, adjusted_logits = router.route(
-                    gate_logits=gate_logits,
-                    capital_bias=capital_bias,
-                    market_enabled=False,
-                    training=training,
-                )
-                difficulty = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
-                affinity = torch.zeros(B, T, self.num_experts, device=h.device, dtype=h.dtype)
-            else:
+        if not use_market:
+            B, T, _E = gate_logits.shape
+            capital_bias = torch.zeros_like(gate_logits)
+            winners, weights, costs, adjusted_logits = router.route(
+                gate_logits=gate_logits,
+                capital_bias=capital_bias,
+                market_enabled=False,
+                training=training,
+            )
+            difficulty = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+            affinity = torch.zeros(B, T, self.num_experts, device=h.device, dtype=h.dtype)
+        else:
+            route_ctx = torch.no_grad if self.route_no_grad else nullcontext
+            with route_ctx():
+                route_h = h.detach() if self.route_no_grad else h
                 difficulty, affinity = self.critic(route_h)
                 self._assert_finite(difficulty, "difficulty", step)
                 self._assert_finite(affinity, "affinity", step)
                 critic_subsidy = self.critic.subsidy_from_affinity(affinity)
                 self._assert_finite(critic_subsidy, "critic_subsidy", step)
-                alpha = torch.sigmoid(self.raw_market_alpha).to(device=h.device, dtype=gate_logits.dtype)
+                alpha = self.market_alpha.to(device=h.device, dtype=gate_logits.dtype)
                 capital_bias = capital_shares.view(1, 1, -1)
                 capital_bias = capital_bias * (1.0 + difficulty.detach()) + critic_subsidy.detach()
                 capital_bias = alpha * capital_bias.detach()
@@ -979,9 +981,9 @@ class CaMoE_Block(nn.Module):
                     market_enabled=True,
                     training=training,
                 )
-                self._assert_finite(weights, "weights", step)
-                self._assert_finite(costs, "costs", step)
-                self._assert_finite(adjusted_logits, "adjusted_logits", step)
+            self._assert_finite(weights, "weights", step)
+            self._assert_finite(costs, "costs", step)
+            self._assert_finite(adjusted_logits, "adjusted_logits", step)
 
         if self.route_no_grad:
             diff_out = difficulty.detach()
@@ -990,7 +992,16 @@ class CaMoE_Block(nn.Module):
             diff_out = difficulty
             adjusted_out = adjusted_logits
 
-        return winners.detach(), weights, costs.detach(), diff_out, affinity.detach(), adjusted_out
+        return (
+            winners.detach(),
+            weights,
+            costs.detach(),
+            diff_out,
+            affinity.detach(),
+            adjusted_out,
+            gate_logits.detach(),
+            capital_bias.detach(),
+        )
 
     def _build_trans_prefix_union(
         self,
@@ -1109,7 +1120,7 @@ class CaMoE_Block(nn.Module):
         else:
             x_after_att, h, v_first, rwkv_state = self._forward_att_stage(x, v_first, idx, step)
 
-        winners, weights, costs, difficulty, affinity, adjusted_logits = self._forward_route_stage(
+        winners, weights, costs, difficulty, affinity, adjusted_logits, gate_logits, capital_bias = self._forward_route_stage(
             h, capital_shares, router, use_market, training, step
         )
 
@@ -1133,6 +1144,8 @@ class CaMoE_Block(nn.Module):
             "difficulty": difficulty,
             "affinity": affinity,
             "adjusted_logits": adjusted_logits,
+            "gate_logits": gate_logits,
+            "capital_bias": capital_bias,
         }
         return x, v_first, info
 
@@ -1263,7 +1276,12 @@ class CaMoE_System(nn.Module):
         use_market = True if use_market_override is None else bool(use_market_override)
         
         all_info = {
-            "winners": [], "costs": [], "difficulties": [], "affinities": []
+            "winners": [],
+            "costs": [],
+            "difficulties": [],
+            "affinities": [],
+            "gate_logits": [],
+            "capital_bias": [],
         }
         warmup_steps = self.config.get('warmup_steps', 2000)
 
@@ -1288,13 +1306,15 @@ class CaMoE_System(nn.Module):
             # 其它阶段在 block 内 route_no_grad=True 时 difficulty 已是 detached tensor
             all_info["difficulties"].append(info["difficulty"])
             all_info["affinities"].append(info["affinity"].detach())
+            all_info["gate_logits"].append(info["gate_logits"].detach())
+            all_info["capital_bias"].append(info["capital_bias"].detach())
 
             with torch.no_grad():
                 adj_prob = F.softmax(info["adjusted_logits"].float(), dim=-1)
                 adj_ent = -(adj_prob * torch.log(adj_prob + 1e-9)).sum(dim=-1).mean()
                 wt_prob = info["weights"].float()
                 wt_ent = -(wt_prob * torch.log(wt_prob + 1e-9)).sum(dim=-1).mean()
-                alpha = torch.sigmoid(block.raw_market_alpha.detach()).mean()
+                alpha = block.market_alpha.detach().mean()
                 self.last_winner_entropy[i] = adj_ent.to(self.last_winner_entropy.dtype)
                 self.last_weight_entropy[i] = wt_ent.to(self.last_weight_entropy.dtype)
                 self.last_market_alpha[i] = alpha.to(self.last_market_alpha.dtype)
@@ -1329,8 +1349,8 @@ class CaMoE_System(nn.Module):
           all_info (Dict): 各层难度/路由信息。
 
         Returns:
-          Tuple[Tensor, Tensor, Tensor, Tensor, float]:
-          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``bridge_loss``。
+          Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+          ``total_loss``、``token_losses``、``main_loss``、``critic_loss``、``aux_loss``。
         """
         if self.config.get("stabilize_logits", False):
             # 训练稳定性保护：避免上游极端值导致 CE 直接 NaN/Inf
@@ -1368,10 +1388,32 @@ class CaMoE_System(nn.Module):
         if len(all_info.get("difficulties", [])) > 0:
             critic_loss /= len(all_info["difficulties"])
 
-        total_loss = main_loss + 0.1 * critic_loss
-        bridge_loss = 0.0 # No longer used
+        # Router Load Balance Loss
+        aux_loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        n_counted = 0
+        valid_mask = targets.ne(-100)
+        valid_count = valid_mask.sum().item()
+        if valid_count > 0:
+            for i, winners_i in enumerate(all_info.get("winners", [])):
+                if i >= self.n_layer:
+                    break
+                freq = torch.zeros(self.num_experts, device=logits.device, dtype=logits.dtype)
+                for k in range(2):
+                    one_hot = F.one_hot(winners_i[:, :, k], self.num_experts).to(dtype=logits.dtype)
+                    one_hot = one_hot * valid_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    freq = freq + one_hot.sum(dim=(0, 1))
+                denom = valid_mask.sum().to(dtype=logits.dtype) * 2.0 + 1e-6
+                freq = freq / denom
+                target_freq = torch.tensor(1.0 / self.num_experts, device=logits.device, dtype=logits.dtype)
+                aux_loss = aux_loss + ((freq - target_freq) ** 2).sum() * self.num_experts
+                n_counted += 1
+            if n_counted > 0:
+                aux_loss = aux_loss / float(n_counted)
+
+        aux_coeff = float(self.config.get("aux_loss_coeff", 0.01))
+        total_loss = main_loss + 0.1 * critic_loss + aux_coeff * aux_loss
         
-        return total_loss, token_losses, main_loss, critic_loss, bridge_loss
+        return total_loss, token_losses, main_loss, critic_loss, aux_loss
     
     def _compute_critic_bonus_signal(self, critic_loss) -> float:
         if critic_loss is None:
@@ -1475,6 +1517,10 @@ class CaMoE_System(nn.Module):
             dividend_scale = float(self.economy_cfg.get("dividend_scale", 0.6))
             dividend_std_factor = float(self.economy_cfg.get("dividend_std_factor", 0.5))
             repay_ratio = float(self.economy_cfg.get("repay_ratio", 0.25))
+            alpha_ema = float(self.economy_cfg.get("market_alpha_ema", 0.98))
+            alpha_step = float(self.economy_cfg.get("market_alpha_step", 0.2))
+            alpha_min = float(self.economy_cfg.get("market_alpha_min", 0.0))
+            alpha_max = float(self.economy_cfg.get("market_alpha_max", 1.0))
 
             for i in range(self.n_layer):
                 if i >= len(all_info.get("winners", [])):
@@ -1491,6 +1537,22 @@ class CaMoE_System(nn.Module):
                 baseline = float(self.capital_manager.baseline_losses[i].item())
                 perf = baseline - float(token_losses.mean().item())
                 self.layer_performance_ema[i] = 0.95 * self.layer_performance_ema[i] + 0.05 * perf
+
+                # Alpha EMA 自适应（非梯度）:
+                # gate 与 market bias 越一致，alpha 目标越高；越冲突，alpha 目标越低。
+                if i < len(all_info.get("gate_logits", [])) and i < len(all_info.get("capital_bias", [])):
+                    gate_logits_i = all_info["gate_logits"][i]     # [B,T,E]
+                    capital_bias_i = all_info["capital_bias"][i]   # [B,T,E]
+                    gate_top1 = gate_logits_i.argmax(dim=-1)
+                    market_top1 = capital_bias_i.argmax(dim=-1)
+                    agree = (gate_top1 == market_top1).float()
+                    agree_ratio = float(agree.mean().item()) if agree.numel() > 0 else 0.5
+                    curr_alpha = float(self.blocks[i].market_alpha.item())
+                    alpha_target = curr_alpha + alpha_step * (agree_ratio - 0.5) * 2.0
+                    alpha_target = max(alpha_min, min(alpha_max, alpha_target))
+                    new_alpha = alpha_ema * curr_alpha + (1.0 - alpha_ema) * alpha_target
+                    new_alpha = max(alpha_min, min(alpha_max, new_alpha))
+                    self.blocks[i].market_alpha.fill_(new_alpha)
 
                 self.blocks[i].critic.settle(
                     all_info["affinities"][i],
@@ -1563,7 +1625,7 @@ class CaMoE_System(nn.Module):
 
 CaMoE/market.py:
 """
-CaMoE v20 Market Mechanism
+CaMoE v21 Market Mechanism
 Top-2 Vickrey Auction + Central Bank/QE + Idle Tax/Depreciation + Asset Velocity
 """
 
@@ -1853,16 +1915,9 @@ class SparseRouter:
         else:
             costs = torch.zeros(B, T, device=gate_logits.device, dtype=gate_logits.dtype)
 
-        # 2) weight 分支：仅使用 gate_logits（可微，不受市场偏置直接影响）
+        # 2) weight 分支：纯 Gate 主导（不引入市场梯度）
         top2_gate = torch.gather(gate_logits, dim=-1, index=winners)
-        if market_enabled:
-            top2_adjusted = torch.gather(adjusted_logits, dim=-1, index=winners)
-            # ST-gradient bridge:
-            # 前向仍等价于 top2_gate，反向允许 adjusted 分支（含市场 alpha/bias）回传梯度。
-            top2_for_weight = top2_gate + (top2_adjusted - top2_adjusted.detach())
-        else:
-            top2_for_weight = top2_gate
-        weights = F.softmax(top2_for_weight, dim=-1)
+        weights = F.softmax(top2_gate, dim=-1)
 
         # 返回无噪声 adjusted logits 作为调试信号
         return winners, weights, costs, adjusted_logits
@@ -2793,459 +2848,4 @@ class DeepEmbedAttention(nn.Module):
         attn = F.softmax(scores.float(), dim=-1).to(scores.dtype)
         out = attn @ v
         return out
-
-
-CaMoE/config.py:
-"""
-CaMoE v21 配置文件
-7 阶段训练调度 + 经济系统增强版
-"""
-
-from .config_pilot import CONFIG_PILOT
-
-# ==========================================
-# 版本控制
-# ==========================================
-VERSION = "v21"
-SCALE = "0.4b"
-VARIANT = "6R2T-Top2"
-
-# ==========================================
-# 自动生成标识符
-# ==========================================
-RUN_ID = f"FineWeb70-Cosmo30-{SCALE}-{VARIANT}-{VERSION}"
-
-# ==========================================
-# 通用分组名（用于分阶段训练）
-# ==========================================
-PARAM_GROUPS = [
-    "rwkv_backbone",
-    "router_conf",
-    "rwkv_experts",
-    "trans_experts",
-    "bridge",
-    "critic",
-    "emb_head",
-]
-
-# ==========================================
-# v21 七阶段调度（SFT/RLHF 占位）
-# ==========================================
-PHASE_SCHEDULE_V21 = [
-    {
-        "name": "prewarm",
-        "steps": 2000,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["router_conf", "bridge"],
-        "lr_mult": {
-            "rwkv_backbone": 0.0,
-            "router_conf": 1.0,
-            "rwkv_experts": 0.0,
-            "trans_experts": 0.0,
-            "bridge": 1.0,
-            "critic": 0.0,
-            "emb_head": 0.0,
-        },
-        "market_update": False,
-        "use_market": False,
-        "route_grad": True,
-    },
-    {
-        "name": "warm",
-        "steps": 3000,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.35,
-            "router_conf": 0.35,
-            "rwkv_experts": 0.35,
-            "trans_experts": 0.35,
-            "bridge": 0.35,
-            "critic": 0.35,
-            "emb_head": 0.35,
-        },
-        "market_update": False,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "criticwarm",
-        "steps": 4000,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["critic"],
-        "lr_mult": {
-            "rwkv_backbone": 0.0,
-            "router_conf": 0.0,
-            "rwkv_experts": 0.0,
-            "trans_experts": 0.0,
-            "bridge": 0.0,
-            "critic": 2.0,
-            "emb_head": 0.0,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "prenormal",
-        "steps": 3000,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.35,
-            "router_conf": 0.7,
-            "rwkv_experts": 0.6,
-            "trans_experts": 0.8,
-            "bridge": 0.8,
-            "critic": 1.6,
-            "emb_head": 0.5,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "normal",
-        "steps": 40000,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.7,
-            "router_conf": 1.0,
-            "rwkv_experts": 1.0,
-            "trans_experts": 1.0,
-            "bridge": 1.0,
-            "critic": 1.0,
-            "emb_head": 0.8,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "sft",
-        "steps": 0,
-        "data_profile": "ultrachat_100",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.5,
-            "router_conf": 0.6,
-            "rwkv_experts": 0.8,
-            "trans_experts": 0.8,
-            "bridge": 0.6,
-            "critic": 0.5,
-            "emb_head": 0.8,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "rlhf",
-        "steps": 0,
-        "data_profile": "rlhf_placeholder",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.3,
-            "router_conf": 0.4,
-            "rwkv_experts": 0.5,
-            "trans_experts": 0.5,
-            "bridge": 0.4,
-            "critic": 0.6,
-            "emb_head": 0.6,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-]
-
-
-def _total_steps(schedule):
-    return int(sum(max(0, int(p.get("steps", 0))) for p in schedule))
-
-
-# ==========================================
-# 0.4B 主配置（v21）
-# ==========================================
-CONFIG_04B = {
-    # ===== 元信息 =====
-    "version": VERSION,
-    "scale": SCALE,
-    "variant": VARIANT,
-    "project": f"CaMoE-{VERSION}",
-    "run_name": RUN_ID,
-    # ===== 模型结构 =====
-    "n_embd": 1024,
-    "n_layer": 16,
-    "head_size": 64,
-    "vocab_size": 65536,
-    "tied_embeddings": True,
-    "use_deep_embed_attention": False,
-    "use_shared_deep_embed": True,
-    "dea_q_dim": 256,
-    "dea_kv_dim": 32,
-    "dea_score_scale": 1024.0,
-    "dea_cap_scale": 64.0,
-    # ===== 专家配置 =====
-    "num_rwkv_experts": 6,
-    "num_trans_experts": 2,
-    "top_k": 2,
-    "prefix_len": 48,
-    "low_rank_dim": 64,
-    # ===== 优化器与阶段 =====
-    "base_lr": 1e-4,
-    "phase_schedule": PHASE_SCHEDULE_V21,
-    "sft_steps": 0,
-    "rlhf_steps": 0,
-    "total_steps": _total_steps(PHASE_SCHEDULE_V21),
-    "param_groups": PARAM_GROUPS,
-    # ===== Market 参数（兼容旧键） =====
-    "total_capital": 10000.0,
-    "min_capital_share": 0.05,
-    "tax_threshold": 2.0,
-    "tax_rate": 0.1,
-    # ===== 经济系统（v20） =====
-    "economy": {
-        # 中央银行 / QE
-        "qe_low_ratio": 0.85,
-        "qe_high_ratio": 1.20,
-        "qe_inject_ratio": 0.20,
-        "qe_drain_ratio": 0.10,
-        "qe_floor_alloc_ratio": 0.70,
-        # 基础算力保障
-        "base_compute_floor_ratio": 0.06,
-        # 破产保护 + 债务重组
-        "critic_bankrupt_threshold_ratio": 0.20,
-        "bailout_base": 1000.0,
-        "bailout_decay": 0.65,
-        "bailout_min": 200.0,
-        "repay_ratio": 0.25,
-        "restructure_alpha": 0.12,
-        "donor_topk": 2,
-        # 闲置税 + 折旧
-        "idle_threshold": 0.01,
-        "idle_tax_rate": 0.02,
-        "depreciation_rate": 0.001,
-        # 分红
-        "base_commission": 0.8,
-        "dividend_scale": 0.6,
-        "dividend_std_factor": 0.5,
-        # 风投注资（VC Injection）
-        "vc_affinity_threshold": 0.15,
-        "vc_low_cap_ratio": 0.85,
-        "vc_selected_threshold": 0.01,
-        "vc_inject_ratio": 0.01,
-        "vc_max_inject_ratio": 0.12,
-        # CriticWarm 奖励增强（中等）
-        "criticwarm_reward_scale": 2.0,
-        "criticwarm_penalty_scale": 0.4,
-        "critic_bonus_scale": 0.2,
-        "critic_bonus_clip": (-0.1, 0.3),
-        "critic_bonus_ema_momentum": 0.95,
-    },
-    # ===== 训练参数 =====
-    "micro_batch_size": 6,
-    "ctx_len": 1024,
-    "grad_accum": 8,
-    "use_gradient_checkpoint": True,
-    "checkpoint_att_stage": True,
-    "checkpoint_expert_stage": True,
-    "route_no_grad": True,
-    "router_noise_std": 0.02,
-    "market_alpha_init": 0.0,
-    "lazy_prefix_union": True,
-    # ===== 日志与评估 =====
-    "log_interval": 10,
-    "eval_interval": 1000,
-    "eval_iters": 50,
-    # ===== 数据 =====
-    "data_path": "./data/camoe_mix_v20_fineweb70_cosmo30",
-    "data_roots": {
-        "fineweb_edu": "./data/fineweb_edu_sample10bt_rwkv_processed",
-        "ultrachat_200k": "./data/ultrachat_200k_rwkv_processed",
-        "cosmopedia_100k": "./data/cosmopedia_100k_rwkv_processed",
-    },
-    "data_profiles": {
-        "fineweb_cosmo_70_30": {
-            "mix": {
-                "fineweb_edu": 0.70,
-                "cosmopedia_100k": 0.30,
-            }
-        },
-        "ultrachat_100": {
-            "mix": {
-                "ultrachat_200k": 1.0,
-            }
-        },
-        "rlhf_placeholder": {
-            "mix": {},
-        },
-    },
-    # 兼容旧代码路径（默认等于主 profile）
-    "mix": {
-        "fineweb_edu": 0.70,
-        "cosmopedia_100k": 0.30,
-    },
-    # ===== 其他 =====
-    "weights_path": "model/rwkv7-g1d-0.1b-20260129-ctx8192.pth",
-    "vocab_file": "tokenizer/rwkv_vocab_v20230424.txt",
-    "save_dir": f"checkpoints/{VERSION}_{SCALE}",
-    # ===== 旧字段兼容（用于旧逻辑 fallback） =====
-    "prewarm_steps": 2000,
-    "warmup_steps": 5000,
-    "lr_prewarm": 1e-4,
-    "lr_warmup": 3.5e-5,
-    "lr_normal": 1e-4,
-}
-
-
-# ==========================================
-# 0.4B Toy 配置（快速验证）
-# ==========================================
-CONFIG_04B_TOY_PHASES = [
-    {
-        "name": "prewarm",
-        "steps": 100,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["router_conf", "bridge"],
-        "lr_mult": {
-            "rwkv_backbone": 0.0,
-            "router_conf": 1.0,
-            "rwkv_experts": 0.0,
-            "trans_experts": 0.0,
-            "bridge": 1.0,
-            "critic": 0.0,
-            "emb_head": 0.0,
-        },
-        "market_update": False,
-        "use_market": False,
-        "route_grad": True,
-    },
-    {
-        "name": "warm",
-        "steps": 150,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {g: 0.35 for g in PARAM_GROUPS},
-        "market_update": False,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "criticwarm",
-        "steps": 200,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["critic"],
-        "lr_mult": {
-            "rwkv_backbone": 0.0,
-            "router_conf": 0.0,
-            "rwkv_experts": 0.0,
-            "trans_experts": 0.0,
-            "bridge": 0.0,
-            "critic": 2.0,
-            "emb_head": 0.0,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "prenormal",
-        "steps": 100,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.35,
-            "router_conf": 0.7,
-            "rwkv_experts": 0.6,
-            "trans_experts": 0.8,
-            "bridge": 0.8,
-            "critic": 1.6,
-            "emb_head": 0.5,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {
-        "name": "normal",
-        "steps": 450,
-        "data_profile": "fineweb_cosmo_70_30",
-        "train_groups": ["all"],
-        "lr_mult": {
-            "rwkv_backbone": 0.7,
-            "router_conf": 1.0,
-            "rwkv_experts": 1.0,
-            "trans_experts": 1.0,
-            "bridge": 1.0,
-            "critic": 1.0,
-            "emb_head": 0.8,
-        },
-        "market_update": True,
-        "use_market": True,
-        "route_grad": True,
-    },
-    {"name": "sft", "steps": 0, "data_profile": "ultrachat_100", "train_groups": ["all"], "lr_mult": {}, "market_update": True, "use_market": True, "route_grad": True},
-    {"name": "rlhf", "steps": 0, "data_profile": "rlhf_placeholder", "train_groups": ["all"], "lr_mult": {}, "market_update": True, "use_market": True, "route_grad": True},
-]
-
-CONFIG_04B_TOY = {
-    **CONFIG_04B,
-    "scale": "0.4b_toy",
-    "run_name": f"Toy-0.4b-{VARIANT}-{VERSION}",
-    "micro_batch_size": 1,
-    "ctx_len": 512,
-    "grad_accum": 24,
-    "phase_schedule": CONFIG_04B_TOY_PHASES,
-    "total_steps": _total_steps(CONFIG_04B_TOY_PHASES),
-    "log_interval": 10,
-    "eval_interval": 200,
-    "eval_iters": 20,
-    "base_lr": 8e-5,
-    # Diagnostic/runtime switches
-    "train_use_amp": True,
-    "amp_dtype": "bfloat16",
-    "cuda_use_fast_math": True,
-    "cuda_force_fp32_kernel": False,
-    "use_gradient_checkpoint": False,
-    "checkpoint_att_stage": False,
-    "checkpoint_expert_stage": False,
-    "route_no_grad": True,
-    "router_noise_std": 0.02,
-    "market_alpha_init": 0.0,
-    "lazy_prefix_union": True,
-    "save_dir": f"checkpoints/{VERSION}_0.4b_toy",
-}
-
-
-# ==========================================
-# 0.1B 配置（保持 pilot）
-# ==========================================
-CONFIG_01B = {
-    **CONFIG_PILOT,
-    "version": VERSION,
-    "project": f"CaMoE-{VERSION}",
-    "run_name": f"Pilot-0.1b-{VERSION}",
-    "param_groups": PARAM_GROUPS,
-    "router_noise_std": 0.02,
-    "market_alpha_init": 0.0,
-    "save_dir": f"checkpoints/{VERSION}_0.1b",
-}
-
-
-def get_config(scale: str = "0.4b"):
-    if scale == "0.4b":
-        return CONFIG_04B
-    if scale == "0.4b_toy":
-        return CONFIG_04B_TOY
-    if scale == "0.1b":
-        return CONFIG_01B
-    if scale == "pilot":
-        return CONFIG_PILOT
-    raise ValueError(f"Unknown scale: {scale}")
-
-
-# 向后兼容
-CONFIG_MINIPILE = CONFIG_04B
 

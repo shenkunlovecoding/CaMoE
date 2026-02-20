@@ -89,7 +89,7 @@ def init_rwkv7_cuda():
                 
                 op_ns.forward(r, w, k, v, a, b, y, s, sa)
                 ctx.save_for_backward(r, w, k, v, a, b, s, sa)
-                return y
+                return y,sa
             
             @staticmethod
             def backward(ctx, dy):
@@ -115,9 +115,10 @@ def init_rwkv7_cuda():
                 for x in [r, w, k, v, a, b]
             ]
             
-            out = RWKV7_ClampW.apply(r, w, k, v, a, b)
+            out , sa = RWKV7_ClampW.apply(r, w, k, v, a, b)
             out = out.view(B, T, HC).to(orig_dtype)
-            return out
+            sa = sa.view(B, T, HC).to(orig_dtype)
+            return out, sa
         
         RUN_CUDA_RWKV7 = _run_cuda
         USE_CUDA = True
@@ -343,16 +344,18 @@ class RWKV7_TimeMix(nn.Module):
         # RWKV-7 动态状态演化
         use_fallback = os.environ.get("CAMOE_FORCE_TIMEMIX_FALLBACK", "0") == "1"
         if (not use_fallback) and USE_CUDA and RUN_CUDA_RWKV7 is not None:
-            x_att = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+            x_att , sa = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+            state_representation = sa
         else:
             x_att = self._run_torch_fallback(r, w, k, v, -kk, kk * a, self.n_head, self.head_size)
+            state_representation = x_att.clone() 
         if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
             self._report_nonfinite(x_att, "x_att_raw", self.layer_id)
         if os.environ.get("CAMOE_SANITIZE_TIMEMIX_OUT", "0") == "1":
             x_att = torch.nan_to_num(x_att, nan=0.0, posinf=0.0, neginf=0.0)
 
             
-        state_representation = x_att.clone() 
+        
         x_att = self.ln_x(x_att.view(B * T, C)).view(B, T, C)
         if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
             self._report_nonfinite(x_att, "x_att_ln", self.layer_id)

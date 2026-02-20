@@ -30,8 +30,8 @@ except ImportError:
 
 # ================= 配置 =================
 # [请确认] 模型路径
-MODEL_PATH = "checkpoints/v20_infer.pth" # 你的 Pilot 路径
-SCALE = "0.4b"  # "0.4b" or "pilot" or "0.1b"
+MODEL_PATH = "checkpoints/v21_0.1b/v21_final.pth" # 你的 Pilot 路径
+SCALE = "pilot"  # "0.4b" or "pilot" or "0.1b"
 DEVICE = "cuda"
 
 # ================= 加载逻辑 =================

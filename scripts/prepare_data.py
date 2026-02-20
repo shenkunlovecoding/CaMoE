@@ -21,8 +21,7 @@ import pyrwkv_tokenizer
 # (path_or_id, subset_or_none, split, mode, probability)
 DATA_RECIPE = {
     # v20: FineWeb-Edu(sample-10BT) 70% + Cosmopedia-100k 30%
-    "fineweb_edu": ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "raw", 0.70),
-    "cosmopedia_100k": ("HuggingFaceTB/cosmopedia-100k", None, "train", "raw", 0.30),
+    "fineweb_edu": ("roneneldan/TinyStories", None, "train", "raw", 1),
 }
 
 

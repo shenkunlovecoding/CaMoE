@@ -11,7 +11,6 @@ DEFAULT_FILES = [
     "CaMoE/experts.py",
     "CaMoE/bridge.py",
     "CaMoE/backbone.py",
-    "CaMoE/config.py",
 ]
 
 
