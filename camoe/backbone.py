@@ -145,7 +145,7 @@ class RWKV7_TimeMix(nn.Module):
         self.head_size = head_size
         self.n_head = n_embd // head_size
         self.n_embd = n_embd
-        
+        self.ln_sa = nn.LayerNorm(n_embd)
         assert n_embd % head_size == 0
         
         C = n_embd
@@ -345,7 +345,7 @@ class RWKV7_TimeMix(nn.Module):
         use_fallback = os.environ.get("CAMOE_FORCE_TIMEMIX_FALLBACK", "0") == "1"
         if (not use_fallback) and USE_CUDA and RUN_CUDA_RWKV7 is not None:
             x_att , sa = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
-            state_representation = sa
+            state_representation = self.ln_sa(sa)
         else:
             x_att = self._run_torch_fallback(r, w, k, v, -kk, kk * a, self.n_head, self.head_size)
             state_representation = x_att.clone() 
