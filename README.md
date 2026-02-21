@@ -24,6 +24,7 @@ https://img.shields.io/badge/Speed-7k_TPS-orange](https://github.com/shenkunlove
 - 修复 `grad_accum` 在 resume 场景下的潜在残留梯度问题（训练循环启动即 `zero_grad`）。
 - 修复 `market_update` 仅使用最后一个 micro-batch 的偏差，改为按 `grad_accum` 窗口聚合更新。
 - 文档澄清：`LinearTransformerExpert` 当前为 SDPA softmax prefix-attention；`SparseRouter` 为 Top-K 输出稀疏（非前置粗筛）。
+- 增加模块级 `torch.compile` 加速实验（`Bridge / Critic / Experts`），并同步依赖列表（`requirements.txt`）。
 
 ### v21（2026-02）
 
@@ -113,23 +114,26 @@ winners        F.softmax(gate_logits[top_k])
 
 ## 🏆 Benchmark
 
-### 历史 0.1B TinyStories 实验（供参考）
+### 0.1B TinyStories Pilot（Greedy + repetition penalty=1.2）
+
+> 设置：纯 TinyStories Pilot，Greedy 解码，`repetition_penalty=1.2`，6 组英文 prompt 验证。
 
 | Metric | Result | Note |
 | :--- | :--- | :--- |
-| **PPL (Perplexity)** | **2.16** | 逻辑连贯，语法完美 |
-| **Speed (Inference)** | **24,918 TPS** | 比同级 Dense Transformer 快 5-8 倍 |
-| **Avg Trans Usage** | **12.59%** | 深度稀疏化 |
+| **Samples** | **6 prompts / 533 tokens** | 覆盖常识补全、故事续写、名句开头 |
+| **Global Routing** | **Mixed 100%** | Pure RWKV=0%，Deep Trans=0% |
+| **Generation Quality** | **可读稳定，但偏 TinyStories 文风** | 叙事连贯，知识问答题会被故事化 |
 
-### 涌现的层级分工（0.1B TinyStories 实验）
-CaMoE 在无人工干预下自动学会在不同层级分配算力：
+### 层级路由画像（本轮 6 prompt 平均 Top-2 命中率）
+CaMoE 在本次 Pilot 中呈现“关键层强 Trans、中间层混合、个别层近关闭”的结构：
 
 ```
-L00-L04 | 🟦 RWKV Dominant | 基础词法与浅层语义 (省算力)
-L05     | 🟥 Trans Dominant | 逻辑中枢与复杂推理 (逻辑转折点)
-L06-L09 | 🟦 RWKV Dominant | 信息传递与上下文维持
-L10-L11 | 🟥 Trans Dominant | 输出精修与 Token 选择 (最终把关)
+L00  100.0% | L01   93.0% | L02   0.0% | L03   0.2%
+L04   63.7% | L05    0.1% | L06  49.6% | L07  40.4%
+L08   64.3% | L09  100.0% | L10  42.3% | L11  22.6%
 ```
+
+结论：路由并未坍塌到单一路径，而是形成分层分工；但在纯 TinyStories 语料下，开放域事实提示词会被“儿童故事模板”覆盖。
 
 ### v21.1 0.4B 训练状态
 > ⚠️ v21.1 目前为 architecture iteration 阶段，尚未完成完整 14B token 训练。
@@ -210,6 +214,8 @@ CaMoE_Project/
 - Python 3.10+
 - PyTorch 2.0+（CUDA）
 - `pip install -r requirements.txt`
+
+> 注：当前分支包含 `torch.compile` 路径，首次运行会有编译预热时间；若环境不稳定，可临时关闭相关 compile 调用后再训练。
 
 ### 数据准备
 
