@@ -34,6 +34,7 @@ class SparseRWKVFFN(nn.Module):
         # Init
         self.value.weight.data.zero_()
         nn.init.orthogonal_(self.key.weight.data, gain=2.0)
+        self.forward = torch.compile(self.forward, mode="max-autotune",dynamic=True)
     
     def get_confidence(self, x: torch.Tensor) -> torch.Tensor:
         r"""get_confidence(x) -> Tensor
@@ -99,6 +100,7 @@ class LinearTransformerExpert(nn.Module):
         
         # Init: 抑制输出
         nn.init.orthogonal_(self.o.weight, gain=0.1)
+        self.forward = torch.compile(self.forward, mode="max-autotune",dynamic=True)
 
     def get_confidence(self, x: torch.Tensor) -> torch.Tensor:
         r"""get_confidence(x) -> Tensor

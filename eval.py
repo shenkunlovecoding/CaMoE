@@ -285,45 +285,15 @@ def generate_and_visualize(
 
 # ================= 测试 =================
 prompts = [
-    "2 + 2 =",
-    "print('Hello '' +",
     "The chemical symbol for water is H2",
     'Once upon a time, there was a little girl named Lily.',
-    'The capital of France is Paris, but the capital of Japan is',
     # 文学
     "It was the best of times, it was the worst of times,",
     "Call me Ishmael.",
     "All happy families are alike;",
     "In a hole in the ground there lived",
-    
-    # 诗歌
-    "Shall I compare thee to a summer's day?",
-    "Two roads diverged in a yellow wood,",
-    "I wandered lonely as a cloud",
-    
-    # 名言
-    "To be, or not to be,",
-    "I have a dream that one day",
-    "The only thing we have to fear is",
-    
-    # 童话
-    "In a galaxy far, far away,",
-    "Mirror, mirror on the wall,",
-    
-    # 哲学
-    "I think, therefore",
-    "The meaning of life is",
-    
-    # 科学
-    "The Earth revolves around the",
-    "Einstein's famous equation is E =",
-    
-    # 流行文化
-    "Winter is coming, said",
-    "May the Force be",
-    "You shall not",
 ]
 
 if __name__ == "__main__":
     for p in prompts:
-        generate_and_visualize(p,temperature=0.7,top_p=0.5,repetition_penalty=1.2)
+        generate_and_visualize(p,temperature=0.0,top_p=1.0,repetition_penalty=1.2)

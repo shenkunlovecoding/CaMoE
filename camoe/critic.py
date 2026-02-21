@@ -40,6 +40,7 @@ class CriticVC(nn.Module):
         self.register_buffer("prediction_accuracy", torch.tensor(0.5))
         self.register_buffer("debt", torch.tensor(0.0))
         self.register_buffer("bailout_count", torch.tensor(0.0))
+        self.forward = torch.compile(self.forward, mode="max-autotune")
 
     def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feat = self.feature(h)

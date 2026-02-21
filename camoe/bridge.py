@@ -21,6 +21,7 @@ class UltimateBridge(nn.Module):
 
     def __init__(self, n_embd: int, max_prefix_len: int = 64, low_rank_dim: int = 64) -> None:
         super().__init__()
+        self.forward = torch.compile(self.forward,dynamic=True)
         self.max_prefix_len = max_prefix_len
         self.n_embd = n_embd
         self.low_rank_dim = low_rank_dim
