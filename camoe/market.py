@@ -259,6 +259,10 @@ class SparseRouter:
     r"""SparseRouter(noise_std=0.02) -> None
 
     基于 Top-2 Vickrey 拍卖的稀疏路由器。
+
+    说明:
+      这里的“稀疏”指输出阶段仅保留 Top-2 experts。
+      上游 confidence 仍会对全部 experts 计算（E 较小时开销可控）。
     """
 
     def __init__(self, noise_std: float = 0.02) -> None:

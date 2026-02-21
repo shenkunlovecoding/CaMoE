@@ -6,7 +6,7 @@ https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg](https://opensource
 https://img.shields.io/badge/Architecture-Hybrid_MoE-blueviolet](https://github.com/shenkunlovecoding/CaMoE)
 https://img.shields.io/badge/Speed-7k_TPS-orange](https://github.com/shenkunlovecoding/CaMoE)
 
-**CaMoE (Capital-driven Mixture of Experts)** 是一个基于**市场经济机制**的混合专家语言模型架构，目前主力版本为 **v21 · 0.4B · 6R2T-Top2**。
+**CaMoE (Capital-driven Mixture of Experts)** 是一个基于**市场经济机制**的混合专家语言模型架构，目前主力版本为 **v21.1 · 0.4B · 6R2T-Top2**。
 
 不同于传统 MoE 依赖静态门控或纯辅助损失（Auxiliary Loss），CaMoE 将路由拆分为两个协作系统：
 
@@ -19,7 +19,13 @@ https://img.shields.io/badge/Speed-7k_TPS-orange](https://github.com/shenkunlove
 
 ## ✅ 近期更新
 
-### v21（2026-02，当前版本）
+### v21.1（2026-02，当前版本）
+
+- 修复 `grad_accum` 在 resume 场景下的潜在残留梯度问题（训练循环启动即 `zero_grad`）。
+- 修复 `market_update` 仅使用最后一个 micro-batch 的偏差，改为按 `grad_accum` 窗口聚合更新。
+- 文档澄清：`LinearTransformerExpert` 当前为 SDPA softmax prefix-attention；`SparseRouter` 为 Top-K 输出稀疏（非前置粗筛）。
+
+### v21（2026-02）
 
 **1. Gradient Gate × Market Bias 双通道路由**
 
@@ -125,8 +131,8 @@ L06-L09 | 🟦 RWKV Dominant | 信息传递与上下文维持
 L10-L11 | 🟥 Trans Dominant | 输出精修与 Token 选择 (最终把关)
 ```
 
-### v21 0.4B 训练状态
-> ⚠️ v21 目前为 architecture iteration 阶段，尚未完成完整 14B token 训练。
+### v21.1 0.4B 训练状态
+> ⚠️ v21.1 目前为 architecture iteration 阶段，尚未完成完整 14B token 训练。
 > 当前已验证梯度流通与路由动态性，完整 benchmark 待后续更新。
 
 ---
@@ -176,8 +182,8 @@ CaMoE_Project/
 │   ├── experts.py       # SparseRWKVFFN + LinearTransformerExpert（含 confidence 网络）
 │   ├── market.py        # CapitalManager（经济系统）+ SparseRouter（双通道路由）
 │   ├── critic.py        # CriticVC：难度预测 + VC 结算 + 破产重组
-│   ├── system.py        # CaMoE_System & CaMoE_Block（v21 双通道 + Load Balance）
-│   ├── config.py        # v21 配置（phase_schedule / economy / route_grad）
+│   ├── system.py        # CaMoE_System & CaMoE_Block（v21.1 双通道 + Load Balance）
+│   ├── config.py        # v21.1 配置（phase_schedule / economy / route_grad）
 │   ├── config_pilot.py  # 0.1B Pilot 配置
 │   ├── wrapper.py       # lm-evaluation-harness 适配器
 │   └── cuda/            # RWKV-7 ClampW CUDA Kernels（BF16/FP32）
@@ -230,7 +236,7 @@ python train.py --scale 0.4b_toy
 python train.py --scale 0.1b
 
 # 断点续训
-python train.py --scale 0.4b --resume checkpoints/v21_0.4b/v21_step10000.pth
+python train.py --scale 0.4b --resume checkpoints/v21.1_0.4b/v21.1_step10000.pth
 
 # 诊断模式
 python train.py --scale 0.4b --diag no_amp       # 关闭混合精度
@@ -250,12 +256,12 @@ python train.py --scale 0.4b --diag fp32_kernel  # 强制 FP32 CUDA kernel
 python eval.py
 
 # lm-evaluation-harness 基准评测
-python lmeval.py --pretrained checkpoints/v21_0.4b/v21_final.pth --tasks arc_easy,hellaswag
+python lmeval.py --pretrained checkpoints/v21.1_0.4b/v21.1_final.pth --tasks arc_easy,hellaswag
 ```
 
 ---
 
-## ⚙️ 关键配置项（v21）
+## ⚙️ 关键配置项（v21.1）
 
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
@@ -277,6 +283,7 @@ python lmeval.py --pretrained checkpoints/v21_0.4b/v21_final.pth --tasks arc_eas
 - **v19**：训练稳定性修复（Kernel / Loss / NaN 诊断）
 - **v20**：七阶段训练、CriticWarm、经济系统增强
 - **v21**：Gradient Gate × Market Bias 双通道路由 + Load Balance Loss
+- **v21.1**：`grad_accum` + market 累积更新修复，路由/专家命名澄清
 - **v22**：完整 14B token 训练 + Benchmark 验证
 - **v23+**：Neurosymbolic Bazaar（Tool-as-Expert + ROSA 记忆专家）
 

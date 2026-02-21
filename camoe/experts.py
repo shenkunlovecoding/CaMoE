@@ -1,6 +1,6 @@
 """
-CaMoE v18 Experts
-RWKV FFN + Linear Transformer
+CaMoE Experts
+RWKV FFN + Prefix-Attention Expert
 """
 
 import torch
@@ -68,7 +68,11 @@ class SparseRWKVFFN(nn.Module):
 class LinearTransformerExpert(nn.Module):
     r"""LinearTransformerExpert(n_embd, n_head) -> None
 
-    使用 Bridge Prefix 作为 K/V 的线性 Transformer 专家。
+    使用 Bridge Prefix 作为 K/V 的前缀注意力专家。
+
+    说明:
+      名称沿用历史命名，但当前实现使用 ``scaled_dot_product_attention``
+      的 softmax attention（非严格线性 attention）。
 
     Args:
       n_embd (int): 输入/输出维度。
@@ -121,7 +125,7 @@ class LinearTransformerExpert(nn.Module):
         H, D = self.n_head, self.head_dim
         P = prefix.shape[1]
         
-        # Linear Attention
+        # Prefix attention (SDPA softmax, not strict linear attention)
         q = self.q(x).reshape(N, 1, H, D)
         k = self.k(prefix).reshape(N, P, H, D)
         v = self.v(prefix).reshape(N, P, H, D)

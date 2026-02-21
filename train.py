@@ -1,5 +1,5 @@
 """
-CaMoE v21 训练脚本
+CaMoE v21.1 训练脚本
 支持: 七阶段调度 / 分组学习率 / 分阶段数据 profile / 经济系统增强 / Eval Loss
 """
 
@@ -388,6 +388,43 @@ def infinite_loader(loader: DataLoader) -> Iterator:
         for batch in loader:
             yield batch
 
+
+def _detach_market_info(info: Dict[str, List[torch.Tensor]]) -> Dict[str, List[torch.Tensor]]:
+    r"""_detach_market_info(info) -> Dict
+
+    将 market 相关张量从 autograd 图中分离，避免 grad_accum 阶段额外保图。
+    """
+    detached = {}
+    for k, v in info.items():
+        if isinstance(v, list):
+            detached[k] = [x.detach() if torch.is_tensor(x) else x for x in v]
+        else:
+            detached[k] = v.detach() if torch.is_tensor(v) else v
+    return detached
+
+
+def _merge_market_infos(info_chunks: List[Dict[str, List[torch.Tensor]]]) -> Dict[str, List[torch.Tensor]]:
+    r"""_merge_market_infos(info_chunks) -> Dict
+
+    将多个 micro-batch 的路由信息沿 batch 维拼接，供一次 market_update 使用。
+    """
+    if not info_chunks:
+        return {}
+
+    merged: Dict[str, List[torch.Tensor]] = {}
+    keys = info_chunks[0].keys()
+    for k in keys:
+        first = info_chunks[0][k]
+        if not isinstance(first, list):
+            merged[k] = first
+            continue
+        nlayers = len(first)
+        merged[k] = []
+        for lid in range(nlayers):
+            parts = [chunk[k][lid] for chunk in info_chunks if lid < len(chunk[k])]
+            merged[k].append(torch.cat(parts, dim=0) if len(parts) > 1 else parts[0])
+    return merged
+
 def main() -> None:
     r"""main() -> None
 
@@ -638,6 +675,7 @@ def main() -> None:
     os.makedirs(config['save_dir'], exist_ok=True)
     
     print(f"🚀 Training start from step {start_step}...")
+    optimizer.zero_grad(set_to_none=True)
     
     # ==========================================
     # Logging 逻辑 (回滚到瞬时值 + 修复Step显示)
@@ -647,6 +685,11 @@ def main() -> None:
     active_profile = current_profile
     
     # 5. Training Loop
+    accum_market_infos: List[Dict[str, List[torch.Tensor]]] = []
+    accum_token_losses: List[torch.Tensor] = []
+    accum_critic_losses: List[float] = []
+    accum_micro_steps = 0
+
     for step in range(start_step, config['total_steps']):
         t0 = time.time()
         
@@ -697,6 +740,10 @@ def main() -> None:
         if not torch.isfinite(loss_to_backward):
             print(f"⚠️ Non-finite loss at step {step}: {float(loss_to_backward)} (skip batch)")
             optimizer.zero_grad(set_to_none=True)
+            accum_market_infos.clear()
+            accum_token_losses.clear()
+            accum_critic_losses.clear()
+            accum_micro_steps = 0
             continue
 
         if not loss_to_backward.requires_grad:
@@ -706,17 +753,45 @@ def main() -> None:
                 f"(total_loss.requires_grad={total_loss.requires_grad}, critic_loss.requires_grad={critic_req})."
             )
             optimizer.zero_grad(set_to_none=True)
+            accum_market_infos.clear()
+            accum_token_losses.clear()
+            accum_critic_losses.clear()
+            accum_micro_steps = 0
             continue
 
         loss_to_backward.backward()
+        accum_market_infos.append(_detach_market_info(info))
+        accum_token_losses.append(token_losses.detach())
+        if isinstance(critic_loss, torch.Tensor):
+            accum_critic_losses.append(float(critic_loss.detach().item()))
+        else:
+            accum_critic_losses.append(float(critic_loss))
+        accum_micro_steps += 1
         
         if (step + 1) % config['grad_accum'] == 0:
             clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            if phase.get("market_update", True) and step > 100:
-                model.update_market(info, token_losses, step, phase=phase_name, critic_loss=critic_loss)
+            if phase.get("market_update", True) and step > 100 and accum_micro_steps > 0:
+                merged_info = _merge_market_infos(accum_market_infos)
+                merged_token_losses = torch.cat(accum_token_losses, dim=0)
+                merged_critic_loss = (
+                    sum(accum_critic_losses) / max(1, len(accum_critic_losses))
+                    if accum_critic_losses else None
+                )
+                model.update_market(
+                    merged_info,
+                    merged_token_losses,
+                    step,
+                    phase=phase_name,
+                    critic_loss=merged_critic_loss,
+                )
+
+            accum_market_infos.clear()
+            accum_token_losses.clear()
+            accum_critic_losses.clear()
+            accum_micro_steps = 0
         
         # [修改] 日志与评估逻辑
         if step % log_interval == 0:

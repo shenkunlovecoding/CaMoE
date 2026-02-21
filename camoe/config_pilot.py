@@ -1,6 +1,6 @@
 # config_pilot.py
 
-VERSION = "v21"
+VERSION = "v21.1"
 SCALE = "0.1b"
 VARIANT = "3R1T-Top2"
 
@@ -140,8 +140,8 @@ CONFIG_PILOT = {
     "checkpoint_att_stage": False,
     "checkpoint_expert_stage": False,
 
-    # ===== v21 路由核心参数 =====
-    "route_no_grad": False,      # 关键：v21 需要梯度流通
+    # ===== v21.1 路由核心参数 =====
+    "route_no_grad": False,      # 关键：v21.1 需要梯度流通
     "router_noise_std": 0.03,    # 训练噪声（0.1B 模型稍大一点，帮助探索）
     "market_alpha_init": 0.05,   # buffer 初始值（直接是 alpha，不是 logit）
     "aux_loss_coeff": 0.05,      # Load Balance Loss（从 0.01 加到 0.05，修复死层）
@@ -196,7 +196,7 @@ CONFIG_PILOT = {
     "amp_dtype": "bfloat16",
     "cuda_use_fast_math": True,  # 0.1B 足够稳定
     "cuda_force_fp32_kernel": False,
-    "stabilize_logits": False,   # 不需要了，v21 logits 更健康
+    "stabilize_logits": False,   # 不需要了，v21.1 logits 更健康
     "nan_debug": False,
 
     # ===== 日志与评估 =====
