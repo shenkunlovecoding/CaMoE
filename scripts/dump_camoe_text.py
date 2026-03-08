@@ -5,12 +5,15 @@ import sys
 
 DEFAULT_FILES = [
     "train.py",
-    "CaMoE/system.py",
-    "CaMoE/market.py",
-    "CaMoE/critic.py",
-    "CaMoE/experts.py",
-    "CaMoE/bridge.py",
-    "CaMoE/backbone.py",
+    "camoe/model.py",
+    "camoe/block.py",
+    "camoe/auction.py",
+    "camoe/capital.py",
+    "camoe/expert_base.py",
+    "camoe/expert_rwkv.py",
+    "camoe/expert_critic.py",
+    "camoe/backbone.py",
+    "camoe/config.py",
 ]
 
 
@@ -28,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         "--files",
         nargs="*",
         default=None,
-        help="Override default file list, e.g. --files train.py CaMoE/system.py",
+        help="Override default file list, e.g. --files train.py camoe/model.py",
     )
     return parser.parse_args()
 
