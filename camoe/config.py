@@ -25,6 +25,15 @@ class CaMoEConfig:
     # Auction
     auction_noise_std: float = 0.01
 
+    # Optional DeepEmbed branch
+    use_deep_embed: bool = False
+    deep_embed_scale: float = 0.1
+
+    # Runtime
+    enable_compile: bool = True
+    compile_mode: str = "max-autotune-no-cudagraphs"
+    enable_gradient_checkpointing: bool = True
+
     # Capital
     expert_capital_init: float = 1.0
     critic_capital_init: float = 0.5

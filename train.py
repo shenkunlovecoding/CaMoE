@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from contextlib import nullcontext
 from typing import Iterator
 
@@ -15,6 +16,21 @@ from torch.utils.data import DataLoader
 from camoe.backbone import init_rwkv7_cuda
 from camoe.config import CONFIG_0_1B, CONFIG_0_4B, CaMoEConfig
 from camoe.model import CaMoE_Model
+
+try:
+    import swanlab
+
+    HAS_SWANLAB = True
+except ImportError:
+    HAS_SWANLAB = False
+
+
+PHASE_IDS = {
+    "prewarm": 0.0,
+    "market_warm": 1.0,
+    "critic_warm": 2.0,
+    "full_market": 3.0,
+}
 
 
 def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
@@ -94,18 +110,19 @@ def save_checkpoint(
     expert_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     step: int,
+    swanlab_run_id: str | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "expert_optimizer": expert_optimizer.state_dict(),
-            "critic_optimizer": critic_optimizer.state_dict(),
-            "step": step,
-            "config": model.get_checkpoint_config(),
-        },
-        path,
-    )
+    payload = {
+        "model": model.state_dict(),
+        "expert_optimizer": expert_optimizer.state_dict(),
+        "critic_optimizer": critic_optimizer.state_dict(),
+        "step": step,
+        "config": model.get_checkpoint_config(),
+    }
+    if swanlab_run_id is not None:
+        payload["swanlab_run_id"] = swanlab_run_id
+    torch.save(payload, path)
 
 
 def main() -> None:
@@ -121,6 +138,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--critic_lr", type=float, default=None)
     parser.add_argument("--critic_update_interval", type=int, default=None)
+    parser.add_argument("--use_deep_embed", action="store_true")
+    parser.add_argument("--deep_embed_scale", type=float, default=None)
+    parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -140,6 +161,14 @@ def main() -> None:
         config.critic_lr = args.critic_lr
     if args.critic_update_interval is not None:
         config.critic_update_interval = args.critic_update_interval
+    if args.use_deep_embed:
+        config.use_deep_embed = True
+    if args.deep_embed_scale is not None:
+        config.deep_embed_scale = args.deep_embed_scale
+    if args.no_compile:
+        config.enable_compile = False
+    if args.no_gradient_checkpointing:
+        config.enable_gradient_checkpointing = False
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     amp_enabled = bool(args.amp and device.type == "cuda")
@@ -157,6 +186,7 @@ def main() -> None:
     critic_optimizer = torch.optim.Adam(critic_params, lr=config.critic_lr)
 
     start_step = 0
+    checkpoint = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=True)
@@ -165,6 +195,18 @@ def main() -> None:
         if "critic_optimizer" in checkpoint:
             critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         start_step = int(checkpoint.get("step", 0)) + 1
+
+    swanlab_run_id = None
+    if HAS_SWANLAB:
+        resume_id = checkpoint.get("swanlab_run_id") if isinstance(checkpoint, dict) else None
+        experiment = swanlab.init(
+            project="CaMoE-v22",
+            name=f"pure-market-{args.scale}",
+            config=config.to_dict(),
+            id=resume_id,
+            resume="allow",
+        )
+        swanlab_run_id = experiment.public.run_id
 
     dataset = load_training_split(args.data)
     collate_fn = build_collate_fn(config.seq_len, config.ignore_index)
@@ -180,6 +222,7 @@ def main() -> None:
 
     model.train()
     for step in range(start_step, config.total_steps):
+        step_start = time.time()
         batch = next(train_iter).to(device)
         if batch.size(1) <= 1:
             continue
@@ -216,21 +259,53 @@ def main() -> None:
             critic_loss_value = float(critic_loss.detach().item())
 
         if step % args.log_interval == 0:
-            metrics = model.market_metrics()
+            metrics = model.market_metrics(critic_alpha=critic_alpha)
             entropy_values = [value for key, value in metrics.items() if key.endswith("routing_entropy")]
             routing_entropy = sum(entropy_values) / max(len(entropy_values), 1) if entropy_values else 0.0
+            tps = input_ids.numel() / max(time.time() - step_start, 1e-6)
             print(
                 f"step={step} phase={phase} loss={float(result['loss_scalar'].detach().item()):.4f} "
                 f"critic_loss={critic_loss_value if critic_loss_value is not None else 'n/a'} "
                 f"routing_entropy={routing_entropy:.4f}"
             )
+            if HAS_SWANLAB:
+                logs = {
+                    "Loss/Train_Main": float(result["loss_scalar"].detach().item()),
+                    "Loss/Train_Total": float(result["loss_scalar"].detach().item()),
+                    "Loss/Train_Critic": float(critic_loss_value or 0.0),
+                    "Loss/Aux_Balance": 0.0,
+                    "Speed/TPS": float(tps),
+                    "Phase/ID": PHASE_IDS.get(phase, -1.0),
+                    f"Phase/{phase}": 1.0,
+                    "Market/RoutingEntropy": float(routing_entropy),
+                    "Market/CriticAlpha": float(critic_alpha),
+                    "Model/UseDeepEmbed": float(config.use_deep_embed),
+                    "Runtime/CompileEnabled": float(config.enable_compile),
+                    "Runtime/GradientCheckpointing": float(config.enable_gradient_checkpointing),
+                }
+                logs.update(metrics)
+                swanlab.log(logs, step=step)
 
         if step > 0 and step % args.save_interval == 0:
             checkpoint_path = os.path.join(args.save_dir, f"v22_step{step}.pth")
-            save_checkpoint(checkpoint_path, model, expert_optimizer, critic_optimizer, step)
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                expert_optimizer,
+                critic_optimizer,
+                step,
+                swanlab_run_id=swanlab_run_id,
+            )
 
     final_path = os.path.join(args.save_dir, "v22_final.pth")
-    save_checkpoint(final_path, model, expert_optimizer, critic_optimizer, config.total_steps - 1)
+    save_checkpoint(
+        final_path,
+        model,
+        expert_optimizer,
+        critic_optimizer,
+        config.total_steps - 1,
+        swanlab_run_id=swanlab_run_id,
+    )
 
 
 if __name__ == "__main__":

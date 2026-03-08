@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .backbone import RWKV7_TimeMix
+from .backbone import RWKV7_TimeMix, SharedDeepEmbed
 from .block import CaMoE_Block
 from .capital import ExpertCapitalManager
 from .config import CONFIG_0_4B, CaMoEConfig
@@ -23,6 +23,7 @@ class CaMoE_Model(nn.Module):
         super().__init__()
         self.config = config
         self.emb = nn.Embedding(config.vocab_size, config.dim)
+        self.deep_embed = SharedDeepEmbed(config.vocab_size, config.dim) if config.use_deep_embed else None
         self.backbone_norms = nn.ModuleList([nn.LayerNorm(config.dim) for _ in range(config.n_layers)])
         self.backbone_layers = nn.ModuleList(
             [
@@ -60,6 +61,7 @@ class CaMoE_Model(nn.Module):
                     critic_pair=critic_pair,
                     top_k=config.top_k,
                     auction_noise=config.auction_noise_std,
+                    use_gradient_checkpointing=config.enable_gradient_checkpointing,
                 )
             )
 
@@ -77,6 +79,7 @@ class CaMoE_Model(nn.Module):
             depreciation=config.depreciation,
         )
         self._sync_all_capitals_to_experts()
+        self._maybe_compile_modules()
 
     def forward(
         self,
@@ -88,11 +91,17 @@ class CaMoE_Model(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch, steps = input_ids.shape
         x = self.emb(input_ids)
+        if self.deep_embed is not None:
+            x = x + self.config.deep_embed_scale * self.deep_embed(input_ids)
         v_first = None
 
         for layer_idx in range(self.config.n_layers):
-            normed = self.backbone_norms[layer_idx](x)
-            att_out, v_first, _ = self.backbone_layers[layer_idx](normed, v_first)
+            att_out, v_first = self._forward_backbone_layer(
+                x,
+                v_first,
+                layer_idx,
+                v_first is not None,
+            )
             x = x + att_out
             x = x + self.blocks[layer_idx](
                 x,
@@ -172,19 +181,78 @@ class CaMoE_Model(nn.Module):
             return self.emb.weight.new_zeros(())
         return total_loss / max(count, 1)
 
-    def market_metrics(self) -> dict[str, float]:
+    def market_metrics(self, critic_alpha: float = 1.0) -> dict[str, float]:
         metrics: dict[str, float] = {}
         for layer_idx, block in enumerate(self.blocks):
             caps = self.capital_manager.capitals[layer_idx]
             metrics[f"layer_{layer_idx}/capital_mean"] = float(caps.mean().item())
             metrics[f"layer_{layer_idx}/capital_min"] = float(caps.min().item())
             metrics[f"layer_{layer_idx}/capital_max"] = float(caps.max().item())
+            sorted_caps, _ = torch.sort(caps.float())
+            n = sorted_caps.numel()
+            idx = torch.arange(1, n + 1, device=sorted_caps.device, dtype=sorted_caps.dtype)
+            gini = ((2 * idx - n - 1) * sorted_caps).sum() / (n * sorted_caps.sum().clamp(min=1e-6))
+            critic_cap = (
+                block.critic_pair.critic_a.capital.float() + block.critic_pair.critic_b.capital.float()
+            ) / 2.0
+            metrics[f"L{layer_idx}/Gini"] = float(gini.item())
+            metrics[f"L{layer_idx}/CriticCap"] = float(critic_cap.item())
+            metrics[f"L{layer_idx}/MarketAlpha"] = float(critic_alpha)
             cache = block.get_cache()
             if cache:
                 weights = cache["weights"].float()
                 entropy = -(weights * torch.log(weights + 1e-9)).sum(dim=-1).mean()
                 metrics[f"layer_{layer_idx}/routing_entropy"] = float(entropy.item())
+                metrics[f"L{layer_idx}/WinnerFromAdjustedEntropy"] = float(entropy.item())
+                metrics[f"L{layer_idx}/WeightEntropy"] = float(entropy.item())
         return metrics
+
+    def _forward_backbone_layer(
+        self,
+        x: torch.Tensor,
+        v_first_in: torch.Tensor | None,
+        layer_idx: int,
+        has_v_first: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normed = self.backbone_norms[layer_idx](x)
+        v_first = v_first_in if has_v_first else None
+        att_out, next_v_first, _ = self.backbone_layers[layer_idx](normed, v_first)
+        if next_v_first is None:
+            next_v_first = v_first_in if v_first_in is not None else x.new_zeros(x.shape)
+        return att_out, next_v_first
+
+    def _maybe_compile_modules(self) -> None:
+        if not self.config.enable_compile or not hasattr(torch, "compile"):
+            return
+
+        compile_mode = self.config.compile_mode
+        self._compile_forward(self.deep_embed, compile_mode)
+        for layer in self.backbone_layers:
+            self._compile_forward(layer, compile_mode)
+        for block in self.blocks:
+            for expert in block.experts:
+                self._compile_forward(expert, compile_mode)
+            self._compile_forward(block.critic_pair.critic_a.position_net, compile_mode)
+            self._compile_forward(block.critic_pair.critic_b.position_net, compile_mode)
+
+    @staticmethod
+    def _compile_forward(module: nn.Module | None, compile_mode: str) -> None:
+        if module is None:
+            return
+        try:
+            original_forward = module.forward
+            compiled_forward = torch.compile(original_forward, mode=compile_mode)
+
+            def compiled_with_fallback(*args, **kwargs):
+                try:
+                    return compiled_forward(*args, **kwargs)
+                except Exception:
+                    module.forward = original_forward
+                    return original_forward(*args, **kwargs)
+
+            module.forward = compiled_with_fallback
+        except Exception:
+            return
 
     def _sync_all_capitals_to_experts(self) -> None:
         for layer_idx, block in enumerate(self.blocks):

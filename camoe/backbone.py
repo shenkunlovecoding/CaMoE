@@ -373,151 +373,20 @@ class RWKV7_TimeMix(nn.Module):
         return out, v_first , state_representation
 
 
-# ==================== DeepEmbed + DeepEmbedAttention (from RWKV-7 Goose) ====================
-# 思想：用「词表级」嵌入对 K/V 做逐 token 调制，并增加一条因果 Self-Attention 分支（Q/K/V token-shift + soft-cap）
-
-
 class SharedDeepEmbed(nn.Module):
     """
-    全模型共享的 DeepEmbed 表。
-    通过跨层共享，将词表参数从 O(n_layer * vocab * dim) 降为 O(vocab * dim)。
+    Optional token-level DeepEmbed branch.
+
+    This is intentionally separate from TimeMix. It provides an additional
+    learned token embedding that can be added to the main embedding stream,
+    while keeping the backbone free of the removed legacy attention branch.
     """
 
-    def __init__(self, vocab_size: int, k_dim: int, v_dim: int):
+    def __init__(self, vocab_size: int, dim: int):
         super().__init__()
-        self.k_emb = nn.Embedding(vocab_size, k_dim)
-        self.v_emb = nn.Embedding(vocab_size, v_dim)
-        nn.init.normal_(self.k_emb.weight, std=0.02)
-        nn.init.normal_(self.v_emb.weight, std=0.02)
+        self.embedding = nn.Embedding(vocab_size, dim)
+        self.norm = nn.LayerNorm(dim)
+        nn.init.normal_(self.embedding.weight, std=0.02)
 
-    def forward(self, idx: torch.Tensor):
-        r"""forward(idx) -> Tuple[Tensor, Tensor]
-
-        Args:
-          idx (Tensor): 形状 ``[B, T]`` 的 token id。
-
-        Returns:
-          Tuple[Tensor, Tensor]: ``k_emb(idx)`` 与 ``v_emb(idx)``。
-        """
-        return self.k_emb(idx), self.v_emb(idx)
-
-
-class DeepEmbedAttention(nn.Module):
-    """
-    DeepEmbedAttention (DEA)：与 TimeMix 并行的因果 Self-Attention 分支。
-    - Q/K/V 经 DeepEmbed（k_emb, v_emb 按 token id 查表）调制
-    - Q/K/V 做 token-shift（与上一位置混合）
-    - 使用 soft-cap: 64 * tanh(scores / 1024) 再 softmax
-    """
-    
-    def __init__(
-        self,
-        n_embd: int,
-        n_layer: int,
-        layer_id: int,
-        head_size: int,
-        vocab_size: int,
-        shared_deep_embed: nn.Module = None,
-        q_dim: int = 256,
-        kv_dim: int = 32,
-        score_scale: float = 1024.0,
-        cap_scale: float = 64.0,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.n_embd = n_embd
-        self.q_dim = min(q_dim, n_embd)
-        self.kv_dim = min(kv_dim, self.q_dim)
-        self.score_scale = float(score_scale)
-        self.cap_scale = float(cap_scale)
-        C = n_embd
-
-        # RWKV-8 风格低维路径：Q(C->q_dim), K/V(C->kv_dim->up)
-        self.qq = nn.Linear(C, self.q_dim, bias=False)
-        self.k = nn.Linear(C, self.kv_dim, bias=False)
-        self.k_up = nn.Linear(self.kv_dim, self.q_dim, bias=False)
-        self.v = nn.Linear(C, self.kv_dim, bias=False)
-        self.v_up = nn.Linear(self.kv_dim, C, bias=False)
-
-        # DeepEmbed：默认使用跨层共享表；未提供则回退为层内表
-        self.shared_deep_embed = shared_deep_embed
-        if self.shared_deep_embed is None:
-            self.k_emb = nn.Embedding(vocab_size, self.q_dim)
-            self.v_emb = nn.Embedding(vocab_size, C)
-            nn.init.normal_(self.k_emb.weight, std=0.02)
-            nn.init.normal_(self.v_emb.weight, std=0.02)
-        else:
-            self.k_emb = None
-            self.v_emb = None
-        
-        # Token-shift 系数（与 backbone time_shift 类似）
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / max(n_layer, 1))
-            ddd_q = torch.ones(1, 1, self.q_dim)
-            ddd_v = torch.ones(1, 1, C)
-            for i in range(self.q_dim):
-                ddd_q[0, 0, i] = i / max(self.q_dim - 1, 1)
-            for i in range(C):
-                ddd_v[0, 0, i] = i / max(C - 1, 1)
-            self.x_q = nn.Parameter(1.0 - torch.pow(ddd_q, 0.2 * ratio_1_to_almost0))
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd_q, 0.7 * ratio_1_to_almost0))
-            self.x_v = nn.Parameter(1.0 - torch.pow(ddd_v, 0.7 * ratio_1_to_almost0))
-
-        self.ln_q = nn.LayerNorm(self.q_dim)
-        self.ln_k = nn.LayerNorm(self.q_dim)
-        self.ln_v = nn.LayerNorm(C)
-        
-        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        
-        with torch.no_grad():
-            self.qq.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
-            self.k.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
-            self.k_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
-            self.v.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
-            self.v_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
-    
-    def forward(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        r"""forward(x, idx) -> Tensor
-
-        Args:
-          x (Tensor): 形状 ``[B, T, C]``。
-          idx (Tensor): 形状 ``[B, T]`` 的 token id。
-
-        Returns:
-          Tensor: 形状 ``[B, T, C]`` 的 DEA 分支输出。
-        """
-        B, T, C = x.shape
-        if self.shared_deep_embed is not None:
-            k_emb, v_emb = self.shared_deep_embed(idx)
-        else:
-            k_emb = self.k_emb(idx)
-            v_emb = self.v_emb(idx)
-
-        # Q
-        q = self.qq(x)
-        q_prev = self.time_shift(q) - q
-        q = q + q_prev * self.x_q
-        q = self.ln_q(q)
-        
-        # K: C -> kv_dim -> q_dim，再由 token 级 DeepEmbed 调制
-        k = self.k_up(self.k(x)) * k_emb
-        k_prev = self.time_shift(k) - k
-        k = k + k_prev * self.x_k
-        k = self.ln_k(k)
-        
-        # V: C -> kv_dim -> C，保留 tanh 非线性后调制
-        v = torch.tanh(self.v_up(self.v(x))) * v_emb
-        v_prev = self.time_shift(v) - v
-        v = v + v_prev * self.x_v
-        v = self.ln_v(v)
-        
-        # Causal self-attention with soft-cap
-        scores = (q @ k.transpose(-2, -1)) / self.score_scale
-        scores = self.cap_scale * torch.tanh(scores)
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
-        attn = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-        out = attn @ v
-        return out
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.embedding(idx))

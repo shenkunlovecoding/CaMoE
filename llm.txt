@@ -1,0 +1,1430 @@
+train.py:
+"""CaMoE v22 training script."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from contextlib import nullcontext
+from typing import Iterator
+
+import torch
+from datasets import Dataset, DatasetDict, load_from_disk
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+
+from camoe.backbone import init_rwkv7_cuda
+from camoe.config import CONFIG_0_1B, CONFIG_0_4B, CaMoEConfig
+from camoe.model import CaMoE_Model
+
+
+def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
+    s1 = config.prewarm_steps
+    s2 = s1 + config.market_warmup_steps
+    s3 = s2 + config.critic_warmup_steps
+    if step < s1:
+        return "prewarm", 0.0
+    if step < s2:
+        return "market_warm", 0.0
+    if step < s3:
+        alpha = (step - s2) / max(config.critic_warmup_steps, 1)
+        return "critic_warm", float(alpha)
+    return "full_market", 1.0
+
+
+def select_config(scale: str) -> CaMoEConfig:
+    if scale == "0.1b":
+        return CONFIG_0_1B.copy()
+    if scale == "0.4b":
+        return CONFIG_0_4B.copy()
+    raise ValueError(f"Unknown scale: {scale}")
+
+
+def load_training_split(path: str) -> Dataset:
+    dataset = load_from_disk(path)
+    if isinstance(dataset, DatasetDict):
+        if "train" in dataset:
+            dataset = dataset["train"]
+        else:
+            first_key = next(iter(dataset.keys()))
+            dataset = dataset[first_key]
+    if not isinstance(dataset, Dataset):
+        raise TypeError(f"Unsupported dataset type: {type(dataset)!r}")
+    dataset.set_format(type="torch", columns=["input_ids"])
+    return dataset
+
+
+def build_collate_fn(seq_len: int, ignore_index: int):
+    chunk_len = 16
+
+    def collate(batch):
+        input_ids = [item["input_ids"] for item in batch]
+        max_len = min(max(len(ids) for ids in input_ids), seq_len + 1)
+        input_len = ((max_len - 1 + chunk_len - 1) // chunk_len) * chunk_len
+        target_len = max(input_len + 1, chunk_len + 1)
+        padded = torch.full((len(batch), target_len), ignore_index, dtype=torch.long)
+        for row, ids in enumerate(input_ids):
+            length = min(len(ids), target_len)
+            padded[row, :length] = ids[:length]
+        return padded
+
+    return collate
+
+
+def infinite_loader(loader: DataLoader) -> Iterator[torch.Tensor]:
+    while True:
+        yield from loader
+
+
+def split_optim_params(model: CaMoE_Model) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    expert_params = []
+    critic_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "critic_pair" in name:
+            critic_params.append(param)
+        else:
+            expert_params.append(param)
+    return expert_params, critic_params
+
+
+def save_checkpoint(
+    path: str,
+    model: CaMoE_Model,
+    expert_optimizer: torch.optim.Optimizer,
+    critic_optimizer: torch.optim.Optimizer,
+    step: int,
+) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "expert_optimizer": expert_optimizer.state_dict(),
+            "critic_optimizer": critic_optimizer.state_dict(),
+            "step": step,
+            "config": model.get_checkpoint_config(),
+        },
+        path,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train CaMoE v22 pure-market model")
+    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
+    parser.add_argument("--data", required=True, help="Path to a HuggingFace dataset saved with load_from_disk")
+    parser.add_argument("--save_dir", default="checkpoints/v22")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--seq_len", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--critic_lr", type=float, default=None)
+    parser.add_argument("--critic_update_interval", type=int, default=None)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--amp", action="store_true")
+    args = parser.parse_args()
+
+    config = select_config(args.scale)
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.seq_len is not None:
+        config.seq_len = args.seq_len
+    if args.steps is not None:
+        config.total_steps = args.steps
+    if args.lr is not None:
+        config.lr = args.lr
+    if args.critic_lr is not None:
+        config.critic_lr = args.critic_lr
+    if args.critic_update_interval is not None:
+        config.critic_update_interval = args.critic_update_interval
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_ctx = (
+        lambda: torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if amp_enabled
+        else nullcontext
+    )
+
+    init_rwkv7_cuda()
+
+    model = CaMoE_Model(config).to(device)
+    expert_params, critic_params = split_optim_params(model)
+    expert_optimizer = torch.optim.AdamW(expert_params, lr=config.lr)
+    critic_optimizer = torch.optim.Adam(critic_params, lr=config.critic_lr)
+
+    start_step = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        if "expert_optimizer" in checkpoint:
+            expert_optimizer.load_state_dict(checkpoint["expert_optimizer"])
+        if "critic_optimizer" in checkpoint:
+            critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        start_step = int(checkpoint.get("step", 0)) + 1
+
+    dataset = load_training_split(args.data)
+    collate_fn = build_collate_fn(config.seq_len, config.ignore_index)
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        collate_fn=collate_fn,
+    )
+    train_iter = infinite_loader(loader)
+
+    model.train()
+    for step in range(start_step, config.total_steps):
+        batch = next(train_iter).to(device)
+        if batch.size(1) <= 1:
+            continue
+
+        input_ids = batch[:, :-1]
+        targets = batch[:, 1:]
+        phase, critic_alpha = get_phase(step, config)
+
+        expert_optimizer.zero_grad(set_to_none=True)
+        with amp_ctx():
+            result = model(
+                input_ids,
+                targets,
+                critic_alpha=critic_alpha,
+                training=True,
+                uniform=(phase == "prewarm"),
+            )
+        result["loss_scalar"].backward()
+        clip_grad_norm_(expert_params, config.grad_clip)
+        expert_optimizer.step()
+
+        settle_results = []
+        if phase != "prewarm":
+            with torch.no_grad():
+                settle_results = model.settle_all_layers(result["loss"].detach())
+
+        critic_loss_value = None
+        if phase not in ("prewarm", "market_warm") and settle_results and step % config.critic_update_interval == 0:
+            critic_optimizer.zero_grad(set_to_none=True)
+            critic_loss = model.compute_critic_loss(settle_results)
+            critic_loss.backward()
+            clip_grad_norm_(critic_params, 1.0)
+            critic_optimizer.step()
+            critic_loss_value = float(critic_loss.detach().item())
+
+        if step % args.log_interval == 0:
+            metrics = model.market_metrics()
+            entropy_values = [value for key, value in metrics.items() if key.endswith("routing_entropy")]
+            routing_entropy = sum(entropy_values) / max(len(entropy_values), 1) if entropy_values else 0.0
+            print(
+                f"step={step} phase={phase} loss={float(result['loss_scalar'].detach().item()):.4f} "
+                f"critic_loss={critic_loss_value if critic_loss_value is not None else 'n/a'} "
+                f"routing_entropy={routing_entropy:.4f}"
+            )
+
+        if step > 0 and step % args.save_interval == 0:
+            checkpoint_path = os.path.join(args.save_dir, f"v22_step{step}.pth")
+            save_checkpoint(checkpoint_path, model, expert_optimizer, critic_optimizer, step)
+
+    final_path = os.path.join(args.save_dir, "v22_final.pth")
+    save_checkpoint(final_path, model, expert_optimizer, critic_optimizer, config.total_steps - 1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+camoe/model.py:
+"""Pure-market CaMoE model."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .backbone import RWKV7_TimeMix
+from .block import CaMoE_Block
+from .capital import ExpertCapitalManager
+from .config import CONFIG_0_4B, CaMoEConfig
+from .expert_critic import CriticPair
+from .expert_rwkv import RWKVExpert
+
+
+class CaMoE_Model(nn.Module):
+    """Stacked RWKV backbone plus pure-market expert blocks."""
+
+    def __init__(self, config: CaMoEConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.emb = nn.Embedding(config.vocab_size, config.dim)
+        self.backbone_norms = nn.ModuleList([nn.LayerNorm(config.dim) for _ in range(config.n_layers)])
+        self.backbone_layers = nn.ModuleList(
+            [
+                RWKV7_TimeMix(
+                    n_embd=config.dim,
+                    n_layer=config.n_layers,
+                    layer_id=layer_idx,
+                    head_size=config.head_size,
+                )
+                for layer_idx in range(config.n_layers)
+            ]
+        )
+
+        self.blocks = nn.ModuleList()
+        for _layer_idx in range(config.n_layers):
+            experts = [
+                RWKVExpert(
+                    dim=config.dim,
+                    expand=config.ffn_expand,
+                    capital_init=config.expert_capital_init,
+                    capital_floor=config.capital_floor,
+                )
+                for _ in range(config.n_experts)
+            ]
+            critic_pair = CriticPair(
+                dim=config.dim,
+                n_routable=config.n_experts,
+                hidden_dim=config.critic_hidden_dim,
+                capital_init=config.critic_capital_init,
+                capital_floor=config.capital_floor,
+            )
+            self.blocks.append(
+                CaMoE_Block(
+                    experts=experts,
+                    critic_pair=critic_pair,
+                    top_k=config.top_k,
+                    auction_noise=config.auction_noise_std,
+                )
+            )
+
+        self.ln_out = nn.LayerNorm(config.dim)
+        self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
+        if config.tie_weights:
+            self.lm_head.weight = self.emb.weight
+
+        self.capital_manager = ExpertCapitalManager(
+            n_layers=config.n_layers,
+            n_experts_per_layer=config.n_experts,
+            capital_init=config.expert_capital_init,
+            ema_decay=config.ema_decay,
+            capital_floor=config.capital_floor,
+            depreciation=config.depreciation,
+        )
+        self._sync_all_capitals_to_experts()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        critic_alpha: float = 1.0,
+        training: bool = True,
+        uniform: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        batch, steps = input_ids.shape
+        x = self.emb(input_ids)
+        v_first = None
+
+        for layer_idx in range(self.config.n_layers):
+            normed = self.backbone_norms[layer_idx](x)
+            att_out, v_first, _ = self.backbone_layers[layer_idx](normed, v_first)
+            x = x + att_out
+            x = x + self.blocks[layer_idx](
+                x,
+                critic_alpha=critic_alpha,
+                training=training,
+                uniform=uniform,
+            )
+
+        x = self.ln_out(x)
+        logits = self.lm_head(x)
+        result: dict[str, torch.Tensor] = {"logits": logits}
+
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=self.config.ignore_index,
+                reduction="none",
+            ).view(batch, steps)
+            result["loss"] = loss
+            result["loss_scalar"] = loss.mean()
+
+        return result
+
+    def settle_all_layers(
+        self,
+        token_loss: torch.Tensor,
+    ) -> list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]]:
+        all_profits: list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]] = []
+        for layer_idx, block in enumerate(self.blocks):
+            cache = block.get_cache()
+            if not cache:
+                continue
+
+            profit = self.capital_manager.settle_layer(
+                layer_idx=layer_idx,
+                winners=cache["winners"],
+                weights=cache["weights"],
+                token_loss=token_loss,
+                prices=cache["prices"],
+            )
+            adv_a, adv_b = block.critic_pair.settle_both(cache["x_detached"], profit)
+            self.capital_manager.sync_to_experts(layer_idx, list(block.experts))
+
+            all_profits.append(
+                {
+                    "layer": layer_idx,
+                    "profit": profit,
+                    "adv_a": adv_a,
+                    "adv_b": adv_b,
+                    "cache": cache,
+                }
+            )
+
+        return all_profits
+
+    def compute_critic_loss(
+        self,
+        settle_results: list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]],
+    ) -> torch.Tensor:
+        total_loss: torch.Tensor | None = None
+        count = 0
+        for result in settle_results:
+            layer_idx = int(result["layer"])
+            block = self.blocks[layer_idx]
+            cache = result["cache"]
+            loss = block.critic_pair.reinforce_loss(
+                cache["x_detached"],
+                result["profit"].detach(),
+                result["adv_a"],
+                result["adv_b"],
+            )
+            total_loss = loss if total_loss is None else (total_loss + loss)
+            count += 1
+
+        if total_loss is None:
+            return self.emb.weight.new_zeros(())
+        return total_loss / max(count, 1)
+
+    def market_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for layer_idx, block in enumerate(self.blocks):
+            caps = self.capital_manager.capitals[layer_idx]
+            metrics[f"layer_{layer_idx}/capital_mean"] = float(caps.mean().item())
+            metrics[f"layer_{layer_idx}/capital_min"] = float(caps.min().item())
+            metrics[f"layer_{layer_idx}/capital_max"] = float(caps.max().item())
+            cache = block.get_cache()
+            if cache:
+                weights = cache["weights"].float()
+                entropy = -(weights * torch.log(weights + 1e-9)).sum(dim=-1).mean()
+                metrics[f"layer_{layer_idx}/routing_entropy"] = float(entropy.item())
+        return metrics
+
+    def _sync_all_capitals_to_experts(self) -> None:
+        for layer_idx, block in enumerate(self.blocks):
+            self.capital_manager.sync_to_experts(layer_idx, list(block.experts))
+
+    def get_checkpoint_config(self) -> dict:
+        return asdict(self.config)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        result = super().load_state_dict(state_dict, strict=strict)
+        self._sync_all_capitals_to_experts()
+        return result
+
+
+def load_camoe_checkpoint(
+    checkpoint_path: str,
+    device: str | torch.device = "cpu",
+    config: CaMoEConfig | dict | None = None,
+    strict: bool = True,
+) -> tuple[CaMoE_Model, CaMoEConfig, dict]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    if config is None and isinstance(checkpoint, dict) and checkpoint.get("config") is not None:
+        config = CaMoEConfig.from_mapping(checkpoint["config"])
+    elif config is None:
+        config = CONFIG_0_4B.copy()
+    elif not isinstance(config, CaMoEConfig):
+        config = CaMoEConfig.from_mapping(config)
+
+    model = CaMoE_Model(config)
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model.load_state_dict(state_dict, strict=strict)
+    model.to(device)
+    return model, config, checkpoint
+
+
+camoe/block.py:
+"""Single pure-market CaMoE block."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .auction import VickreyAuctionHouse
+from .expert_base import BaseExpert
+from .expert_critic import CriticPair
+
+
+class CaMoE_Block(nn.Module):
+    """A routable expert pool plus critic pair and zero-parameter auction."""
+
+    def __init__(
+        self,
+        experts: list[BaseExpert],
+        critic_pair: CriticPair,
+        top_k: int = 2,
+        auction_noise: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.experts = nn.ModuleList(experts)
+        self.critic_pair = critic_pair
+        self.n_routable = len(experts)
+        self.top_k = int(top_k)
+        self.auction = VickreyAuctionHouse(top_k=self.top_k, noise_std=auction_noise)
+        self._cache: dict[str, torch.Tensor] = {}
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        critic_alpha: float = 1.0,
+        training: bool = True,
+        uniform: bool = False,
+        **expert_ctx,
+    ) -> torch.Tensor:
+        if uniform:
+            self._cache = {}
+            return self._forward_uniform(x, **expert_ctx)
+
+        positions = self.critic_pair.get_positions(x.detach()).detach()
+        expert_caps = torch.stack([expert.capital for expert in self.experts]).to(x.device)
+        winners, weights, prices = self.auction(
+            expert_caps,
+            positions,
+            critic_alpha=critic_alpha,
+            training=training,
+        )
+        output = self._dispatch(x, winners, weights, **expert_ctx)
+
+        self._cache = {
+            "winners": winners.detach(),
+            "weights": weights.detach(),
+            "prices": prices.detach(),
+            "positions": positions.detach(),
+            "x_detached": x.detach(),
+        }
+        return output
+
+    def _dispatch(
+        self,
+        x: torch.Tensor,
+        winners: torch.Tensor,
+        weights: torch.Tensor,
+        **expert_ctx,
+    ) -> torch.Tensor:
+        output = torch.zeros_like(x)
+
+        for expert_idx, expert in enumerate(self.experts):
+            match = winners == expert_idx
+            selected = match.any(dim=-1)
+            if not bool(selected.any()):
+                continue
+
+            expert_weight = (weights * match.to(weights.dtype)).sum(dim=-1)
+            expert_out = expert(x, **expert_ctx)
+            compensated = (
+                expert_out * expert_weight.unsqueeze(-1)
+                + expert_out.detach() * (1.0 / self.top_k - expert_weight).unsqueeze(-1)
+            )
+            output = output + compensated * selected.unsqueeze(-1).to(x.dtype)
+
+        return output
+
+    def _forward_uniform(self, x: torch.Tensor, **expert_ctx) -> torch.Tensor:
+        outputs = [expert(x, **expert_ctx) for expert in self.experts]
+        return sum(outputs) / len(outputs)
+
+    def get_cache(self) -> dict[str, torch.Tensor]:
+        return self._cache
+
+
+camoe/auction.py:
+"""Zero-parameter Vickrey auction used for routing."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+
+class VickreyAuctionHouse:
+    """
+    Stateless second-price auction.
+
+    Bid definition:
+      bid = expert_capital + critic_alpha * critic_position
+    """
+
+    def __init__(self, top_k: int = 2, noise_std: float = 0.01) -> None:
+        self.top_k = int(top_k)
+        self.noise_std = float(noise_std)
+
+    def __call__(
+        self,
+        expert_capitals: torch.Tensor,
+        critic_positions: torch.Tensor,
+        critic_alpha: float = 1.0,
+        training: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_experts = expert_capitals.numel()
+        if self.top_k >= n_experts:
+            raise ValueError(
+                f"top_k={self.top_k} requires at least top_k + 1 experts, got {n_experts}."
+            )
+
+        with torch.no_grad():
+            bids = expert_capitals.detach().view(1, 1, -1).to(critic_positions.dtype)
+            bids = bids + float(critic_alpha) * critic_positions.detach()
+            if training and self.noise_std > 0:
+                bids = bids + torch.randn_like(bids) * self.noise_std
+
+            top_vals, top_idxs = bids.topk(self.top_k + 1, dim=-1)
+            winners = top_idxs[:, :, : self.top_k]
+            winner_bids = top_vals[:, :, : self.top_k]
+            prices = top_vals[:, :, self.top_k]
+            weights = F.softmax(winner_bids, dim=-1)
+
+        return winners, weights, prices
+
+
+camoe/capital.py:
+"""Vectorized capital accounting for pure-market CaMoE."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ExpertCapitalManager(nn.Module):
+    """
+    Manage expert capital and running losses as layer-wise buffers.
+
+    The settlement path is vectorized over all experts within a layer.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        n_experts_per_layer: int,
+        capital_init: float = 1.0,
+        ema_decay: float = 0.95,
+        capital_floor: float = 0.01,
+        depreciation: float = 0.001,
+    ) -> None:
+        super().__init__()
+        self.n_layers = int(n_layers)
+        self.n_experts = int(n_experts_per_layer)
+        self.ema_decay = float(ema_decay)
+        self.capital_floor = float(capital_floor)
+        self.depreciation = float(depreciation)
+
+        self.register_buffer(
+            "capitals",
+            torch.full((self.n_layers, self.n_experts), float(capital_init), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "running_loss",
+            torch.zeros(self.n_layers, self.n_experts, dtype=torch.float32),
+        )
+
+    def settle_layer(
+        self,
+        layer_idx: int,
+        winners: torch.Tensor,
+        weights: torch.Tensor,
+        token_loss: torch.Tensor,
+        prices: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Settle one layer and return expert profits shaped ``[E]``.
+        """
+        num_experts = self.n_experts
+        caps = self.capitals[layer_idx]
+        dtype = token_loss.dtype
+
+        one_hot = F.one_hot(winners, num_classes=num_experts).to(dtype=dtype)
+        winner_mask = (one_hot * weights.unsqueeze(-1)).sum(dim=2)
+
+        total_weight = winner_mask.sum(dim=(0, 1)).clamp(min=1e-8)
+        weighted_loss = (token_loss.unsqueeze(-1) * winner_mask).sum(dim=(0, 1))
+        mean_loss = weighted_loss / total_weight
+
+        active = total_weight > 0.01
+        running = self.running_loss[layer_idx].to(dtype=dtype)
+        bootstrap = active & running.abs().lt(1e-8)
+        baseline = torch.where(bootstrap, mean_loss, running)
+        relative = torch.where(
+            active,
+            baseline - mean_loss,
+            torch.zeros_like(mean_loss),
+        )
+
+        updated_running = torch.where(
+            active,
+            self.ema_decay * baseline + (1.0 - self.ema_decay) * mean_loss,
+            running,
+        )
+        self.running_loss[layer_idx].copy_(updated_running.to(self.running_loss.dtype))
+
+        revenue = relative * caps.to(dtype=dtype)
+        total_tokens = max(token_loss.shape[0] * token_loss.shape[1], 1)
+        cost = (prices.unsqueeze(-1) * winner_mask).sum(dim=(0, 1)) / float(total_tokens)
+        cost = torch.where(active, cost, torch.zeros_like(cost))
+        depreciation = self.depreciation * caps.to(dtype=dtype)
+        profit = revenue - cost - depreciation
+
+        next_caps = (caps.to(dtype=dtype) + profit).clamp(min=self.capital_floor)
+        self.capitals[layer_idx].copy_(next_caps.to(self.capitals.dtype))
+        return profit.detach()
+
+    def sync_to_experts(self, layer_idx: int, experts: list[nn.Module]) -> None:
+        for expert_idx, expert in enumerate(experts):
+            expert.capital.fill_(float(self.capitals[layer_idx, expert_idx].item()))
+
+    def sync_from_experts(self, layer_idx: int, experts: list[nn.Module]) -> None:
+        for expert_idx, expert in enumerate(experts):
+            self.capitals[layer_idx, expert_idx] = float(expert.capital.item())
+
+
+camoe/expert_base.py:
+"""Abstract base class for all CaMoE experts."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+import torch
+import torch.nn as nn
+
+
+class BaseExpert(nn.Module, ABC):
+    """
+    Shared interface for all market participants.
+
+    Each expert owns a scalar capital buffer and exposes a unified settlement
+    entrypoint. Concrete subclasses implement the actual forward pass.
+    """
+
+    def __init__(self, capital_init: float = 1.0, capital_floor: float = 0.01) -> None:
+        super().__init__()
+        self.register_buffer("capital", torch.tensor(float(capital_init), dtype=torch.float32))
+        self.capital_floor = float(capital_floor)
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
+        """Run the expert on the provided hidden states."""
+
+    @property
+    @abstractmethod
+    def expert_type(self) -> str:
+        """Return the expert family name."""
+
+    @property
+    def is_routable(self) -> bool:
+        """Whether this expert participates in the token auction."""
+        return True
+
+    def settle(self, profit: torch.Tensor) -> None:
+        """Update capital with a scalar profit signal."""
+        value = torch.as_tensor(
+            profit,
+            device=self.capital.device,
+            dtype=self.capital.dtype,
+        )
+        updated = (self.capital + value).clamp(min=self.capital_floor)
+        self.capital.copy_(updated)
+
+
+camoe/expert_rwkv.py:
+"""RWKV feed-forward expert used by the pure market router."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .expert_base import BaseExpert
+
+
+class RWKVExpert(BaseExpert):
+    """
+    Minimal sparse expert.
+
+    Structure:
+      x -> LayerNorm -> Linear(D, 4D) -> SiLU -> Linear(4D, D)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        expand: int = 4,
+        capital_init: float = 1.0,
+        capital_floor: float = 0.01,
+    ) -> None:
+        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        hidden = int(dim * expand)
+        self.norm = nn.LayerNorm(dim)
+        self.w1 = nn.Linear(dim, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
+        self.act = nn.SiLU()
+
+    @property
+    def expert_type(self) -> str:
+        return "rwkv"
+
+    def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
+        del ctx
+        h = self.norm(x)
+        return self.w2(self.act(self.w1(h)))
+
+
+camoe/expert_critic.py:
+"""Critic experts for pure-market CaMoE."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .expert_base import BaseExpert
+
+
+class CriticExpert(BaseExpert):
+    """
+    Market critic that takes long/short positions on routable experts.
+
+    The critic never participates in token routing and is trained only through
+    the separate REINFORCE-style objective.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_routable: int,
+        hidden_dim: int | None = None,
+        capital_init: float = 0.5,
+        capital_floor: float = 0.01,
+    ) -> None:
+        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        hidden_dim = hidden_dim or max(1, dim // 4)
+        self.n_routable = int(n_routable)
+        self.position_net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.n_routable),
+            nn.Tanh(),
+        )
+
+    @property
+    def expert_type(self) -> str:
+        return "critic"
+
+    @property
+    def is_routable(self) -> bool:
+        return False
+
+    def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
+        del ctx
+        return self.position_net(x)
+
+    def compute_pnl(
+        self,
+        positions: torch.Tensor,
+        expert_profits: torch.Tensor,
+    ) -> torch.Tensor:
+        per_token = (positions * expert_profits.view(1, 1, -1)).sum(dim=-1)
+        return per_token.mean()
+
+
+class CriticPair(nn.Module):
+    """Two critics that use each other as variance-reduction baselines."""
+
+    def __init__(self, dim: int, n_routable: int, **critic_kwargs) -> None:
+        super().__init__()
+        self.critic_a = CriticExpert(dim, n_routable, **critic_kwargs)
+        self.critic_b = CriticExpert(dim, n_routable, **critic_kwargs)
+
+    def get_positions(self, x: torch.Tensor) -> torch.Tensor:
+        pos_a = self.critic_a(x)
+        pos_b = self.critic_b(x)
+        return (pos_a + pos_b) / 2
+
+    def settle_both(
+        self,
+        x_detached: torch.Tensor,
+        expert_profits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pos_a = self.critic_a(x_detached)
+        pos_b = self.critic_b(x_detached)
+
+        pnl_a = self.critic_a.compute_pnl(pos_a, expert_profits)
+        pnl_b = self.critic_b.compute_pnl(pos_b, expert_profits)
+
+        self.critic_a.settle(pnl_a.detach())
+        self.critic_b.settle(pnl_b.detach())
+
+        adv_a = pnl_a - pnl_b.detach()
+        adv_b = pnl_b - pnl_a.detach()
+        return adv_a.detach(), adv_b.detach()
+
+    def reinforce_loss(
+        self,
+        x_detached: torch.Tensor,
+        expert_profits: torch.Tensor,
+        adv_a: torch.Tensor,
+        adv_b: torch.Tensor,
+    ) -> torch.Tensor:
+        pos_a = self.critic_a(x_detached)
+        pos_b = self.critic_b(x_detached)
+
+        pnl_a = self.critic_a.compute_pnl(pos_a, expert_profits)
+        pnl_b = self.critic_b.compute_pnl(pos_b, expert_profits)
+        return -(adv_a * pnl_a + adv_b * pnl_b)
+
+
+camoe/backbone.py:
+"""
+RWKV-7 TimeMix Backbone (Turbo Edition with ClampW Kernel)
+支持 BF16 原生加速
+"""
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.utils.cpp_extension import load
+import math
+import os
+from typing import Tuple
+
+# ==================== CUDA Kernel ====================
+HEAD_SIZE = 64
+CHUNK_LEN = 16
+USE_CUDA = False
+RUN_CUDA_RWKV7 = None
+CUDA_KERNEL_EXPECTS_FP32 = False
+W_SCALE = -math.exp(-0.5)
+
+def init_rwkv7_cuda():
+    r"""init_rwkv7_cuda() -> None
+
+    编译并注册 RWKV7 自定义 CUDA 算子。
+
+    成功后会设置全局 ``USE_CUDA=True`` 并绑定 ``RUN_CUDA_RWKV7``。
+    """
+    global USE_CUDA, RUN_CUDA_RWKV7, CUDA_KERNEL_EXPECTS_FP32
+    
+    try:
+        curr_dir = os.path.dirname(os.path.abspath(__file__))
+        cuda_dir = os.path.join(curr_dir, 'cuda')
+        
+        # 新文件名
+        cu_file = os.path.join(cuda_dir, 'rwkv7_clampw.cu')
+        cpp_file = os.path.join(cuda_dir, 'rwkv7_clampw.cpp')
+        
+        if not (os.path.exists(cu_file) and os.path.exists(cpp_file)):
+            print(f"⚠️ CUDA files not found: {cu_file}")
+            print("   Using Fallback (Slow FP32)...")
+            return
+        
+        # 编译标志：如果不加 -D_FP32_，默认就是 BF16
+        # 注意：HEAD_SIZE 和 CHUNK_LEN 依然要传
+        use_fast_math = os.environ.get("CAMOE_DISABLE_FAST_MATH", "0") != "1"
+        force_fp32_kernel = os.environ.get("CAMOE_FORCE_FP32_KERNEL", "0") == "1"
+
+        flags = [
+            '-res-usage', 
+            f'-D_N_={HEAD_SIZE}', 
+            f"-D_CHUNK_LEN_={CHUNK_LEN}", 
+            "-O3",  
+            "--extra-device-vectorization"
+        ]
+        if use_fast_math:
+            flags.append("--use_fast_math")
+        if force_fp32_kernel:
+            flags.append("-D_FP32_")
+        cxx_flags = ["-D_FP32_"] if force_fp32_kernel else []
+        print(f"🔧 RWKV CUDA flags: fast_math={use_fast_math}, fp32_kernel={force_fp32_kernel}")
+        
+        ext_name = "rwkv7_clampw"
+        load(
+            name=ext_name, 
+            sources=[cu_file, cpp_file], 
+            is_python_module=False, 
+            verbose=True, 
+            extra_cuda_cflags=flags,
+            extra_cflags=cxx_flags,
+        )
+        # TORCH_LIBRARY namespace is fixed in rwkv7_clampw.cpp
+        op_ns = torch.ops.rwkv7_clampw
+        
+        class RWKV7_ClampW(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, r, w, k, v, a, b):
+                B, T, H, C = r.shape
+                assert T % CHUNK_LEN == 0
+                expected_dtype = torch.float32 if force_fp32_kernel else torch.bfloat16
+                assert all(i.dtype == expected_dtype for i in [r, w, k, v, a, b]), "RWKV7 kernel dtype mismatch"
+                assert all(i.is_contiguous() for i in [r, w, k, v, a, b]), "RWKV7 kernel needs contiguous tensors"
+                
+                # 创建输出和状态张量
+                # 注意：BF16 Kernel 要求输入输出是 BF16/FP16，但 State 是 FP32
+                y = torch.empty_like(v)
+                s = torch.empty(B, H, T//CHUNK_LEN, C, C, dtype=torch.float32, device=r.device)
+                sa = torch.empty(B, T, H, C, dtype=torch.float32, device=r.device)
+                
+                op_ns.forward(r, w, k, v, a, b, y, s, sa)
+                ctx.save_for_backward(r, w, k, v, a, b, s, sa)
+                return y,sa
+            
+            @staticmethod
+            def backward(ctx, dy):
+                expected_dtype = torch.float32 if force_fp32_kernel else torch.bfloat16
+                assert dy.dtype == expected_dtype, "RWKV7 backward dtype mismatch"
+                assert dy.is_contiguous(), "RWKV7 backward needs contiguous dy"
+                r, w, k, v, a, b, s, sa = ctx.saved_tensors
+                dr, dw, dk, dv, da, db = [torch.empty_like(x) for x in [r, w, k, v, a, b]]
+                op_ns.backward(r, w, k, v, a, b, dy, s, sa, dr, dw, dk, dv, da, db)
+                return dr, dw, dk, dv, da, db
+        
+        def _run_cuda(r, w, k, v, a, b):
+            B, T, HC = r.shape
+            H = HC // HEAD_SIZE
+            orig_dtype = r.dtype
+            target_dtype = torch.float32 if CUDA_KERNEL_EXPECTS_FP32 else torch.bfloat16
+            
+            # View 变换
+            # 关键改动：不再强制转 .float() (FP32)
+            # 保持原有的 dtype (BF16)，只做 contiguous 和 view
+            r, w, k, v, a, b = [
+                x.to(dtype=target_dtype).contiguous().view(B, T, H, HEAD_SIZE)
+                for x in [r, w, k, v, a, b]
+            ]
+            
+            out , sa = RWKV7_ClampW.apply(r, w, k, v, a, b)
+            out = out.view(B, T, HC).to(orig_dtype)
+            sa = sa.view(B, T, HC).to(orig_dtype)
+            return out, sa
+        
+        RUN_CUDA_RWKV7 = _run_cuda
+        USE_CUDA = True
+        CUDA_KERNEL_EXPECTS_FP32 = force_fp32_kernel
+        print(
+            f"✅ RWKV-7 CUDA Kernel (ClampW + {'FP32' if force_fp32_kernel else 'BF16'}) Ready"
+        )
+        
+    except Exception as e:
+        print(f"⚠️ CUDA init failed: {e}")
+
+
+# ==================== RWKV-7 TimeMix ====================
+class RWKV7_TimeMix(nn.Module):
+    """
+    RWKV-7 TimeMix (Attention equivalent)
+    完整实现动态状态演化
+    """
+    
+    def __init__(self, n_embd: int, n_layer: int, layer_id: int, head_size: int = 64):
+        super().__init__()
+        self.layer_id = layer_id
+        self.n_layer = n_layer
+        self.head_size = head_size
+        self.n_head = n_embd // head_size
+        self.n_embd = n_embd
+        self.ln_sa = nn.LayerNorm(n_embd)
+        assert n_embd % head_size == 0
+        
+        C = n_embd
+        H = self.n_head
+        N = head_size
+        
+        with torch.no_grad():
+            ratio_0_to_1 = layer_id / max(n_layer - 1, 1)
+            ratio_1_to_almost0 = 1.0 - (layer_id / n_layer)
+            
+            ddd = torch.ones(1, 1, C)
+            for i in range(C):
+                ddd[0, 0, i] = i / C
+            
+            self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+            self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
+            self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
+            self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+            
+            def ortho_init(x, scale):
+                shape = x.shape
+                if len(shape) == 2:
+                    gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1
+                    nn.init.orthogonal_(x, gain=gain * scale)
+                return x
+            
+            # 按RWKV-7规范设置LORA维度
+            D_DECAY_LORA = max(32, int(round((2.5 * (C ** 0.5)) / 32) * 32))
+            D_AAA_LORA = max(32, int(round((2.5 * (C ** 0.5)) / 32) * 32))
+            D_MV_LORA = max(32, int(round((1.7 * (C ** 0.5)) / 32) * 32))
+            D_GATE_LORA = max(32, int(round((5 * (C ** 0.5)) / 32) * 32))
+            
+            # Decay
+            www = torch.zeros(C)
+            zigzag = torch.zeros(C)
+            linear = torch.zeros(C)
+            for n in range(C):
+                linear[n] = n / (C - 1) - 0.5
+                zigzag[n] = ((n % N) - ((N - 1) / 2)) / ((N - 1) / 2)
+                zigzag[n] = zigzag[n] * abs(zigzag[n])
+                www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
+            
+            self.w0 = nn.Parameter(www.reshape(1, 1, C) + 0.5 + zigzag * 2.5)
+            self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
+            self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
+            
+            # AAA (in-context learning rate)
+            self.a0 = nn.Parameter(torch.zeros(1, 1, C) - 0.19 + zigzag * 0.3 + linear * 0.4)
+            self.a1 = nn.Parameter(torch.zeros(C, D_AAA_LORA))
+            self.a2 = nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1))
+            
+            # Value residual
+            self.v0 = nn.Parameter(torch.zeros(1, 1, C) + 0.73 - linear * 0.4)
+            self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
+            self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
+            
+            # Gate
+            self.g1 = nn.Parameter(torch.zeros(C, D_GATE_LORA))
+            self.g2 = nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1))
+            
+            # Key normalization
+            self.k_k = nn.Parameter(torch.zeros(1, 1, C) + 0.71 - linear * 0.1)
+            self.k_a = nn.Parameter(torch.zeros(1, 1, C) + 1.02)
+            self.r_k = nn.Parameter(torch.zeros(H, N) - 0.04)
+        
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        self.receptance = nn.Linear(C, C, bias=False)
+        self.key = nn.Linear(C, C, bias=False)
+        self.value = nn.Linear(C, C, bias=False)
+        self.output = nn.Linear(C, C, bias=False)
+        self.ln_x = nn.GroupNorm(H, C, eps=64e-5)
+        
+        # 初始化权重
+        with torch.no_grad():
+            self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+            self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
+            self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+            self.output.weight.data.zero_()
+
+    @staticmethod
+    def _report_nonfinite(x: torch.Tensor, name: str, layer_id: int) -> None:
+        if torch.isfinite(x).all():
+            return
+        with torch.no_grad():
+            bad = ~torch.isfinite(x)
+            bad_count = int(bad.sum().item())
+            total = x.numel()
+            finite_x = x[torch.isfinite(x)]
+            if finite_x.numel() > 0:
+                vmin = float(finite_x.min().item())
+                vmax = float(finite_x.max().item())
+            else:
+                vmin = float("nan")
+                vmax = float("nan")
+            print(
+                f"❌ NaNDebug-TimeMix | layer={layer_id} | tensor={name} | "
+                f"bad={bad_count}/{total} | finite_min={vmin:.6e} | finite_max={vmax:.6e}"
+            )
+
+    @staticmethod
+    def _run_torch_fallback(
+        r: torch.Tensor,
+        w_raw: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        n_head: int,
+        head_size: int,
+    ) -> torch.Tensor:
+        r"""纯 PyTorch 的 TimeMix 递推实现，用于 CUDA kernel 异常时的应急路径。"""
+        B, T, C = r.shape
+        H, N = n_head, head_size
+        r = r.view(B, T, H, N).float()
+        w_raw = w_raw.view(B, T, H, N).float()
+        k = k.view(B, T, H, N).float()
+        v = v.view(B, T, H, N).float()
+        a = a.view(B, T, H, N).float()
+        b = b.view(B, T, H, N).float()
+
+        # 与 CUDA kernel 保持同样的 w 变换
+        w = torch.exp(W_SCALE / (1.0 + torch.exp(-w_raw)))
+
+        state = torch.zeros(B, H, N, N, device=r.device, dtype=torch.float32)
+        ys = []
+        for t in range(T):
+            rt = r[:, t]  # [B,H,N]
+            wt = w[:, t]
+            kt = k[:, t]
+            vt = v[:, t]
+            at = a[:, t]
+            bt = b[:, t]
+
+            sa = (state * at.unsqueeze(-2)).sum(dim=-1)  # [B,H,N_i]
+            state = (
+                state * wt.unsqueeze(-2)
+                + sa.unsqueeze(-1) * bt.unsqueeze(-2)
+                + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+            )
+            yt = (state * rt.unsqueeze(-2)).sum(dim=-1)  # [B,H,N_i]
+            ys.append(yt)
+
+        y = torch.stack(ys, dim=1).reshape(B, T, C)
+        return y.to(r.dtype)
+    
+    def forward(
+        self, x: torch.Tensor, v_first: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""forward(x, v_first=None) -> Tuple[Tensor, Tensor, Tensor]
+
+        执行 RWKV-7 TimeMix 主干前向。
+
+        Args:
+          x (Tensor): 形状 ``[B, T, C]``。
+          v_first (Tensor, optional): 首层 value 缓存。Default: ``None``。
+
+        Returns:
+          Tuple[Tensor, Tensor, Tensor]:
+          输出 ``out``、更新后的 ``v_first``、以及中间状态 ``state_representation``。
+        """
+        B, T, C = x.size()
+        H = self.n_head
+        N = self.head_size
+        
+        # Token shift
+        xx = self.time_shift(x) - x
+        
+        xr = x + xx * self.x_r
+        xw = x + xx * self.x_w
+        xk = x + xx * self.x_k
+        xv = x + xx * self.x_v
+        xa = x + xx * self.x_a
+        xg = x + xx * self.x_g
+        
+        r = self.receptance(xr)
+        w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5
+        k = self.key(xk)
+        v = self.value(xv)
+        
+        # Value residual (layer 0 stores, others use)
+        if self.layer_id == 0:
+            v_first = v.clone()
+        else:
+            if v_first is not None:
+                v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+        
+        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+        
+        kk = k * self.k_k
+        kk = F.normalize(kk.view(B, T, H, -1), dim=-1, p=2.0).view(B, T, C)
+        k = k * (1 + (a - 1) * self.k_a)
+        
+        # RWKV-7 动态状态演化
+        use_fallback = os.environ.get("CAMOE_FORCE_TIMEMIX_FALLBACK", "0") == "1"
+        if (not use_fallback) and USE_CUDA and RUN_CUDA_RWKV7 is not None:
+            x_att , sa = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk * a)
+            state_representation = self.ln_sa(sa)
+        else:
+            x_att = self._run_torch_fallback(r, w, k, v, -kk, kk * a, self.n_head, self.head_size)
+            state_representation = x_att.clone() 
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(x_att, "x_att_raw", self.layer_id)
+        if os.environ.get("CAMOE_SANITIZE_TIMEMIX_OUT", "0") == "1":
+            x_att = torch.nan_to_num(x_att, nan=0.0, posinf=0.0, neginf=0.0)
+
+            
+        
+        x_att = self.ln_x(x_att.view(B * T, C)).view(B, T, C)
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(x_att, "x_att_ln", self.layer_id)
+        
+        # Bonus term
+        x_att = x_att + (
+            (r.view(B, T, H, -1) * k.view(B, T, H, -1) * self.r_k)
+            .sum(dim=-1, keepdim=True) * v.view(B, T, H, -1)
+        ).view(B, T, C)
+        
+        out = self.output(x_att * g)
+        if os.environ.get("CAMOE_NAN_DEBUG", "0") == "1":
+            self._report_nonfinite(out, "att_out", self.layer_id)
+        
+        return out, v_first , state_representation
+
+
+# ==================== DeepEmbed + DeepEmbedAttention (from RWKV-7 Goose) ====================
+# 思想：用「词表级」嵌入对 K/V 做逐 token 调制，并增加一条因果 Self-Attention 分支（Q/K/V token-shift + soft-cap）
+
+
+class SharedDeepEmbed(nn.Module):
+    """
+    全模型共享的 DeepEmbed 表。
+    通过跨层共享，将词表参数从 O(n_layer * vocab * dim) 降为 O(vocab * dim)。
+    """
+
+    def __init__(self, vocab_size: int, k_dim: int, v_dim: int):
+        super().__init__()
+        self.k_emb = nn.Embedding(vocab_size, k_dim)
+        self.v_emb = nn.Embedding(vocab_size, v_dim)
+        nn.init.normal_(self.k_emb.weight, std=0.02)
+        nn.init.normal_(self.v_emb.weight, std=0.02)
+
+    def forward(self, idx: torch.Tensor):
+        r"""forward(idx) -> Tuple[Tensor, Tensor]
+
+        Args:
+          idx (Tensor): 形状 ``[B, T]`` 的 token id。
+
+        Returns:
+          Tuple[Tensor, Tensor]: ``k_emb(idx)`` 与 ``v_emb(idx)``。
+        """
+        return self.k_emb(idx), self.v_emb(idx)
+
+
+class DeepEmbedAttention(nn.Module):
+    """
+    DeepEmbedAttention (DEA)：与 TimeMix 并行的因果 Self-Attention 分支。
+    - Q/K/V 经 DeepEmbed（k_emb, v_emb 按 token id 查表）调制
+    - Q/K/V 做 token-shift（与上一位置混合）
+    - 使用 soft-cap: 64 * tanh(scores / 1024) 再 softmax
+    """
+    
+    def __init__(
+        self,
+        n_embd: int,
+        n_layer: int,
+        layer_id: int,
+        head_size: int,
+        vocab_size: int,
+        shared_deep_embed: nn.Module = None,
+        q_dim: int = 256,
+        kv_dim: int = 32,
+        score_scale: float = 1024.0,
+        cap_scale: float = 64.0,
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.n_embd = n_embd
+        self.q_dim = min(q_dim, n_embd)
+        self.kv_dim = min(kv_dim, self.q_dim)
+        self.score_scale = float(score_scale)
+        self.cap_scale = float(cap_scale)
+        C = n_embd
+
+        # RWKV-8 风格低维路径：Q(C->q_dim), K/V(C->kv_dim->up)
+        self.qq = nn.Linear(C, self.q_dim, bias=False)
+        self.k = nn.Linear(C, self.kv_dim, bias=False)
+        self.k_up = nn.Linear(self.kv_dim, self.q_dim, bias=False)
+        self.v = nn.Linear(C, self.kv_dim, bias=False)
+        self.v_up = nn.Linear(self.kv_dim, C, bias=False)
+
+        # DeepEmbed：默认使用跨层共享表；未提供则回退为层内表
+        self.shared_deep_embed = shared_deep_embed
+        if self.shared_deep_embed is None:
+            self.k_emb = nn.Embedding(vocab_size, self.q_dim)
+            self.v_emb = nn.Embedding(vocab_size, C)
+            nn.init.normal_(self.k_emb.weight, std=0.02)
+            nn.init.normal_(self.v_emb.weight, std=0.02)
+        else:
+            self.k_emb = None
+            self.v_emb = None
+        
+        # Token-shift 系数（与 backbone time_shift 类似）
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / max(n_layer, 1))
+            ddd_q = torch.ones(1, 1, self.q_dim)
+            ddd_v = torch.ones(1, 1, C)
+            for i in range(self.q_dim):
+                ddd_q[0, 0, i] = i / max(self.q_dim - 1, 1)
+            for i in range(C):
+                ddd_v[0, 0, i] = i / max(C - 1, 1)
+            self.x_q = nn.Parameter(1.0 - torch.pow(ddd_q, 0.2 * ratio_1_to_almost0))
+            self.x_k = nn.Parameter(1.0 - torch.pow(ddd_q, 0.7 * ratio_1_to_almost0))
+            self.x_v = nn.Parameter(1.0 - torch.pow(ddd_v, 0.7 * ratio_1_to_almost0))
+
+        self.ln_q = nn.LayerNorm(self.q_dim)
+        self.ln_k = nn.LayerNorm(self.q_dim)
+        self.ln_v = nn.LayerNorm(C)
+        
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        
+        with torch.no_grad():
+            self.qq.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
+            self.k.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.k_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
+            self.v.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
+            self.v_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
+    
+    def forward(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        r"""forward(x, idx) -> Tensor
+
+        Args:
+          x (Tensor): 形状 ``[B, T, C]``。
+          idx (Tensor): 形状 ``[B, T]`` 的 token id。
+
+        Returns:
+          Tensor: 形状 ``[B, T, C]`` 的 DEA 分支输出。
+        """
+        B, T, C = x.shape
+        if self.shared_deep_embed is not None:
+            k_emb, v_emb = self.shared_deep_embed(idx)
+        else:
+            k_emb = self.k_emb(idx)
+            v_emb = self.v_emb(idx)
+
+        # Q
+        q = self.qq(x)
+        q_prev = self.time_shift(q) - q
+        q = q + q_prev * self.x_q
+        q = self.ln_q(q)
+        
+        # K: C -> kv_dim -> q_dim，再由 token 级 DeepEmbed 调制
+        k = self.k_up(self.k(x)) * k_emb
+        k_prev = self.time_shift(k) - k
+        k = k + k_prev * self.x_k
+        k = self.ln_k(k)
+        
+        # V: C -> kv_dim -> C，保留 tanh 非线性后调制
+        v = torch.tanh(self.v_up(self.v(x))) * v_emb
+        v_prev = self.time_shift(v) - v
+        v = v + v_prev * self.x_v
+        v = self.ln_v(v)
+        
+        # Causal self-attention with soft-cap
+        scores = (q @ k.transpose(-2, -1)) / self.score_scale
+        scores = self.cap_scale * torch.tanh(scores)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+        )
+        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+        attn = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        out = attn @ v
+        return out
+

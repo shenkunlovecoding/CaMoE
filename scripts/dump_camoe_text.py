@@ -13,7 +13,6 @@ DEFAULT_FILES = [
     "camoe/expert_rwkv.py",
     "camoe/expert_critic.py",
     "camoe/backbone.py",
-    "camoe/config.py",
 ]
 
 
