@@ -1,10 +1,11 @@
-train.py:
+===== FILE: train.py =====
 """CaMoE v22 training script."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from contextlib import nullcontext
 from typing import Iterator
 
@@ -14,8 +15,23 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from camoe.backbone import init_rwkv7_cuda
-from camoe.config import CONFIG_0_1B, CONFIG_0_4B, CaMoEConfig
+from camoe.config import CaMoEConfig, get_config
 from camoe.model import CaMoE_Model
+
+try:
+    import swanlab
+
+    HAS_SWANLAB = True
+except ImportError:
+    HAS_SWANLAB = False
+
+
+PHASE_IDS = {
+    "prewarm": 0.0,
+    "market_warm": 1.0,
+    "critic_warm": 2.0,
+    "full_market": 3.0,
+}
 
 
 def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
@@ -30,14 +46,6 @@ def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
         alpha = (step - s2) / max(config.critic_warmup_steps, 1)
         return "critic_warm", float(alpha)
     return "full_market", 1.0
-
-
-def select_config(scale: str) -> CaMoEConfig:
-    if scale == "0.1b":
-        return CONFIG_0_1B.copy()
-    if scale == "0.4b":
-        return CONFIG_0_4B.copy()
-    raise ValueError(f"Unknown scale: {scale}")
 
 
 def load_training_split(path: str) -> Dataset:
@@ -95,18 +103,19 @@ def save_checkpoint(
     expert_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     step: int,
+    swanlab_run_id: str | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "expert_optimizer": expert_optimizer.state_dict(),
-            "critic_optimizer": critic_optimizer.state_dict(),
-            "step": step,
-            "config": model.get_checkpoint_config(),
-        },
-        path,
-    )
+    payload = {
+        "model": model.state_dict(),
+        "expert_optimizer": expert_optimizer.state_dict(),
+        "critic_optimizer": critic_optimizer.state_dict(),
+        "step": step,
+        "config": model.get_checkpoint_config(),
+    }
+    if swanlab_run_id is not None:
+        payload["swanlab_run_id"] = swanlab_run_id
+    torch.save(payload, path)
 
 
 def main() -> None:
@@ -122,13 +131,22 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--critic_lr", type=float, default=None)
     parser.add_argument("--critic_update_interval", type=int, default=None)
+    parser.add_argument("--use_deep_embed", action="store_true")
+    parser.add_argument("--deep_embed_scale", type=float, default=None)
+    parser.add_argument("--n_rosa_experts", type=int, default=None)
+    parser.add_argument("--rosa_backend", type=str, default=None, choices=["wind"])
+    parser.add_argument("--rosa_bits", type=int, default=None)
+    parser.add_argument("--slim_rosa_heads", type=int, default=None)
+    parser.add_argument("--rosa_truncation_length", type=int, default=None)
+    parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
-    config = select_config(args.scale)
+    config = get_config(args.scale)
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.seq_len is not None:
@@ -141,6 +159,24 @@ def main() -> None:
         config.critic_lr = args.critic_lr
     if args.critic_update_interval is not None:
         config.critic_update_interval = args.critic_update_interval
+    if args.use_deep_embed:
+        config.use_deep_embed = True
+    if args.deep_embed_scale is not None:
+        config.deep_embed_scale = args.deep_embed_scale
+    if args.n_rosa_experts is not None:
+        config.n_rosa_experts = args.n_rosa_experts
+    if args.rosa_backend is not None:
+        config.rosa_backend = args.rosa_backend
+    if args.rosa_bits is not None:
+        config.rosa_bits = args.rosa_bits
+    if args.slim_rosa_heads is not None:
+        config.slim_rosa_heads = args.slim_rosa_heads
+    if args.rosa_truncation_length is not None:
+        config.rosa_truncation_length = args.rosa_truncation_length
+    if args.no_compile:
+        config.enable_compile = False
+    if args.no_gradient_checkpointing:
+        config.enable_gradient_checkpointing = False
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     amp_enabled = bool(args.amp and device.type == "cuda")
@@ -158,6 +194,7 @@ def main() -> None:
     critic_optimizer = torch.optim.Adam(critic_params, lr=config.critic_lr)
 
     start_step = 0
+    checkpoint = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"], strict=True)
@@ -166,6 +203,18 @@ def main() -> None:
         if "critic_optimizer" in checkpoint:
             critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         start_step = int(checkpoint.get("step", 0)) + 1
+
+    swanlab_run_id = None
+    if HAS_SWANLAB:
+        resume_id = checkpoint.get("swanlab_run_id") if isinstance(checkpoint, dict) else None
+        experiment = swanlab.init(
+            project="CaMoE-v22",
+            name=f"pure-market-{args.scale}",
+            config=config.to_dict(),
+            id=resume_id,
+            resume="allow",
+        )
+        swanlab_run_id = experiment.public.run_id
 
     dataset = load_training_split(args.data)
     collate_fn = build_collate_fn(config.seq_len, config.ignore_index)
@@ -181,6 +230,7 @@ def main() -> None:
 
     model.train()
     for step in range(start_step, config.total_steps):
+        step_start = time.time()
         batch = next(train_iter).to(device)
         if batch.size(1) <= 1:
             continue
@@ -217,107 +267,122 @@ def main() -> None:
             critic_loss_value = float(critic_loss.detach().item())
 
         if step % args.log_interval == 0:
-            metrics = model.market_metrics()
+            metrics = model.market_metrics(critic_alpha=critic_alpha)
             entropy_values = [value for key, value in metrics.items() if key.endswith("routing_entropy")]
             routing_entropy = sum(entropy_values) / max(len(entropy_values), 1) if entropy_values else 0.0
+            tps = input_ids.numel() / max(time.time() - step_start, 1e-6)
             print(
                 f"step={step} phase={phase} loss={float(result['loss_scalar'].detach().item()):.4f} "
                 f"critic_loss={critic_loss_value if critic_loss_value is not None else 'n/a'} "
                 f"routing_entropy={routing_entropy:.4f}"
             )
+            if HAS_SWANLAB:
+                logs = {
+                    "Loss/Train_Main": float(result["loss_scalar"].detach().item()),
+                    "Loss/Train_Total": float(result["loss_scalar"].detach().item()),
+                    "Loss/Train_Critic": float(critic_loss_value or 0.0),
+                    "Loss/Aux_Balance": 0.0,
+                    "Speed/TPS": float(tps),
+                    "Phase/ID": PHASE_IDS.get(phase, -1.0),
+                    f"Phase/{phase}": 1.0,
+                    "Market/RoutingEntropy": float(routing_entropy),
+                    "Market/CriticAlpha": float(critic_alpha),
+                    "Model/UseDeepEmbed": float(config.use_deep_embed),
+                    "Runtime/CompileEnabled": float(config.enable_compile),
+                    "Runtime/GradientCheckpointing": float(config.enable_gradient_checkpointing),
+                }
+                logs.update(metrics)
+                swanlab.log(logs, step=step)
 
         if step > 0 and step % args.save_interval == 0:
             checkpoint_path = os.path.join(args.save_dir, f"v22_step{step}.pth")
-            save_checkpoint(checkpoint_path, model, expert_optimizer, critic_optimizer, step)
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                expert_optimizer,
+                critic_optimizer,
+                step,
+                swanlab_run_id=swanlab_run_id,
+            )
 
     final_path = os.path.join(args.save_dir, "v22_final.pth")
-    save_checkpoint(final_path, model, expert_optimizer, critic_optimizer, config.total_steps - 1)
+    save_checkpoint(
+        final_path,
+        model,
+        expert_optimizer,
+        critic_optimizer,
+        config.total_steps - 1,
+        swanlab_run_id=swanlab_run_id,
+    )
 
 
 if __name__ == "__main__":
     main()
 
 
-camoe/model.py:
-"""Pure-market CaMoE model."""
+===== FILE: camoe/model.py =====
+"""Pure-market CaMoE model (v22.1 dual-market)."""
 
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .backbone import RWKV7_TimeMix
+from .backbone import SharedDeepEmbed
 from .block import CaMoE_Block
 from .capital import ExpertCapitalManager
 from .config import CONFIG_0_4B, CaMoEConfig
 from .expert_critic import CriticPair
+from .expert_rosa import ROSAExpert
 from .expert_rwkv import RWKVExpert
+from .expert_timemix import TimeMixExpert
 
 
 class CaMoE_Model(nn.Module):
-    """Stacked RWKV backbone plus pure-market expert blocks."""
+    """Stacked dual-market CaMoE with sequence and FFN auctions per layer."""
 
     def __init__(self, config: CaMoEConfig) -> None:
         super().__init__()
         self.config = config
         self.emb = nn.Embedding(config.vocab_size, config.dim)
-        self.backbone_norms = nn.ModuleList([nn.LayerNorm(config.dim) for _ in range(config.n_layers)])
-        self.backbone_layers = nn.ModuleList(
-            [
-                RWKV7_TimeMix(
-                    n_embd=config.dim,
-                    n_layer=config.n_layers,
-                    layer_id=layer_idx,
-                    head_size=config.head_size,
-                )
-                for layer_idx in range(config.n_layers)
-            ]
-        )
+        self.deep_embed = SharedDeepEmbed(config.vocab_size, config.dim) if config.use_deep_embed else None
 
-        self.blocks = nn.ModuleList()
-        for _layer_idx in range(config.n_layers):
-            experts = [
-                RWKVExpert(
-                    dim=config.dim,
-                    expand=config.ffn_expand,
-                    capital_init=config.expert_capital_init,
-                    capital_floor=config.capital_floor,
-                )
-                for _ in range(config.n_experts)
-            ]
-            critic_pair = CriticPair(
-                dim=config.dim,
-                n_routable=config.n_experts,
-                hidden_dim=config.critic_hidden_dim,
-                capital_init=config.critic_capital_init,
-                capital_floor=config.capital_floor,
-            )
-            self.blocks.append(
-                CaMoE_Block(
-                    experts=experts,
-                    critic_pair=critic_pair,
-                    top_k=config.top_k,
-                    auction_noise=config.auction_noise_std,
-                )
-            )
+        self.blocks = nn.ModuleList([self._build_block(layer_idx) for layer_idx in range(config.n_layers)])
 
         self.ln_out = nn.LayerNorm(config.dim)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
         if config.tie_weights:
             self.lm_head.weight = self.emb.weight
 
-        self.capital_manager = ExpertCapitalManager(
+        self.sequence_capital_manager = (
+            ExpertCapitalManager(
+                n_layers=config.n_layers,
+                n_experts_per_layer=2,
+                capital_init=config.expert_capital_init,
+                ema_decay=config.ema_decay,
+                capital_floor=config.capital_floor,
+                capital_ceiling=config.capital_ceiling,
+                depreciation=config.depreciation,
+            )
+            if config.n_rosa_experts > 0
+            else None
+        )
+        self.ffn_capital_manager = ExpertCapitalManager(
             n_layers=config.n_layers,
             n_experts_per_layer=config.n_experts,
             capital_init=config.expert_capital_init,
             ema_decay=config.ema_decay,
             capital_floor=config.capital_floor,
+            capital_ceiling=config.capital_ceiling,
             depreciation=config.depreciation,
         )
+        self.capital_manager = self.ffn_capital_manager
         self._sync_all_capitals_to_experts()
+        self._maybe_compile_modules()
 
     def forward(
         self,
@@ -329,14 +394,14 @@ class CaMoE_Model(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch, steps = input_ids.shape
         x = self.emb(input_ids)
-        v_first = None
+        if self.deep_embed is not None:
+            x = x + self.config.deep_embed_scale * self.deep_embed(input_ids)
 
-        for layer_idx in range(self.config.n_layers):
-            normed = self.backbone_norms[layer_idx](x)
-            att_out, v_first, _ = self.backbone_layers[layer_idx](normed, v_first)
-            x = x + att_out
-            x = x + self.blocks[layer_idx](
+        v_first = None
+        for block in self.blocks:
+            x, v_first = block(
                 x,
+                v_first=v_first,
                 critic_alpha=critic_alpha,
                 training=training,
                 uniform=uniform,
@@ -353,56 +418,98 @@ class CaMoE_Model(nn.Module):
                 ignore_index=self.config.ignore_index,
                 reduction="none",
             ).view(batch, steps)
+            valid_mask = targets.ne(self.config.ignore_index)
+            valid_count = valid_mask.sum().clamp(min=1)
             result["loss"] = loss
-            result["loss_scalar"] = loss.mean()
+            result["loss_scalar"] = (loss * valid_mask.to(loss.dtype)).sum() / valid_count
+            result["loss_mask"] = valid_mask
 
         return result
 
     def settle_all_layers(
         self,
         token_loss: torch.Tensor,
-    ) -> list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]]:
-        all_profits: list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]] = []
+        token_weight: torch.Tensor | None = None,
+    ) -> list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]]:
+        all_profits: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]] = []
         for layer_idx, block in enumerate(self.blocks):
             cache = block.get_cache()
             if not cache:
                 continue
 
-            profit = self.capital_manager.settle_layer(
-                layer_idx=layer_idx,
-                winners=cache["winners"],
-                weights=cache["weights"],
-                token_loss=token_loss,
-                prices=cache["prices"],
-            )
-            adv_a, adv_b = block.critic_pair.settle_both(cache["x_detached"], profit)
-            self.capital_manager.sync_to_experts(layer_idx, list(block.experts))
+            seq_cache = cache.get("sequence", {})
+            if self.sequence_capital_manager is not None and seq_cache:
+                seq_profit = self.sequence_capital_manager.settle_layer(
+                    layer_idx=layer_idx,
+                    winners=seq_cache["winners"],
+                    token_loss=token_loss,
+                    prices=seq_cache["prices"],
+                    token_weight=token_weight,
+                )
+                seq_critic_profit = seq_profit.clamp(
+                    min=-self.config.critic_profit_clip,
+                    max=self.config.critic_profit_clip,
+                )
+                adv_a, adv_b = block.sequence_critic_pair.settle_both(seq_cache["x_detached"], seq_critic_profit)
+                self.sequence_capital_manager.sync_to_experts(layer_idx, block.sequence_experts())
+                all_profits.append(
+                    {
+                        "layer": layer_idx,
+                        "market": "sequence",
+                        "profit": seq_profit,
+                        "critic_profit": seq_critic_profit,
+                        "adv_a": adv_a,
+                        "adv_b": adv_b,
+                        "cache": seq_cache,
+                    }
+                )
 
-            all_profits.append(
-                {
-                    "layer": layer_idx,
-                    "profit": profit,
-                    "adv_a": adv_a,
-                    "adv_b": adv_b,
-                    "cache": cache,
-                }
-            )
+            ffn_cache = cache.get("ffn", {})
+            if ffn_cache:
+                ffn_profit = self.ffn_capital_manager.settle_layer(
+                    layer_idx=layer_idx,
+                    winners=ffn_cache["winners"],
+                    token_loss=token_loss,
+                    prices=ffn_cache["prices"],
+                    token_weight=token_weight,
+                )
+                ffn_critic_profit = ffn_profit.clamp(
+                    min=-self.config.critic_profit_clip,
+                    max=self.config.critic_profit_clip,
+                )
+                adv_a, adv_b = block.critic_pair.settle_both(ffn_cache["x_detached"], ffn_critic_profit)
+                self.ffn_capital_manager.sync_to_experts(layer_idx, list(block.experts))
+                all_profits.append(
+                    {
+                        "layer": layer_idx,
+                        "market": "ffn",
+                        "profit": ffn_profit,
+                        "critic_profit": ffn_critic_profit,
+                        "adv_a": adv_a,
+                        "adv_b": adv_b,
+                        "cache": ffn_cache,
+                    }
+                )
 
         return all_profits
 
     def compute_critic_loss(
         self,
-        settle_results: list[dict[str, torch.Tensor | int | dict[str, torch.Tensor]]],
+        settle_results: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]],
     ) -> torch.Tensor:
         total_loss: torch.Tensor | None = None
         count = 0
         for result in settle_results:
             layer_idx = int(result["layer"])
+            market = str(result["market"])
             block = self.blocks[layer_idx]
+            critic_pair = block.sequence_critic_pair if market == "sequence" else block.critic_pair
+            if critic_pair is None:
+                continue
             cache = result["cache"]
-            loss = block.critic_pair.reinforce_loss(
+            loss = critic_pair.reinforce_loss(
                 cache["x_detached"],
-                result["profit"].detach(),
+                result["critic_profit"].detach(),
                 result["adv_a"],
                 result["adv_b"],
             )
@@ -413,23 +520,275 @@ class CaMoE_Model(nn.Module):
             return self.emb.weight.new_zeros(())
         return total_loss / max(count, 1)
 
-    def market_metrics(self) -> dict[str, float]:
-        metrics: dict[str, float] = {}
+    def get_market_diagnostics(self) -> list[dict[str, Any]]:
+        diagnostics: list[dict[str, Any]] = []
         for layer_idx, block in enumerate(self.blocks):
-            caps = self.capital_manager.capitals[layer_idx]
-            metrics[f"layer_{layer_idx}/capital_mean"] = float(caps.mean().item())
-            metrics[f"layer_{layer_idx}/capital_min"] = float(caps.min().item())
-            metrics[f"layer_{layer_idx}/capital_max"] = float(caps.max().item())
             cache = block.get_cache()
-            if cache:
-                weights = cache["weights"].float()
-                entropy = -(weights * torch.log(weights + 1e-9)).sum(dim=-1).mean()
-                metrics[f"layer_{layer_idx}/routing_entropy"] = float(entropy.item())
+            if not cache:
+                continue
+
+            seq_cache = cache.get("sequence", {})
+            if self.sequence_capital_manager is not None and seq_cache:
+                diagnostics.append(
+                    {
+                        "layer": layer_idx,
+                        "market": "sequence",
+                        "expert_types": [expert.expert_type for expert in block.sequence_experts()],
+                        "capitals": self.sequence_capital_manager.capitals[layer_idx].detach().clone(),
+                        "cache": {key: value.detach().clone() for key, value in seq_cache.items()},
+                    }
+                )
+
+            ffn_cache = cache.get("ffn", {})
+            if ffn_cache:
+                diagnostics.append(
+                    {
+                        "layer": layer_idx,
+                        "market": "ffn",
+                        "expert_types": [expert.expert_type for expert in block.experts],
+                        "capitals": self.ffn_capital_manager.capitals[layer_idx].detach().clone(),
+                        "cache": {key: value.detach().clone() for key, value in ffn_cache.items()},
+                    }
+                )
+        return diagnostics
+
+    def market_metrics(
+        self,
+        critic_alpha: float = 1.0,
+        token_mask: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        diagnostics = self.get_market_diagnostics()
+        for entry in diagnostics:
+            layer_idx = int(entry["layer"])
+            market = str(entry.get("market", "ffn"))
+            caps = entry["capitals"].float()
+            prefix = f"{market}/layer_{layer_idx}"
+            metrics[f"{prefix}/capital_mean"] = float(caps.mean().item())
+            metrics[f"{prefix}/capital_min"] = float(caps.min().item())
+            metrics[f"{prefix}/capital_max"] = float(caps.max().item())
+            sorted_caps, _ = torch.sort(caps.float())
+            n = sorted_caps.numel()
+            idx = torch.arange(1, n + 1, device=sorted_caps.device, dtype=sorted_caps.dtype)
+            gini = ((2 * idx - n - 1) * sorted_caps).sum() / (n * sorted_caps.sum().clamp(min=1e-6))
+            metrics[f"{prefix}/capital_gini"] = float(gini.item())
+
+            cache = entry["cache"]
+            winners = cache["winners"]
+            bids = cache.get("bids")
+            positions = cache.get("positions")
+            answer_mask = self._resolve_mask(token_mask, winners)
+            active_mask = self._resolve_mask(valid_mask, winners)
+            if active_mask is None:
+                active_mask = torch.ones_like(winners, dtype=torch.float32)
+            answer_mask = answer_mask * active_mask if answer_mask is not None else active_mask
+            prefix_mask = (active_mask - answer_mask).clamp(min=0.0)
+
+            winner_hist_all = self._winner_histogram(winners, caps.numel(), active_mask)
+            winner_hist_answer = self._winner_histogram(winners, caps.numel(), answer_mask)
+            entropy_all = self._entropy(winner_hist_all)
+            entropy_answer = self._entropy(winner_hist_answer)
+            metrics[f"{prefix}/routing_entropy_all"] = float(entropy_all.item())
+            metrics[f"{prefix}/routing_entropy_answer"] = float(entropy_answer.item())
+
+            expert_types = list(entry["expert_types"])
+            type_to_indices: dict[str, list[int]] = {}
+            for expert_idx, expert_type in enumerate(expert_types):
+                type_to_indices.setdefault(expert_type, []).append(expert_idx)
+                metrics[f"{prefix}/expert_{expert_idx}/capital"] = float(caps[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/winner_share_all"] = float(winner_hist_all[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/winner_share_answer"] = float(
+                    winner_hist_answer[expert_idx].item()
+                )
+                if bids is not None:
+                    metrics[f"{prefix}/expert_{expert_idx}/bid_mean_prefix"] = float(
+                        self._masked_mean(bids[:, :, expert_idx], prefix_mask).item()
+                    )
+                    metrics[f"{prefix}/expert_{expert_idx}/bid_mean_answer"] = float(
+                        self._masked_mean(bids[:, :, expert_idx], answer_mask).item()
+                    )
+                if positions is not None:
+                    metrics[f"{prefix}/expert_{expert_idx}/position_mean_answer"] = float(
+                        self._masked_mean(positions[:, :, expert_idx], answer_mask).item()
+                    )
+
+            for expert_type, indices in type_to_indices.items():
+                idx_tensor = torch.tensor(indices, device=caps.device, dtype=torch.long)
+                metrics[f"{prefix}/capital_{expert_type}"] = float(caps.index_select(0, idx_tensor).mean().item())
+                metrics[f"{prefix}/winner_share_answer_{expert_type}"] = float(
+                    winner_hist_answer.index_select(0, idx_tensor).mean().item()
+                )
+                if bids is not None:
+                    type_bids = bids.index_select(-1, idx_tensor)
+                    metrics[f"{prefix}/bid_mean_prefix_{expert_type}"] = float(
+                        self._masked_mean(type_bids.mean(dim=-1), prefix_mask).item()
+                    )
+                    metrics[f"{prefix}/bid_mean_answer_{expert_type}"] = float(
+                        self._masked_mean(type_bids.mean(dim=-1), answer_mask).item()
+                    )
+                if positions is not None:
+                    type_positions = positions.index_select(-1, idx_tensor)
+                    metrics[f"{prefix}/position_mean_answer_{expert_type}"] = float(
+                        self._masked_mean(type_positions.mean(dim=-1), answer_mask).item()
+                    )
+
+            if market == "ffn":
+                metrics[f"layer_{layer_idx}/capital_mean"] = metrics[f"{prefix}/capital_mean"]
+                metrics[f"layer_{layer_idx}/capital_min"] = metrics[f"{prefix}/capital_min"]
+                metrics[f"layer_{layer_idx}/capital_max"] = metrics[f"{prefix}/capital_max"]
+                metrics[f"layer_{layer_idx}/capital_gini"] = metrics[f"{prefix}/capital_gini"]
+                metrics[f"layer_{layer_idx}/routing_entropy"] = metrics[f"{prefix}/routing_entropy_all"]
+                metrics[f"layer_{layer_idx}/routing_entropy_all"] = metrics[f"{prefix}/routing_entropy_all"]
+                metrics[f"layer_{layer_idx}/routing_entropy_answer"] = metrics[f"{prefix}/routing_entropy_answer"]
+                metrics[f"L{layer_idx}/Gini"] = metrics[f"{prefix}/capital_gini"]
+                metrics[f"L{layer_idx}/WinnerFromAdjustedEntropy"] = metrics[f"{prefix}/routing_entropy_answer"]
+                metrics[f"L{layer_idx}/WeightEntropy"] = 0.0
+                metrics[f"L{layer_idx}/MarketAlpha"] = float(critic_alpha)
+                critic_cap = (
+                    self.blocks[layer_idx].critic_pair.critic_a.capital.float()
+                    + self.blocks[layer_idx].critic_pair.critic_b.capital.float()
+                ) / 2.0
+                metrics[f"L{layer_idx}/CriticCap"] = float(critic_cap.item())
+                for expert_idx, _expert_type in enumerate(expert_types):
+                    metrics[f"layer_{layer_idx}/expert_{expert_idx}/capital"] = metrics[
+                        f"{prefix}/expert_{expert_idx}/capital"
+                    ]
+                    metrics[f"layer_{layer_idx}/expert_{expert_idx}/winner_share_answer"] = metrics[
+                        f"{prefix}/expert_{expert_idx}/winner_share_answer"
+                    ]
+                    if f"{prefix}/expert_{expert_idx}/bid_mean_prefix" in metrics:
+                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_prefix"] = metrics[
+                            f"{prefix}/expert_{expert_idx}/bid_mean_prefix"
+                        ]
+                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_answer"] = metrics[
+                            f"{prefix}/expert_{expert_idx}/bid_mean_answer"
+                        ]
+                    if f"{prefix}/expert_{expert_idx}/position_mean_answer" in metrics:
+                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/position_mean_answer"] = metrics[
+                            f"{prefix}/expert_{expert_idx}/position_mean_answer"
+                        ]
+                for expert_type in type_to_indices:
+                    metrics[f"layer_{layer_idx}/capital_{expert_type}"] = metrics[f"{prefix}/capital_{expert_type}"]
+                    metrics[f"layer_{layer_idx}/winner_share_answer_{expert_type}"] = metrics[
+                        f"{prefix}/winner_share_answer_{expert_type}"
+                    ]
+                    if f"{prefix}/bid_mean_prefix_{expert_type}" in metrics:
+                        metrics[f"layer_{layer_idx}/bid_mean_prefix_{expert_type}"] = metrics[
+                            f"{prefix}/bid_mean_prefix_{expert_type}"
+                        ]
+                        metrics[f"layer_{layer_idx}/bid_mean_answer_{expert_type}"] = metrics[
+                            f"{prefix}/bid_mean_answer_{expert_type}"
+                        ]
+                    if f"{prefix}/position_mean_answer_{expert_type}" in metrics:
+                        metrics[f"layer_{layer_idx}/position_mean_answer_{expert_type}"] = metrics[
+                            f"{prefix}/position_mean_answer_{expert_type}"
+                        ]
         return metrics
+
+    def _build_block(self, layer_idx: int) -> CaMoE_Block:
+        timemix_expert = TimeMixExpert(
+            dim=self.config.dim,
+            n_layers=self.config.n_layers,
+            layer_idx=layer_idx,
+            head_size=self.config.head_size,
+            capital_init=self.config.expert_capital_init,
+            capital_floor=self.config.capital_floor,
+            capital_ceiling=self.config.capital_ceiling,
+        )
+        rosa_expert = None
+        sequence_critic_pair = None
+        if self.config.n_rosa_experts > 0:
+            rosa_expert = ROSAExpert(
+                dim=self.config.dim,
+                slim_heads=self.config.effective_slim_rosa_heads,
+                bits_per_symbol=self.config.rosa_bits,
+                backend=self.config.rosa_backend,
+                truncation_length=self.config.rosa_truncation_length,
+                sequence_length=self.config.seq_len,
+                capital_init=self.config.expert_capital_init,
+                capital_floor=self.config.capital_floor,
+                capital_ceiling=self.config.capital_ceiling,
+            )
+            sequence_critic_pair = CriticPair(
+                dim=self.config.dim,
+                n_routable=2,
+                hidden_dim=self.config.critic_hidden_dim,
+                capital_init=self.config.critic_capital_init,
+                capital_floor=self.config.capital_floor,
+                capital_ceiling=self.config.capital_ceiling,
+            )
+
+        ffn_experts = [
+            RWKVExpert(
+                dim=self.config.dim,
+                expand=self.config.ffn_expand,
+                capital_init=self.config.expert_capital_init,
+                capital_floor=self.config.capital_floor,
+                capital_ceiling=self.config.capital_ceiling,
+            )
+            for _ in range(self.config.n_experts)
+        ]
+        ffn_critic_pair = CriticPair(
+            dim=self.config.dim,
+            n_routable=self.config.n_experts,
+            hidden_dim=self.config.critic_hidden_dim,
+            capital_init=self.config.critic_capital_init,
+            capital_floor=self.config.capital_floor,
+            capital_ceiling=self.config.capital_ceiling,
+        )
+        return CaMoE_Block(
+            timemix_expert=timemix_expert,
+            rosa_expert=rosa_expert,
+            ffn_experts=ffn_experts,
+            sequence_critic_pair=sequence_critic_pair,
+            ffn_critic_pair=ffn_critic_pair,
+            sequence_auction_noise=self.config.auction_noise_std,
+            ffn_auction_noise=self.config.auction_noise_std,
+            use_gradient_checkpointing=self.config.enable_gradient_checkpointing,
+        )
+
+    def _maybe_compile_modules(self) -> None:
+        if not self.config.enable_compile or not hasattr(torch, "compile"):
+            return
+
+        compile_mode = self.config.compile_mode
+        self._compile_forward(self.deep_embed, compile_mode)
+        for block in self.blocks:
+            self._compile_forward(block.timemix_expert, compile_mode)
+            self._compile_forward(block.rosa_expert, compile_mode)
+            for expert in block.ffn_experts:
+                self._compile_forward(expert, compile_mode)
+            if block.sequence_critic_pair is not None:
+                self._compile_forward(block.sequence_critic_pair.critic_a.position_net, compile_mode)
+                self._compile_forward(block.sequence_critic_pair.critic_b.position_net, compile_mode)
+            self._compile_forward(block.critic_pair.critic_a.position_net, compile_mode)
+            self._compile_forward(block.critic_pair.critic_b.position_net, compile_mode)
+
+    @staticmethod
+    def _compile_forward(module: nn.Module | None, compile_mode: str) -> None:
+        if module is None:
+            return
+        try:
+            original_forward = module.forward
+            compiled_forward = torch.compile(original_forward, mode=compile_mode)
+
+            def compiled_with_fallback(*args, **kwargs):
+                try:
+                    return compiled_forward(*args, **kwargs)
+                except Exception:
+                    module.forward = original_forward
+                    return original_forward(*args, **kwargs)
+
+            module.forward = compiled_with_fallback
+        except Exception:
+            return
 
     def _sync_all_capitals_to_experts(self) -> None:
         for layer_idx, block in enumerate(self.blocks):
-            self.capital_manager.sync_to_experts(layer_idx, list(block.experts))
+            if self.sequence_capital_manager is not None and block.has_sequence_market:
+                self.sequence_capital_manager.sync_to_experts(layer_idx, block.sequence_experts())
+            self.ffn_capital_manager.sync_to_experts(layer_idx, list(block.experts))
 
     def get_checkpoint_config(self) -> dict:
         return asdict(self.config)
@@ -438,6 +797,36 @@ class CaMoE_Model(nn.Module):
         result = super().load_state_dict(state_dict, strict=strict)
         self._sync_all_capitals_to_experts()
         return result
+
+    @staticmethod
+    def _resolve_mask(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        resolved = torch.as_tensor(mask, device=reference.device, dtype=torch.float32)
+        if resolved.shape != reference.shape:
+            raise ValueError(f"Mask shape {tuple(resolved.shape)} does not match {tuple(reference.shape)}")
+        return resolved
+
+    @staticmethod
+    def _winner_histogram(
+        winners: torch.Tensor,
+        num_experts: int,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        one_hot = F.one_hot(winners, num_classes=num_experts).to(dtype=torch.float32)
+        weighted = one_hot * mask.unsqueeze(-1)
+        denom = mask.sum().clamp(min=1e-8)
+        return weighted.sum(dim=(0, 1)) / denom
+
+    @staticmethod
+    def _entropy(prob: torch.Tensor) -> torch.Tensor:
+        return -(prob * torch.log(prob + 1e-9)).sum()
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = torch.as_tensor(mask, device=values.device, dtype=values.dtype)
+        denom = weights.sum().clamp(min=1e-8)
+        return (values * weights).sum() / denom
 
 
 def load_camoe_checkpoint(
@@ -462,108 +851,217 @@ def load_camoe_checkpoint(
     return model, config, checkpoint
 
 
-camoe/block.py:
-"""Single pure-market CaMoE block."""
+===== FILE: camoe/block.py =====
+"""CaMoE v22.1 block with sequence and FFN markets."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .auction import VickreyAuctionHouse
 from .expert_base import BaseExpert
 from .expert_critic import CriticPair
+from .expert_timemix import TimeMixExpert
+from .expert_rosa import ROSAExpert
 
 
 class CaMoE_Block(nn.Module):
-    """A routable expert pool plus critic pair and zero-parameter auction."""
+    """Single layer with sequence-market routing and FFN-market routing."""
 
     def __init__(
         self,
-        experts: list[BaseExpert],
-        critic_pair: CriticPair,
-        top_k: int = 2,
-        auction_noise: float = 0.01,
+        timemix_expert: TimeMixExpert,
+        rosa_expert: ROSAExpert | None,
+        ffn_experts: list[BaseExpert],
+        sequence_critic_pair: CriticPair | None,
+        ffn_critic_pair: CriticPair,
+        sequence_auction_noise: float = 0.01,
+        ffn_auction_noise: float = 0.01,
+        use_gradient_checkpointing: bool = True,
     ) -> None:
         super().__init__()
-        self.experts = nn.ModuleList(experts)
-        self.critic_pair = critic_pair
-        self.n_routable = len(experts)
-        self.top_k = int(top_k)
-        self.auction = VickreyAuctionHouse(top_k=self.top_k, noise_std=auction_noise)
-        self._cache: dict[str, torch.Tensor] = {}
+        self.timemix_expert = timemix_expert
+        self.rosa_expert = rosa_expert
+        self.ffn_experts = nn.ModuleList(ffn_experts)
+        self.experts = self.ffn_experts
+        self.sequence_critic_pair = sequence_critic_pair
+        self.critic_pair = ffn_critic_pair
+        self.n_routable = len(ffn_experts)
+        self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.sequence_auction = VickreyAuctionHouse(noise_std=sequence_auction_noise)
+        self.ffn_auction = VickreyAuctionHouse(noise_std=ffn_auction_noise)
+        self._cache: dict[str, dict[str, torch.Tensor]] = {}
+
+    @property
+    def has_sequence_market(self) -> bool:
+        return self.rosa_expert is not None and self.sequence_critic_pair is not None
 
     def forward(
         self,
         x: torch.Tensor,
+        v_first: torch.Tensor | None = None,
         critic_alpha: float = 1.0,
         training: bool = True,
         uniform: bool = False,
         **expert_ctx,
-    ) -> torch.Tensor:
-        if uniform:
-            self._cache = {}
-            return self._forward_uniform(x, **expert_ctx)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_out, next_v_first, seq_cache = self._forward_sequence_market(
+            x,
+            v_first=v_first,
+            critic_alpha=critic_alpha,
+            training=training,
+            uniform=uniform,
+            **expert_ctx,
+        )
+        x = x + seq_out
 
-        positions = self.critic_pair.get_positions(x.detach()).detach()
-        expert_caps = torch.stack([expert.capital for expert in self.experts]).to(x.device)
-        winners, weights, prices = self.auction(
+        ffn_out, ffn_cache = self._forward_ffn_market(
+            x,
+            critic_alpha=critic_alpha,
+            training=training,
+            uniform=uniform,
+            **expert_ctx,
+        )
+        x = x + ffn_out
+
+        self._cache = {
+            "sequence": seq_cache,
+            "ffn": ffn_cache,
+        }
+        return x, next_v_first
+
+    def _forward_sequence_market(
+        self,
+        x: torch.Tensor,
+        v_first: torch.Tensor | None,
+        critic_alpha: float,
+        training: bool,
+        uniform: bool,
+        **expert_ctx,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        timemix_out, next_v_first, timemix_state = self.timemix_expert(
+            x,
+            v_first=v_first,
+            **expert_ctx,
+        )
+        if not self.has_sequence_market:
+            return timemix_out, next_v_first, {}
+
+        assert self.rosa_expert is not None
+        rosa_out = self.rosa_expert(x, **expert_ctx)
+        if uniform:
+            return (timemix_out + rosa_out) * 0.5, next_v_first, {}
+
+        positions = self.sequence_critic_pair.get_positions(x.detach()).detach()
+        expert_caps = torch.stack([self.timemix_expert.capital, self.rosa_expert.capital]).to(x.device)
+        winners, prices, bids = self.sequence_auction(
             expert_caps,
             positions,
             critic_alpha=critic_alpha,
             training=training,
         )
-        output = self._dispatch(x, winners, weights, **expert_ctx)
-
-        self._cache = {
+        winner_mask = winners.unsqueeze(-1).eq(1)
+        output = torch.where(winner_mask, rosa_out, timemix_out)
+        cache = {
             "winners": winners.detach(),
-            "weights": weights.detach(),
             "prices": prices.detach(),
+            "bids": bids.detach(),
             "positions": positions.detach(),
+            "expert_capitals": expert_caps.detach(),
+            "x_detached": x.detach(),
+            "timemix_state": timemix_state.detach(),
+        }
+        return output, next_v_first, cache
+
+    def _forward_ffn_market(
+        self,
+        x: torch.Tensor,
+        critic_alpha: float,
+        training: bool,
+        uniform: bool,
+        **expert_ctx,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if uniform:
+            return self._forward_uniform_ffn(x, **expert_ctx), {}
+
+        positions = self.critic_pair.get_positions(x.detach()).detach()
+        expert_caps = torch.stack([expert.capital for expert in self.ffn_experts]).to(x.device)
+        winners, prices, bids = self.ffn_auction(
+            expert_caps,
+            positions,
+            critic_alpha=critic_alpha,
+            training=training,
+        )
+        if self.training and self.use_gradient_checkpointing:
+            output = checkpoint(
+                self._dispatch_ffn,
+                x,
+                winners,
+                use_reentrant=False,
+                **expert_ctx,
+            )
+        else:
+            output = self._dispatch_ffn(x, winners, **expert_ctx)
+
+        cache = {
+            "winners": winners.detach(),
+            "prices": prices.detach(),
+            "bids": bids.detach(),
+            "positions": positions.detach(),
+            "expert_capitals": expert_caps.detach(),
             "x_detached": x.detach(),
         }
-        return output
+        return output, cache
 
-    def _dispatch(
+    def _dispatch_ffn(
         self,
         x: torch.Tensor,
         winners: torch.Tensor,
-        weights: torch.Tensor,
         **expert_ctx,
     ) -> torch.Tensor:
-        output = torch.zeros_like(x)
+        batch, steps, dim = x.shape
+        flat_x = x.reshape(batch * steps, dim)
+        flat_winners = winners.reshape(batch * steps)
+        output = flat_x.new_zeros(flat_x.shape)
 
-        for expert_idx, expert in enumerate(self.experts):
-            match = winners == expert_idx
-            selected = match.any(dim=-1)
-            if not bool(selected.any()):
+        for expert_idx, expert in enumerate(self.ffn_experts):
+            token_indices = (flat_winners == expert_idx).nonzero(as_tuple=False).squeeze(-1)
+            if token_indices.numel() == 0:
                 continue
 
-            expert_weight = (weights * match.to(weights.dtype)).sum(dim=-1)
-            expert_out = expert(x, **expert_ctx)
-            compensated = (
-                expert_out * expert_weight.unsqueeze(-1)
-                + expert_out.detach() * (1.0 / self.top_k - expert_weight).unsqueeze(-1)
-            )
-            output = output + compensated * selected.unsqueeze(-1).to(x.dtype)
+            if expert.supports_sparse_dispatch:
+                expert_input = flat_x.index_select(0, token_indices)
+                expert_out = expert(expert_input, **expert_ctx)
+                output.index_copy_(0, token_indices, expert_out)
+                continue
 
-        return output
+            full_out = expert(x, **expert_ctx).reshape(batch * steps, dim)
+            selected_out = full_out.index_select(0, token_indices)
+            output.index_copy_(0, token_indices, selected_out)
 
-    def _forward_uniform(self, x: torch.Tensor, **expert_ctx) -> torch.Tensor:
-        outputs = [expert(x, **expert_ctx) for expert in self.experts]
+        return output.view(batch, steps, dim)
+
+    def _forward_uniform_ffn(self, x: torch.Tensor, **expert_ctx) -> torch.Tensor:
+        outputs = [expert(x, **expert_ctx) for expert in self.ffn_experts]
         return sum(outputs) / len(outputs)
 
-    def get_cache(self) -> dict[str, torch.Tensor]:
+    def sequence_experts(self) -> list[BaseExpert]:
+        if self.rosa_expert is None:
+            return [self.timemix_expert]
+        return [self.timemix_expert, self.rosa_expert]
+
+    def get_cache(self) -> dict[str, dict[str, torch.Tensor]]:
         return self._cache
 
 
-camoe/auction.py:
+===== FILE: camoe/auction.py =====
 """Zero-parameter Vickrey auction used for routing."""
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 
 class VickreyAuctionHouse:
@@ -572,10 +1070,11 @@ class VickreyAuctionHouse:
 
     Bid definition:
       bid = expert_capital + critic_alpha * critic_position
+
+    v22 now uses strict Top-1 winner-takes-all routing.
     """
 
-    def __init__(self, top_k: int = 2, noise_std: float = 0.01) -> None:
-        self.top_k = int(top_k)
+    def __init__(self, noise_std: float = 0.01) -> None:
         self.noise_std = float(noise_std)
 
     def __call__(
@@ -586,9 +1085,9 @@ class VickreyAuctionHouse:
         training: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n_experts = expert_capitals.numel()
-        if self.top_k >= n_experts:
+        if n_experts < 2:
             raise ValueError(
-                f"top_k={self.top_k} requires at least top_k + 1 experts, got {n_experts}."
+                f"winner-takes-all Vickrey auction requires at least 2 experts, got {n_experts}."
             )
 
         with torch.no_grad():
@@ -597,16 +1096,14 @@ class VickreyAuctionHouse:
             if training and self.noise_std > 0:
                 bids = bids + torch.randn_like(bids) * self.noise_std
 
-            top_vals, top_idxs = bids.topk(self.top_k + 1, dim=-1)
-            winners = top_idxs[:, :, : self.top_k]
-            winner_bids = top_vals[:, :, : self.top_k]
-            prices = top_vals[:, :, self.top_k]
-            weights = F.softmax(winner_bids, dim=-1)
+            top_vals, top_idxs = bids.topk(2, dim=-1)
+            winners = top_idxs[:, :, 0]
+            prices = top_vals[:, :, 1]
 
-        return winners, weights, prices
+        return winners, prices, bids
 
 
-camoe/capital.py:
+===== FILE: camoe/capital.py =====
 """Vectorized capital accounting for pure-market CaMoE."""
 
 from __future__ import annotations
@@ -630,6 +1127,7 @@ class ExpertCapitalManager(nn.Module):
         capital_init: float = 1.0,
         ema_decay: float = 0.95,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
         depreciation: float = 0.001,
     ) -> None:
         super().__init__()
@@ -637,6 +1135,7 @@ class ExpertCapitalManager(nn.Module):
         self.n_experts = int(n_experts_per_layer)
         self.ema_decay = float(ema_decay)
         self.capital_floor = float(capital_floor)
+        self.capital_ceiling = None if capital_ceiling is None else float(capital_ceiling)
         self.depreciation = float(depreciation)
 
         self.register_buffer(
@@ -652,9 +1151,9 @@ class ExpertCapitalManager(nn.Module):
         self,
         layer_idx: int,
         winners: torch.Tensor,
-        weights: torch.Tensor,
         token_loss: torch.Tensor,
         prices: torch.Tensor,
+        token_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Settle one layer and return expert profits shaped ``[E]``.
@@ -663,14 +1162,18 @@ class ExpertCapitalManager(nn.Module):
         caps = self.capitals[layer_idx]
         dtype = token_loss.dtype
 
-        one_hot = F.one_hot(winners, num_classes=num_experts).to(dtype=dtype)
-        winner_mask = (one_hot * weights.unsqueeze(-1)).sum(dim=2)
+        winner_mask = F.one_hot(winners, num_classes=num_experts).to(dtype=dtype)
+        if token_weight is not None:
+            token_weight = torch.as_tensor(token_weight, device=token_loss.device, dtype=dtype)
+            weighted_mask = winner_mask * token_weight.unsqueeze(-1)
+        else:
+            weighted_mask = winner_mask
 
-        total_weight = winner_mask.sum(dim=(0, 1)).clamp(min=1e-8)
-        weighted_loss = (token_loss.unsqueeze(-1) * winner_mask).sum(dim=(0, 1))
-        mean_loss = weighted_loss / total_weight
+        total_selected = weighted_mask.sum(dim=(0, 1)).clamp(min=1e-8)
+        weighted_loss = (token_loss.unsqueeze(-1) * weighted_mask).sum(dim=(0, 1))
+        mean_loss = weighted_loss / total_selected
 
-        active = total_weight > 0.01
+        active = total_selected > 0.01
         running = self.running_loss[layer_idx].to(dtype=dtype)
         bootstrap = active & running.abs().lt(1e-8)
         baseline = torch.where(bootstrap, mean_loss, running)
@@ -688,13 +1191,20 @@ class ExpertCapitalManager(nn.Module):
         self.running_loss[layer_idx].copy_(updated_running.to(self.running_loss.dtype))
 
         revenue = relative * caps.to(dtype=dtype)
-        total_tokens = max(token_loss.shape[0] * token_loss.shape[1], 1)
-        cost = (prices.unsqueeze(-1) * winner_mask).sum(dim=(0, 1)) / float(total_tokens)
+        if token_weight is None:
+            total_tokens = max(token_loss.shape[0] * token_loss.shape[1], 1)
+            cost = (prices.unsqueeze(-1) * winner_mask).sum(dim=(0, 1)) / float(total_tokens)
+        else:
+            cost = (prices.unsqueeze(-1) * weighted_mask).sum(dim=(0, 1)) / total_selected
         cost = torch.where(active, cost, torch.zeros_like(cost))
         depreciation = self.depreciation * caps.to(dtype=dtype)
         profit = revenue - cost - depreciation
 
-        next_caps = (caps.to(dtype=dtype) + profit).clamp(min=self.capital_floor)
+        next_caps = caps.to(dtype=dtype) + profit
+        if self.capital_ceiling is None:
+            next_caps = next_caps.clamp(min=self.capital_floor)
+        else:
+            next_caps = next_caps.clamp(min=self.capital_floor, max=self.capital_ceiling)
         self.capitals[layer_idx].copy_(next_caps.to(self.capitals.dtype))
         return profit.detach()
 
@@ -707,7 +1217,7 @@ class ExpertCapitalManager(nn.Module):
             self.capitals[layer_idx, expert_idx] = float(expert.capital.item())
 
 
-camoe/expert_base.py:
+===== FILE: camoe/expert_base.py =====
 """Abstract base class for all CaMoE experts."""
 
 from __future__ import annotations
@@ -726,10 +1236,16 @@ class BaseExpert(nn.Module, ABC):
     entrypoint. Concrete subclasses implement the actual forward pass.
     """
 
-    def __init__(self, capital_init: float = 1.0, capital_floor: float = 0.01) -> None:
+    def __init__(
+        self,
+        capital_init: float = 1.0,
+        capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
+    ) -> None:
         super().__init__()
         self.register_buffer("capital", torch.tensor(float(capital_init), dtype=torch.float32))
         self.capital_floor = float(capital_floor)
+        self.capital_ceiling = None if capital_ceiling is None else float(capital_ceiling)
 
     @abstractmethod
     def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
@@ -745,6 +1261,11 @@ class BaseExpert(nn.Module, ABC):
         """Whether this expert participates in the token auction."""
         return True
 
+    @property
+    def supports_sparse_dispatch(self) -> bool:
+        """Whether the block can pass only the winner token subset to this expert."""
+        return True
+
     def settle(self, profit: torch.Tensor) -> None:
         """Update capital with a scalar profit signal."""
         value = torch.as_tensor(
@@ -752,11 +1273,194 @@ class BaseExpert(nn.Module, ABC):
             device=self.capital.device,
             dtype=self.capital.dtype,
         )
-        updated = (self.capital + value).clamp(min=self.capital_floor)
+        updated = self.capital + value
+        if self.capital_ceiling is None:
+            updated = updated.clamp(min=self.capital_floor)
+        else:
+            updated = updated.clamp(min=self.capital_floor, max=self.capital_ceiling)
         self.capital.copy_(updated)
 
 
-camoe/expert_rwkv.py:
+===== FILE: camoe/expert_timemix.py =====
+"""Sequence-market TimeMix expert wrapper."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .backbone import RWKV7_TimeMix
+from .expert_base import BaseExpert
+
+
+class TimeMixExpert(BaseExpert):
+    """RWKV-7 TimeMix wrapped as a market participant with capital."""
+
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int,
+        layer_idx: int,
+        head_size: int,
+        capital_init: float = 1.0,
+        capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
+    ) -> None:
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
+        self.input_norm = nn.LayerNorm(dim)
+        self.timemix = RWKV7_TimeMix(
+            n_embd=dim,
+            n_layer=n_layers,
+            layer_id=layer_idx,
+            head_size=head_size,
+        )
+
+    @property
+    def expert_type(self) -> str:
+        return "timemix"
+
+    @property
+    def supports_sparse_dispatch(self) -> bool:
+        return False
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        v_first: torch.Tensor | None = None,
+        **ctx,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del ctx
+        normed = self.input_norm(x)
+        return self.timemix(normed, v_first)
+
+
+===== FILE: camoe/expert_rosa.py =====
+"""Slim Wind ROSA sequence expert."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .expert_base import BaseExpert
+from .wind_rosa_adapter import wind_rosa
+
+
+class ROSAExpert(BaseExpert):
+    """
+    Sequence-aware Slim Wind ROSA expert.
+
+    The expert always processes the full sequence to preserve suffix state.
+    Routing only decides which output tokens are kept.
+
+    The symbolic branch is intentionally narrow: ``slim_heads * bits_per_symbol``
+    can be far smaller than ``dim``. Wind ROSA returns discrete symbols which are
+    decoded into the default signed bit semantics:
+    matched ``1 -> +e``, matched ``0 -> -e``, unmatched ``-> 0``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        slim_heads: int,
+        bits_per_symbol: int = 8,
+        backend: str = "wind",
+        truncation_length: int = 8,
+        sequence_length: int | None = None,
+        capital_init: float = 1.0,
+        capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
+    ) -> None:
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
+        if backend != "wind":
+            raise ValueError(f"ROSAExpert only supports backend='wind', got {backend!r}")
+        if slim_heads <= 0 or bits_per_symbol <= 0:
+            raise ValueError("ROSA expert requires positive slim_heads and bits_per_symbol.")
+
+        self.dim = int(dim)
+        self.slim_heads = int(slim_heads)
+        self.bits_per_symbol = int(bits_per_symbol)
+        self.truncation_length = int(truncation_length)
+        self.sequence_length = None if sequence_length is None else int(sequence_length)
+        hidden = self.slim_heads * self.bits_per_symbol
+
+        self.norm = nn.LayerNorm(dim)
+        self.wq = nn.Linear(dim, hidden, bias=False)
+        self.wk = nn.Linear(dim, hidden, bias=False)
+        self.wv = nn.Linear(dim, hidden, bias=False)
+        self.symbol_scale = nn.Parameter(torch.ones(1, 1, hidden))
+        self.wo = nn.Linear(hidden, dim, bias=False)
+
+    @property
+    def expert_type(self) -> str:
+        return "rosa"
+
+    @property
+    def supports_sparse_dispatch(self) -> bool:
+        return False
+
+    def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
+        del ctx
+        squeezed = False
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeezed = True
+        if x.dim() != 3:
+            raise ValueError(f"ROSAExpert expected [B, T, D] or [N, D], got {tuple(x.shape)}")
+
+        _batch, steps, _dim = x.shape
+        h = self.norm(x)
+        q = self.wq(h)
+        k = self.wk(h)
+        v = self.wv(h)
+
+        padded_q, padded_k, padded_v = self._maybe_pad_sequence(q, k, v)
+        out = wind_rosa(
+            padded_q,
+            padded_k,
+            padded_v,
+            bits_per_symbol=self.bits_per_symbol,
+            truncation_length=self.truncation_length,
+        )
+        out = out[:, :steps, :]
+        out = out.to(h.dtype) * self.symbol_scale.to(h.dtype)
+        out = self.wo(out)
+        if squeezed:
+            return out.squeeze(0)
+        return out
+
+    def _maybe_pad_sequence(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        steps = q.size(1)
+        if self.sequence_length is None:
+            return q, k, v
+        if steps > self.sequence_length:
+            raise ValueError(
+                f"ROSAExpert received T={steps}, which exceeds configured sequence_length={self.sequence_length}."
+            )
+        if steps == self.sequence_length:
+            return q, k, v
+        pad = self.sequence_length - steps
+        return (
+            nn.functional.pad(q, (0, 0, 0, pad)),
+            nn.functional.pad(k, (0, 0, 0, pad)),
+            nn.functional.pad(v, (0, 0, 0, pad)),
+        )
+
+
+===== FILE: camoe/expert_rwkv.py =====
 """RWKV feed-forward expert used by the pure market router."""
 
 from __future__ import annotations
@@ -781,8 +1485,13 @@ class RWKVExpert(BaseExpert):
         expand: int = 4,
         capital_init: float = 1.0,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
     ) -> None:
-        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
         hidden = int(dim * expand)
         self.norm = nn.LayerNorm(dim)
         self.w1 = nn.Linear(dim, hidden, bias=False)
@@ -799,7 +1508,7 @@ class RWKVExpert(BaseExpert):
         return self.w2(self.act(self.w1(h)))
 
 
-camoe/expert_critic.py:
+===== FILE: camoe/expert_critic.py =====
 """Critic experts for pure-market CaMoE."""
 
 from __future__ import annotations
@@ -825,8 +1534,13 @@ class CriticExpert(BaseExpert):
         hidden_dim: int | None = None,
         capital_init: float = 0.5,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
     ) -> None:
-        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
         hidden_dim = hidden_dim or max(1, dim // 4)
         self.n_routable = int(n_routable)
         self.position_net = nn.Sequential(
@@ -903,7 +1617,7 @@ class CriticPair(nn.Module):
         return -(adv_a * pnl_a + adv_b * pnl_b)
 
 
-camoe/backbone.py:
+===== FILE: camoe/backbone.py =====
 """
 RWKV-7 TimeMix Backbone (Turbo Edition with ClampW Kernel)
 支持 BF16 原生加速
@@ -1279,152 +1993,291 @@ class RWKV7_TimeMix(nn.Module):
         return out, v_first , state_representation
 
 
-# ==================== DeepEmbed + DeepEmbedAttention (from RWKV-7 Goose) ====================
-# 思想：用「词表级」嵌入对 K/V 做逐 token 调制，并增加一条因果 Self-Attention 分支（Q/K/V token-shift + soft-cap）
-
-
 class SharedDeepEmbed(nn.Module):
     """
-    全模型共享的 DeepEmbed 表。
-    通过跨层共享，将词表参数从 O(n_layer * vocab * dim) 降为 O(vocab * dim)。
+    Optional token-level DeepEmbed branch.
+
+    This is intentionally separate from TimeMix. It provides an additional
+    learned token embedding that can be added to the main embedding stream,
+    while keeping the backbone free of the removed legacy attention branch.
     """
 
-    def __init__(self, vocab_size: int, k_dim: int, v_dim: int):
+    def __init__(self, vocab_size: int, dim: int):
         super().__init__()
-        self.k_emb = nn.Embedding(vocab_size, k_dim)
-        self.v_emb = nn.Embedding(vocab_size, v_dim)
-        nn.init.normal_(self.k_emb.weight, std=0.02)
-        nn.init.normal_(self.v_emb.weight, std=0.02)
+        self.embedding = nn.Embedding(vocab_size, dim)
+        self.norm = nn.LayerNorm(dim)
+        nn.init.normal_(self.embedding.weight, std=0.02)
 
-    def forward(self, idx: torch.Tensor):
-        r"""forward(idx) -> Tuple[Tensor, Tensor]
-
-        Args:
-          idx (Tensor): 形状 ``[B, T]`` 的 token id。
-
-        Returns:
-          Tuple[Tensor, Tensor]: ``k_emb(idx)`` 与 ``v_emb(idx)``。
-        """
-        return self.k_emb(idx), self.v_emb(idx)
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.embedding(idx))
 
 
-class DeepEmbedAttention(nn.Module):
-    """
-    DeepEmbedAttention (DEA)：与 TimeMix 并行的因果 Self-Attention 分支。
-    - Q/K/V 经 DeepEmbed（k_emb, v_emb 按 token id 查表）调制
-    - Q/K/V 做 token-shift（与上一位置混合）
-    - 使用 soft-cap: 64 * tanh(scores / 1024) 再 softmax
-    """
-    
-    def __init__(
-        self,
-        n_embd: int,
-        n_layer: int,
-        layer_id: int,
-        head_size: int,
-        vocab_size: int,
-        shared_deep_embed: nn.Module = None,
-        q_dim: int = 256,
-        kv_dim: int = 32,
-        score_scale: float = 1024.0,
-        cap_scale: float = 64.0,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.n_embd = n_embd
-        self.q_dim = min(q_dim, n_embd)
-        self.kv_dim = min(kv_dim, self.q_dim)
-        self.score_scale = float(score_scale)
-        self.cap_scale = float(cap_scale)
-        C = n_embd
+===== FILE: camoe/wind_rosa_adapter.py =====
+"""Local adapter for the vendored Slim Wind ROSA kernel."""
 
-        # RWKV-8 风格低维路径：Q(C->q_dim), K/V(C->kv_dim->up)
-        self.qq = nn.Linear(C, self.q_dim, bias=False)
-        self.k = nn.Linear(C, self.kv_dim, bias=False)
-        self.k_up = nn.Linear(self.kv_dim, self.q_dim, bias=False)
-        self.v = nn.Linear(C, self.kv_dim, bias=False)
-        self.v_up = nn.Linear(self.kv_dim, C, bias=False)
+from __future__ import annotations
 
-        # DeepEmbed：默认使用跨层共享表；未提供则回退为层内表
-        self.shared_deep_embed = shared_deep_embed
-        if self.shared_deep_embed is None:
-            self.k_emb = nn.Embedding(vocab_size, self.q_dim)
-            self.v_emb = nn.Embedding(vocab_size, C)
-            nn.init.normal_(self.k_emb.weight, std=0.02)
-            nn.init.normal_(self.v_emb.weight, std=0.02)
-        else:
-            self.k_emb = None
-            self.v_emb = None
-        
-        # Token-shift 系数（与 backbone time_shift 类似）
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / max(n_layer, 1))
-            ddd_q = torch.ones(1, 1, self.q_dim)
-            ddd_v = torch.ones(1, 1, C)
-            for i in range(self.q_dim):
-                ddd_q[0, 0, i] = i / max(self.q_dim - 1, 1)
-            for i in range(C):
-                ddd_v[0, 0, i] = i / max(C - 1, 1)
-            self.x_q = nn.Parameter(1.0 - torch.pow(ddd_q, 0.2 * ratio_1_to_almost0))
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd_q, 0.7 * ratio_1_to_almost0))
-            self.x_v = nn.Parameter(1.0 - torch.pow(ddd_v, 0.7 * ratio_1_to_almost0))
+from dataclasses import dataclass
+from pathlib import Path
 
-        self.ln_q = nn.LayerNorm(self.q_dim)
-        self.ln_k = nn.LayerNorm(self.q_dim)
-        self.ln_v = nn.LayerNorm(C)
-        
-        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        
-        with torch.no_grad():
-            self.qq.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
-            self.k.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
-            self.k_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
-            self.v.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
-            self.v_up.weight.data.uniform_(-0.05 / (self.kv_dim ** 0.5), 0.05 / (self.kv_dim ** 0.5))
-    
-    def forward(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        r"""forward(x, idx) -> Tensor
+import torch
+from torch.utils.cpp_extension import load
 
-        Args:
-          x (Tensor): 形状 ``[B, T, C]``。
-          idx (Tensor): 形状 ``[B, T]`` 的 token id。
 
-        Returns:
-          Tensor: 形状 ``[B, T, C]`` 的 DEA 分支输出。
-        """
-        B, T, C = x.shape
-        if self.shared_deep_embed is not None:
-            k_emb, v_emb = self.shared_deep_embed(idx)
-        else:
-            k_emb = self.k_emb(idx)
-            v_emb = self.v_emb(idx)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+WIND_ROSA_DIR = ROOT_DIR / "wind_rosa"
 
-        # Q
-        q = self.qq(x)
-        q_prev = self.time_shift(q) - q
-        q = q + q_prev * self.x_q
-        q = self.ln_q(q)
-        
-        # K: C -> kv_dim -> q_dim，再由 token 级 DeepEmbed 调制
-        k = self.k_up(self.k(x)) * k_emb
-        k_prev = self.time_shift(k) - k
-        k = k + k_prev * self.x_k
-        k = self.ln_k(k)
-        
-        # V: C -> kv_dim -> C，保留 tanh 非线性后调制
-        v = torch.tanh(self.v_up(self.v(x))) * v_emb
-        v_prev = self.time_shift(v) - v
-        v = v + v_prev * self.x_v
-        v = self.ln_v(v)
-        
-        # Causal self-attention with soft-cap
-        scores = (q @ k.transpose(-2, -1)) / self.score_scale
-        scores = self.cap_scale * torch.tanh(scores)
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+
+@dataclass(frozen=True)
+class WindRosaSpec:
+    sequence_length: int
+    bits_per_symbol: int
+    truncation_length: int
+
+
+_LOADED_SPEC: WindRosaSpec | None = None
+_SCRATCH: torch.Tensor | None = None
+_LOAD_WARNING_EMITTED = False
+_CUDA_KERNEL_DISABLED = False
+
+
+def _pack_bits(x: torch.Tensor, bits_per_symbol: int) -> torch.Tensor:
+    batch, steps, hidden = x.shape
+    if hidden % bits_per_symbol != 0:
+        raise ValueError(
+            f"Hidden size {hidden} must be divisible by bits_per_symbol={bits_per_symbol}."
         )
-        scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
-        attn = F.softmax(scores.float(), dim=-1).to(scores.dtype)
-        out = attn @ v
-        return out
+    heads = hidden // bits_per_symbol
+    shifts = torch.arange(bits_per_symbol, device=x.device, dtype=torch.int64)
+    bits = (x.view(batch, steps, heads, bits_per_symbol) > 0).to(torch.int64)
+    return (bits << shifts.view(1, 1, 1, -1)).sum(dim=-1)
+
+
+def _decode_signed_symbols(
+    packed_symbols: torch.Tensor,
+    match_length: torch.Tensor,
+    bits_per_symbol: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    shifts = torch.arange(bits_per_symbol, device=packed_symbols.device, dtype=torch.int64)
+    bits = ((packed_symbols.unsqueeze(-1) >> shifts.view(1, 1, 1, -1)) & 1).to(dtype)
+    signed = bits.mul(2).sub(1)
+    matched = (match_length > 0).unsqueeze(-1).to(dtype)
+    return (signed * matched).reshape(
+        packed_symbols.size(0),
+        packed_symbols.size(1),
+        packed_symbols.size(2) * bits_per_symbol,
+    )
+
+
+def _expand_match_mask(match_length: torch.Tensor, bits_per_symbol: int) -> torch.Tensor:
+    return (match_length > 0).unsqueeze(-1).expand(*match_length.shape, bits_per_symbol)
+
+
+def _reshape_match_mask(match_length: torch.Tensor, bits_per_symbol: int, dtype: torch.dtype) -> torch.Tensor:
+    return _expand_match_mask(match_length, bits_per_symbol).reshape(
+        match_length.size(0),
+        match_length.size(1),
+        match_length.size(2) * bits_per_symbol,
+    ).to(dtype)
+
+
+def _reshape_signed_grad(
+    grad_output: torch.Tensor,
+    match_length: torch.Tensor,
+    bits_per_symbol: int,
+) -> torch.Tensor:
+    grad_bits = 2.0 * grad_output.float() * _reshape_match_mask(match_length, bits_per_symbol, torch.float32)
+    batch, steps, hidden = grad_bits.shape
+    heads = hidden // bits_per_symbol
+    return grad_bits.view(batch, steps, heads, bits_per_symbol).transpose(1, 2).contiguous()
+
+
+def _unpack_bits(x: torch.Tensor, bits_per_symbol: int, dtype: torch.dtype) -> torch.Tensor:
+    shifts = torch.arange(bits_per_symbol, device=x.device, dtype=torch.int64)
+    bits = ((x.unsqueeze(-1) >> shifts.view(1, 1, 1, -1)) & 1).to(dtype)
+    return bits.reshape(x.size(0), x.size(1), x.size(2) * bits_per_symbol)
+
+
+def _naive_symbolic_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    truncation_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, steps, heads = q.shape
+    y = torch.empty_like(v)
+    match_length = torch.zeros(batch, steps, heads, dtype=torch.int32)
+    q_list = q.tolist()
+    k_list = k.tolist()
+    v_list = v.tolist()
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            q_head = [step[head_idx] for step in q_list[batch_idx]]
+            k_head = [step[head_idx] for step in k_list[batch_idx]]
+            v_head = [step[head_idx] for step in v_list[batch_idx]]
+            for step_idx in range(steps):
+                best_value = v_head[step_idx]
+                best_length = 0
+                max_length = min(truncation_length, step_idx + 1)
+                for width in range(max_length, 0, -1):
+                    target = tuple(q_head[step_idx + 1 - width : step_idx + 1])
+                    found = False
+                    for start in range(step_idx - width, -1, -1):
+                        if tuple(k_head[start : start + width]) == target:
+                            best_value = v_head[start + width]
+                            best_length = width
+                            found = True
+                            break
+                    if found:
+                        break
+                y[batch_idx, step_idx, head_idx] = best_value
+                match_length[batch_idx, step_idx, head_idx] = best_length
+    return y, match_length
+
+
+class _WindRosaFallback(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bits_per_symbol: int,
+        truncation_length: int,
+    ) -> torch.Tensor:
+        del ctx
+        packed_q = _pack_bits(q.float(), bits_per_symbol).cpu()
+        packed_k = _pack_bits(k.float(), bits_per_symbol).cpu()
+        packed_v = _pack_bits(v.float(), bits_per_symbol).cpu()
+        packed_y, match_length = _naive_symbolic_forward(packed_q, packed_k, packed_v, truncation_length)
+        return _decode_signed_symbols(
+            packed_y.to(q.device),
+            match_length.to(q.device),
+            bits_per_symbol,
+            q.dtype,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        del ctx
+        return (
+            torch.zeros_like(grad_output),
+            torch.zeros_like(grad_output),
+            torch.zeros_like(grad_output),
+            None,
+            None,
+        )
+
+
+class _WindRosaFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        assert _LOADED_SPEC is not None
+        bits_per_symbol = _LOADED_SPEC.bits_per_symbol
+        batch, steps, hidden = q.shape
+        if steps != _LOADED_SPEC.sequence_length:
+            raise ValueError(
+                f"Wind ROSA kernel expects T={_LOADED_SPEC.sequence_length}, got T={steps}."
+            )
+        if hidden % bits_per_symbol != 0:
+            raise ValueError(
+                f"Hidden size {hidden} must be divisible by bits_per_symbol={bits_per_symbol}."
+            )
+        if not all(t.is_cuda for t in (q, k, v)):
+            raise ValueError("Wind ROSA CUDA kernel requires CUDA tensors.")
+
+        heads = hidden // bits_per_symbol
+        packed_q = _pack_bits(q.float(), bits_per_symbol).to(torch.uint8).transpose(1, 2).contiguous()
+        packed_k = _pack_bits(k.float(), bits_per_symbol).to(torch.uint8).transpose(1, 2).contiguous()
+        packed_v = _pack_bits(v.float(), bits_per_symbol).to(torch.uint8).transpose(1, 2).contiguous()
+
+        global _SCRATCH
+        scratch_bytes = int(torch.ops.wind_rosa.scratch_size(batch, heads))
+        if _SCRATCH is None or _SCRATCH.numel() < scratch_bytes or _SCRATCH.device != q.device:
+            _SCRATCH = torch.empty(scratch_bytes, dtype=torch.uint8, device=q.device)
+
+        y = torch.empty_like(packed_v)
+        match_length = torch.empty(batch, heads, steps, dtype=torch.int32, device=q.device)
+        torch.ops.wind_rosa.forward_with_match_len(packed_q, packed_k, packed_v, y, match_length, _SCRATCH)
+        ctx.save_for_backward(packed_q, packed_k, packed_v, match_length)
+        return _decode_signed_symbols(y.transpose(1, 2), match_length.transpose(1, 2), bits_per_symbol, torch.float32)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        packed_q, packed_k, packed_v, match_length = ctx.saved_tensors
+        assert _LOADED_SPEC is not None
+        bits_per_symbol = _LOADED_SPEC.bits_per_symbol
+        batch, heads, steps = packed_q.shape
+        grad = _reshape_signed_grad(grad_output, match_length.transpose(1, 2), bits_per_symbol)
+        dq = torch.empty(batch, heads, steps, bits_per_symbol, device=packed_q.device, dtype=torch.float32)
+        dk = torch.empty_like(dq)
+        dv = torch.empty_like(dq)
+        assert _SCRATCH is not None
+        torch.ops.wind_rosa.backward(packed_q, packed_k, packed_v, grad, dq, dk, dv, _SCRATCH)
+        return (
+            dq.transpose(1, 2).reshape(batch, steps, heads * bits_per_symbol),
+            dk.transpose(1, 2).reshape(batch, steps, heads * bits_per_symbol),
+            dv.transpose(1, 2).reshape(batch, steps, heads * bits_per_symbol),
+        )
+
+
+def load_wind_rosa(spec: WindRosaSpec) -> None:
+    global _LOADED_SPEC
+    if _LOADED_SPEC is not None:
+        if _LOADED_SPEC != spec:
+            raise ValueError(
+                f"Wind ROSA kernel already loaded with {_LOADED_SPEC}, requested {spec}. "
+                "Use one fixed (T, C, K) per process."
+            )
+        return
+    if not WIND_ROSA_DIR.exists():
+        raise FileNotFoundError(f"Vendored wind_rosa directory not found: {WIND_ROSA_DIR}")
+
+    load(
+        name=f"camoe_wind_rosa_t{spec.sequence_length}_c{spec.bits_per_symbol}_k{spec.truncation_length}",
+        sources=[
+            str(WIND_ROSA_DIR / "wind_rosa.cu"),
+            str(WIND_ROSA_DIR / "wind_rosa.cpp"),
+        ],
+        is_python_module=False,
+        verbose=False,
+        extra_cuda_cflags=[
+            f"-D_T_={spec.sequence_length}",
+            f"-D_C_={spec.bits_per_symbol}",
+            f"-D_K_={spec.truncation_length}",
+        ],
+    )
+    _LOADED_SPEC = spec
+
+
+def wind_rosa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    bits_per_symbol: int,
+    truncation_length: int,
+) -> torch.Tensor:
+    global _LOAD_WARNING_EMITTED, _CUDA_KERNEL_DISABLED
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError(f"wind_rosa expects matching q/k/v shapes, got {q.shape}, {k.shape}, {v.shape}")
+
+    if q.device.type != "cuda" or _CUDA_KERNEL_DISABLED:
+        return _WindRosaFallback.apply(q, k, v, bits_per_symbol, truncation_length)
+
+    spec = WindRosaSpec(
+        sequence_length=q.size(1),
+        bits_per_symbol=bits_per_symbol,
+        truncation_length=truncation_length,
+    )
+    try:
+        load_wind_rosa(spec)
+        return _WindRosaFunction.apply(q.float(), k.float(), v.float())
+    except Exception as exc:
+        _CUDA_KERNEL_DISABLED = True
+        if not _LOAD_WARNING_EMITTED:
+            print(f"Warning: Wind ROSA CUDA kernel unavailable, falling back to symbolic CPU path: {exc}")
+            _LOAD_WARNING_EMITTED = True
+        return _WindRosaFallback.apply(q, k, v, bits_per_symbol, truncation_length)
 

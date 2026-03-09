@@ -22,8 +22,13 @@ class RWKVExpert(BaseExpert):
         expand: int = 4,
         capital_init: float = 1.0,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
     ) -> None:
-        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
         hidden = int(dim * expand)
         self.norm = nn.LayerNorm(dim)
         self.w1 = nn.Linear(dim, hidden, bias=False)

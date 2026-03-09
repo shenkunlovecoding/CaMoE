@@ -10,15 +10,20 @@ DEFAULT_FILES = [
     "camoe/auction.py",
     "camoe/capital.py",
     "camoe/expert_base.py",
+    "camoe/expert_deepembed.py",
+    "camoe/expert_fractal.py",
+    "camoe/expert_timemix.py",
+    "camoe/expert_rosa.py",
     "camoe/expert_rwkv.py",
     "camoe/expert_critic.py",
     "camoe/backbone.py",
+    "camoe/wind_rosa_adapter.py",
 ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Dump CaMoE core modules and train.py as plain text for AI context."
+        description="Dump CaMoE v22.1 core modules and experiment entrypoints as plain text."
     )
     parser.add_argument(
         "--output",
@@ -44,11 +49,11 @@ def main() -> None:
     for rel in file_list:
         path = repo_root / rel
         if not path.exists():
-            chunks.append(f"{rel}:\n[FILE NOT FOUND]\n")
+            chunks.append(f"===== FILE: {rel} =====\n[FILE NOT FOUND]\n")
             continue
 
         content = path.read_text(encoding="utf-8", errors="replace")
-        chunks.append(f"{rel}:\n{content}\n")
+        chunks.append(f"===== FILE: {rel} =====\n{content}\n")
 
     output_text = "\n".join(chunks)
 

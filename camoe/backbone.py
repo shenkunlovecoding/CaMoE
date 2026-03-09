@@ -372,21 +372,3 @@ class RWKV7_TimeMix(nn.Module):
         
         return out, v_first , state_representation
 
-
-class SharedDeepEmbed(nn.Module):
-    """
-    Optional token-level DeepEmbed branch.
-
-    This is intentionally separate from TimeMix. It provides an additional
-    learned token embedding that can be added to the main embedding stream,
-    while keeping the backbone free of the removed legacy attention branch.
-    """
-
-    def __init__(self, vocab_size: int, dim: int):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, dim)
-        self.norm = nn.LayerNorm(dim)
-        nn.init.normal_(self.embedding.weight, std=0.02)
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.embedding(idx))

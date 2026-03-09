@@ -21,6 +21,7 @@ class ExpertCapitalManager(nn.Module):
         capital_init: float = 1.0,
         ema_decay: float = 0.95,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
         depreciation: float = 0.001,
     ) -> None:
         super().__init__()
@@ -28,6 +29,7 @@ class ExpertCapitalManager(nn.Module):
         self.n_experts = int(n_experts_per_layer)
         self.ema_decay = float(ema_decay)
         self.capital_floor = float(capital_floor)
+        self.capital_ceiling = None if capital_ceiling is None else float(capital_ceiling)
         self.depreciation = float(depreciation)
 
         self.register_buffer(
@@ -43,9 +45,9 @@ class ExpertCapitalManager(nn.Module):
         self,
         layer_idx: int,
         winners: torch.Tensor,
-        weights: torch.Tensor,
         token_loss: torch.Tensor,
         prices: torch.Tensor,
+        token_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Settle one layer and return expert profits shaped ``[E]``.
@@ -54,14 +56,18 @@ class ExpertCapitalManager(nn.Module):
         caps = self.capitals[layer_idx]
         dtype = token_loss.dtype
 
-        one_hot = F.one_hot(winners, num_classes=num_experts).to(dtype=dtype)
-        winner_mask = (one_hot * weights.unsqueeze(-1)).sum(dim=2)
+        winner_mask = F.one_hot(winners, num_classes=num_experts).to(dtype=dtype)
+        if token_weight is not None:
+            token_weight = torch.as_tensor(token_weight, device=token_loss.device, dtype=dtype)
+            weighted_mask = winner_mask * token_weight.unsqueeze(-1)
+        else:
+            weighted_mask = winner_mask
 
-        total_weight = winner_mask.sum(dim=(0, 1)).clamp(min=1e-8)
-        weighted_loss = (token_loss.unsqueeze(-1) * winner_mask).sum(dim=(0, 1))
-        mean_loss = weighted_loss / total_weight
+        total_selected = weighted_mask.sum(dim=(0, 1)).clamp(min=1e-8)
+        weighted_loss = (token_loss.unsqueeze(-1) * weighted_mask).sum(dim=(0, 1))
+        mean_loss = weighted_loss / total_selected
 
-        active = total_weight > 0.01
+        active = total_selected > 0.01
         running = self.running_loss[layer_idx].to(dtype=dtype)
         bootstrap = active & running.abs().lt(1e-8)
         baseline = torch.where(bootstrap, mean_loss, running)
@@ -79,13 +85,20 @@ class ExpertCapitalManager(nn.Module):
         self.running_loss[layer_idx].copy_(updated_running.to(self.running_loss.dtype))
 
         revenue = relative * caps.to(dtype=dtype)
-        total_tokens = max(token_loss.shape[0] * token_loss.shape[1], 1)
-        cost = (prices.unsqueeze(-1) * winner_mask).sum(dim=(0, 1)) / float(total_tokens)
+        if token_weight is None:
+            total_tokens = max(token_loss.shape[0] * token_loss.shape[1], 1)
+            cost = (prices.unsqueeze(-1) * winner_mask).sum(dim=(0, 1)) / float(total_tokens)
+        else:
+            cost = (prices.unsqueeze(-1) * weighted_mask).sum(dim=(0, 1)) / total_selected
         cost = torch.where(active, cost, torch.zeros_like(cost))
         depreciation = self.depreciation * caps.to(dtype=dtype)
         profit = revenue - cost - depreciation
 
-        next_caps = (caps.to(dtype=dtype) + profit).clamp(min=self.capital_floor)
+        next_caps = caps.to(dtype=dtype) + profit
+        if self.capital_ceiling is None:
+            next_caps = next_caps.clamp(min=self.capital_floor)
+        else:
+            next_caps = next_caps.clamp(min=self.capital_floor, max=self.capital_ceiling)
         self.capitals[layer_idx].copy_(next_caps.to(self.capitals.dtype))
         return profit.detach()
 

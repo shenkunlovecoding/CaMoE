@@ -17,7 +17,6 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 
 from camoe.backbone import init_rwkv7_cuda
-from camoe.config import get_config
 from camoe.model import load_camoe_checkpoint
 
 try:
@@ -55,13 +54,8 @@ class CaMoELM(LM):
         super().__init__()
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
         self._batch_size = int(batch_size)
-        self._config_hint = get_config(scale)
-        self.model, self.config, _ = load_camoe_checkpoint(
-            pretrained,
-            device=self._device,
-            config=self._config_hint,
-            strict=True,
-        )
+        del scale
+        self.model, self.config, _ = load_camoe_checkpoint(pretrained, device=self._device, config=None, strict=True)
         self.model.eval()
         self._max_length = self.config.seq_len
         self._eot_token_id = 0

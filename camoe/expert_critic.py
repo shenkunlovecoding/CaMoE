@@ -23,8 +23,13 @@ class CriticExpert(BaseExpert):
         hidden_dim: int | None = None,
         capital_init: float = 0.5,
         capital_floor: float = 0.01,
+        capital_ceiling: float | None = None,
     ) -> None:
-        super().__init__(capital_init=capital_init, capital_floor=capital_floor)
+        super().__init__(
+            capital_init=capital_init,
+            capital_floor=capital_floor,
+            capital_ceiling=capital_ceiling,
+        )
         hidden_dim = hidden_dim or max(1, dim // 4)
         self.n_routable = int(n_routable)
         self.position_net = nn.Sequential(

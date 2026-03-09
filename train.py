@@ -14,7 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from camoe.backbone import init_rwkv7_cuda
-from camoe.config import CONFIG_0_1B, CONFIG_0_4B, CaMoEConfig
+from camoe.config import CaMoEConfig, get_config
 from camoe.model import CaMoE_Model
 
 try:
@@ -45,14 +45,6 @@ def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
         alpha = (step - s2) / max(config.critic_warmup_steps, 1)
         return "critic_warm", float(alpha)
     return "full_market", 1.0
-
-
-def select_config(scale: str) -> CaMoEConfig:
-    if scale == "0.1b":
-        return CONFIG_0_1B.copy()
-    if scale == "0.4b":
-        return CONFIG_0_4B.copy()
-    raise ValueError(f"Unknown scale: {scale}")
 
 
 def load_training_split(path: str) -> Dataset:
@@ -138,8 +130,16 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--critic_lr", type=float, default=None)
     parser.add_argument("--critic_update_interval", type=int, default=None)
-    parser.add_argument("--use_deep_embed", action="store_true")
-    parser.add_argument("--deep_embed_scale", type=float, default=None)
+    parser.add_argument("--n_deepembed_experts", type=int, default=None)
+    parser.add_argument("--n_slim_deepembed_experts", type=int, default=None)
+    parser.add_argument("--deepembed_mode", type=str, default=None, choices=["1x", "4x"])
+    parser.add_argument("--deepembed_expand", type=int, default=None)
+    parser.add_argument("--slim_deepembed_rank", type=int, default=None)
+    parser.add_argument("--n_rosa_experts", type=int, default=None)
+    parser.add_argument("--rosa_backend", type=str, default=None, choices=["wind"])
+    parser.add_argument("--rosa_bits", type=int, default=None)
+    parser.add_argument("--slim_rosa_heads", type=int, default=None)
+    parser.add_argument("--rosa_truncation_length", type=int, default=None)
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--log_interval", type=int, default=100)
@@ -148,7 +148,7 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
-    config = select_config(args.scale)
+    config = get_config(args.scale)
     if args.batch_size is not None:
         config.batch_size = args.batch_size
     if args.seq_len is not None:
@@ -161,10 +161,26 @@ def main() -> None:
         config.critic_lr = args.critic_lr
     if args.critic_update_interval is not None:
         config.critic_update_interval = args.critic_update_interval
-    if args.use_deep_embed:
-        config.use_deep_embed = True
-    if args.deep_embed_scale is not None:
-        config.deep_embed_scale = args.deep_embed_scale
+    if args.n_deepembed_experts is not None:
+        config.n_deepembed_experts = args.n_deepembed_experts
+    if args.n_slim_deepembed_experts is not None:
+        config.n_slim_deepembed_experts = args.n_slim_deepembed_experts
+    if args.deepembed_mode is not None:
+        config.deepembed_mode = args.deepembed_mode
+    if args.deepembed_expand is not None:
+        config.deepembed_expand = args.deepembed_expand
+    if args.slim_deepembed_rank is not None:
+        config.slim_deepembed_rank = args.slim_deepembed_rank
+    if args.n_rosa_experts is not None:
+        config.n_rosa_experts = args.n_rosa_experts
+    if args.rosa_backend is not None:
+        config.rosa_backend = args.rosa_backend
+    if args.rosa_bits is not None:
+        config.rosa_bits = args.rosa_bits
+    if args.slim_rosa_heads is not None:
+        config.slim_rosa_heads = args.slim_rosa_heads
+    if args.rosa_truncation_length is not None:
+        config.rosa_truncation_length = args.rosa_truncation_length
     if args.no_compile:
         config.enable_compile = False
     if args.no_gradient_checkpointing:
@@ -279,7 +295,6 @@ def main() -> None:
                     f"Phase/{phase}": 1.0,
                     "Market/RoutingEntropy": float(routing_entropy),
                     "Market/CriticAlpha": float(critic_alpha),
-                    "Model/UseDeepEmbed": float(config.use_deep_embed),
                     "Runtime/CompileEnabled": float(config.enable_compile),
                     "Runtime/GradientCheckpointing": float(config.enable_gradient_checkpointing),
                 }

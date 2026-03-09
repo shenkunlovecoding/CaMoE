@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 
 from camoe.backbone import init_rwkv7_cuda
-from camoe.config import get_config
 from camoe.model import load_camoe_checkpoint
 
 try:
@@ -69,12 +68,7 @@ def main() -> None:
 
     init_rwkv7_cuda()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model, config, _ = load_camoe_checkpoint(
-        args.checkpoint,
-        device=device,
-        config=get_config(args.scale),
-        strict=True,
-    )
+    model, config, _ = load_camoe_checkpoint(args.checkpoint, device=device, config=None, strict=True)
     model.eval()
     tokenizer = load_tokenizer(args.vocab_file)
 
@@ -106,8 +100,8 @@ def main() -> None:
                 cache = block.get_cache()
                 if not cache:
                     continue
-                winners = cache["winners"][0, -1]
-                usage[layer_idx].update(int(index) for index in winners.tolist())
+                winner = int(cache["winners"][0, -1].item())
+                usage[layer_idx].update([winner])
 
             sequence = torch.cat([sequence, next_token], dim=1)
             if int(next_token.item()) == 0:

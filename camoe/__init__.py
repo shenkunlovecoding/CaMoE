@@ -6,8 +6,13 @@ from .capital import ExpertCapitalManager
 from .config import CONFIG_0_1B, CONFIG_0_4B, VERSION, CaMoEConfig, get_config
 from .expert_base import BaseExpert
 from .expert_critic import CriticExpert, CriticPair
+from .expert_deepembed import DeepEmbedExpert, SlimDeepEmbedExpert
+from .expert_fractal import ExpansionRightLedger, FractalBlueprint, FractalCaMoEPlaceholder
+from .expert_rosa import ROSAExpert
 from .expert_rwkv import RWKVExpert
+from .expert_timemix import TimeMixExpert
 from .model import CaMoE_Model, load_camoe_checkpoint
+from .reverse_baselines import SingleROSAReverseModel, SingleRWKVReverseModel
 
 __all__ = [
     "BaseExpert",
@@ -18,8 +23,17 @@ __all__ = [
     "CONFIG_0_4B",
     "CriticExpert",
     "CriticPair",
+    "DeepEmbedExpert",
+    "ExpansionRightLedger",
     "ExpertCapitalManager",
+    "FractalBlueprint",
+    "FractalCaMoEPlaceholder",
+    "ROSAExpert",
     "RWKVExpert",
+    "SlimDeepEmbedExpert",
+    "TimeMixExpert",
+    "SingleROSAReverseModel",
+    "SingleRWKVReverseModel",
     "VERSION",
     "VickreyAuctionHouse",
     "get_config",
