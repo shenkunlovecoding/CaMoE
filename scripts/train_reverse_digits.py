@@ -21,7 +21,11 @@ if str(ROOT) not in sys.path:
 
 from camoe.config import CaMoEConfig
 from camoe.model import CaMoE_Model
-from camoe.reverse_baselines import SingleROSAReverseModel, SingleRWKVReverseModel
+from camoe.reverse_baselines import (
+    BaselinePureRosaRWKVFFN,
+    BaselineTimeMixRosaRWKVFFN,
+    BaselineTimeMixRWKVFFN,
+)
 
 try:
     import swanlab
@@ -40,6 +44,15 @@ PARITY_ID = 16
 CUMSUM_ID = 17
 MAJORITY_ID = 18
 COUNT_ID = 19
+PATTERN_ID = 20
+DELAY_ID = 21
+REPEAT_ID = 22
+RUNMAX_ID = 23
+THRESH_ID = 24
+BRACKET_ID = 25
+MASK_ID = 26
+LPAREN_ID = 27
+RPAREN_ID = 28
 IGNORE_INDEX = -100
 TOKEN_NAMES = {
     PAD_ID: "[PAD]",
@@ -52,12 +65,39 @@ TOKEN_NAMES = {
     CUMSUM_ID: "[CUMSUM]",
     MAJORITY_ID: "[MAJORITY]",
     COUNT_ID: "[COUNT]",
+    PATTERN_ID: "[PATTERN]",
+    DELAY_ID: "[DELAY]",
+    REPEAT_ID: "[REPEAT]",
+    RUNMAX_ID: "[RUNMAX]",
+    THRESH_ID: "[THRESH]",
+    BRACKET_ID: "[BRACKET]",
+    MASK_ID: "[MASK]",
+    LPAREN_ID: "(",
+    RPAREN_ID: ")",
 }
 TOKEN_NAMES.update({4 + value: str(value) for value in range(10)})
-ANSI_BLUE = "\033[94m"
-ANSI_RED = "\033[91m"
 ANSI_YELLOW = "\033[93m"
 ANSI_RESET = "\033[0m"
+EXPERT_ANSI_PALETTE = [
+    "\033[94m",
+    "\033[91m",
+    "\033[92m",
+    "\033[95m",
+    "\033[96m",
+    "\033[33m",
+    "\033[37m",
+    "\033[90m",
+]
+EXPERT_HTML_PALETTE = [
+    "#62b0ff",
+    "#ff6b6b",
+    "#55d88a",
+    "#ff9ff3",
+    "#63e6be",
+    "#ffd166",
+    "#f8f9fa",
+    "#adb5bd",
+]
 OPERATION_NAME_BY_ID = {
     0: "reverse_digits",
     1: "copy_digits",
@@ -65,6 +105,12 @@ OPERATION_NAME_BY_ID = {
     3: "cumsum_mod10",
     4: "majority_vote",
     5: "count_ones",
+    6: "pattern_complete",
+    7: "delayed_copy",
+    8: "first_repeat",
+    9: "running_max",
+    10: "sum_threshold",
+    11: "bracket_depth",
 }
 
 
@@ -205,23 +251,63 @@ def split_optim_params(model: CaMoE_Model) -> tuple[list[torch.nn.Parameter], li
     return expert_params, critic_params
 
 
+def _compute_market_alpha(step: int, config: CaMoEConfig) -> float:
+    start = config.prewarm_steps + config.market_warmup_steps
+    ramp = max(config.critic_warmup_steps, 1)
+    progress = min(max((step - start) / ramp, 0.0), 1.0)
+    return float(config.market_alpha_start + (config.market_alpha_end - config.market_alpha_start) * progress)
+
+
+def _compute_ste_temperature(step: int, config: CaMoEConfig) -> float:
+    if step < config.prewarm_steps:
+        return float(config.ste_temperature_start)
+    offset = step - config.prewarm_steps
+    total = max(config.ste_anneal_steps, 0)
+    mid = max(config.ste_midpoint_steps, 0)
+    if total == 0:
+        return float(config.ste_temperature_end)
+    if offset <= mid:
+        if mid == 0:
+            return float(config.ste_temperature_mid)
+        p = offset / mid
+        return float(config.ste_temperature_start + (config.ste_temperature_mid - config.ste_temperature_start) * p)
+    if offset <= total:
+        tail = total - mid
+        if tail <= 0:
+            return float(config.ste_temperature_end)
+        p = (offset - mid) / tail
+        return float(config.ste_temperature_mid + (config.ste_temperature_end - config.ste_temperature_mid) * p)
+    return float(config.ste_temperature_end)
+
+
 def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
     s1 = config.prewarm_steps
     s2 = s1 + config.market_warmup_steps
     s3 = s2 + config.critic_warmup_steps
     if step < s1:
-        return "prewarm", 0.0
+        return "prewarm", float(config.market_alpha_start)
     if step < s2:
-        return "market_warm", 0.0
+        return "market_warm", float(config.market_alpha_start)
     if step < s3:
-        alpha = (step - s2) / max(config.critic_warmup_steps, 1)
-        return "critic_warm", float(alpha)
-    return "full_market", 1.0
+        return "critic_warm", _compute_market_alpha(step, config)
+    return "full_market", float(config.market_alpha_end)
 
 
-def build_config(args: argparse.Namespace) -> CaMoEConfig:
+def infer_max_sequence_length(*datasets: Dataset) -> int:
+    max_length = 0
+    for dataset in datasets:
+        if len(dataset) == 0:
+            continue
+        max_length = max(
+            max_length,
+            max(len(token_ids) for token_ids in dataset["input_ids"]),
+        )
+    return max_length
+
+
+def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
     return CaMoEConfig(
-        vocab_size=20,
+        vocab_size=29,
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -239,6 +325,14 @@ def build_config(args: argparse.Namespace) -> CaMoEConfig:
         deepembed_expand=args.deepembed_expand,
         slim_deepembed_rank=args.slim_deepembed_rank,
         auction_noise_std=args.auction_noise_std,
+        market_alpha_start=args.market_alpha_start,
+        market_alpha_end=args.market_alpha_end,
+        routing_ste=bool(args.routing_ste),
+        ste_temperature_start=args.ste_temperature_start,
+        ste_temperature_mid=args.ste_temperature_mid,
+        ste_temperature_end=args.ste_temperature_end,
+        ste_midpoint_steps=args.ste_midpoint_steps,
+        ste_anneal_steps=args.ste_anneal_steps,
         enable_compile=False,
         enable_gradient_checkpointing=False,
         expert_capital_init=1.0,
@@ -250,12 +344,15 @@ def build_config(args: argparse.Namespace) -> CaMoEConfig:
         critic_hidden_dim=None,
         critic_update_interval=args.critic_update_interval,
         critic_lr=args.critic_lr,
+        routing_entropy_reg=args.routing_entropy_reg,
+        critic_shadow_prewarm=bool(args.critic_shadow_prewarm),
+        critic_shadow_market=bool(args.critic_shadow_market),
         prewarm_steps=args.prewarm_steps,
         market_warmup_steps=args.market_warmup_steps,
         critic_warmup_steps=args.critic_warmup_steps,
         lr=args.lr,
         batch_size=args.batch_size,
-        seq_len=pad_to_chunk(2 * args.max_eval_length + 3),
+        seq_len=seq_len,
         total_steps=args.steps,
         grad_clip=1.0,
         ignore_index=IGNORE_INDEX,
@@ -268,6 +365,7 @@ def evaluate_model(
     device: torch.device,
     model_kind: str,
     critic_alpha: float = 1.0,
+    ste_temperature: float = 0.3,
     uniform: bool = False,
 ) -> dict[str, float]:
     model.eval()
@@ -289,6 +387,7 @@ def evaluate_model(
                     batch["input_ids"],
                     batch["targets"],
                     critic_alpha=critic_alpha,
+                    ste_temperature=ste_temperature,
                     training=False,
                     uniform=uniform,
                 )
@@ -354,10 +453,30 @@ def decode_display_stream(input_ids: torch.Tensor, targets: torch.Tensor) -> lis
     return tokens
 
 
-def colorize_token(token: str, winner: int, is_answer: bool) -> str:
+def build_expert_styles(expert_types: list[str]) -> list[dict[str, str]]:
+    styles = []
+    total_counts: dict[str, int] = {}
+    for expert_type in expert_types:
+        total_counts[expert_type] = total_counts.get(expert_type, 0) + 1
+    type_counts: dict[str, int] = {}
+    for expert_idx, expert_type in enumerate(expert_types):
+        count = type_counts.get(expert_type, 0)
+        type_counts[expert_type] = count + 1
+        suffix = f"#{count}" if total_counts[expert_type] > 1 else ""
+        styles.append(
+            {
+                "label": f"{expert_type}{suffix}",
+                "ansi": EXPERT_ANSI_PALETTE[expert_idx % len(EXPERT_ANSI_PALETTE)],
+                "html": EXPERT_HTML_PALETTE[expert_idx % len(EXPERT_HTML_PALETTE)],
+            }
+        )
+    return styles
+
+
+def colorize_token(token: str, winner: int, is_answer: bool, expert_styles: list[dict[str, str]]) -> str:
     if token == "[SEP]":
         return f"{ANSI_YELLOW}{token}{ANSI_RESET}"
-    color = ANSI_RED if winner == 1 else ANSI_BLUE
+    color = expert_styles[winner]["ansi"] if 0 <= winner < len(expert_styles) else ANSI_RESET
     decorated = f"{token}" if is_answer else f"({token})"
     return f"{color}{decorated}{ANSI_RESET}"
 
@@ -369,6 +488,7 @@ def render_route_preview(
     step: int,
     task_name: str,
     critic_alpha: float,
+    ste_temperature: float,
     uniform: bool,
 ) -> None:
     model.eval()
@@ -377,6 +497,7 @@ def render_route_preview(
             batch["input_ids"],
             batch["targets"],
             critic_alpha=critic_alpha,
+            ste_temperature=ste_temperature,
             training=False,
             uniform=uniform,
         )
@@ -387,9 +508,13 @@ def render_route_preview(
     html_parts = [
         "<html><head><meta charset='utf-8'><style>",
         "body{font-family:Consolas,monospace;background:#111;color:#eee;padding:16px;}",
-        ".rwkv{color:#62b0ff;} .rosa{color:#ff6b6b;} .sep{color:#ffd166;font-weight:700;}",
-        ".answer{font-weight:700;} .prefix{opacity:0.65;} table{border-collapse:collapse;margin:12px 0;}",
-        "td,th{border:1px solid #333;padding:4px 6px;} h2,h3{margin:16px 0 8px;}",
+        ".sep{color:#ffd166;font-weight:700;} .answer{font-weight:700;} .prefix{opacity:0.65;}",
+        ".token{display:inline-block;margin:0 2px 6px 0;padding:2px 5px;border-radius:4px;background:#1b1b1b;}",
+        ".legend{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px;}",
+        ".legend-item{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid #333;border-radius:999px;background:#181818;}",
+        ".legend-swatch{width:10px;height:10px;border-radius:999px;display:inline-block;}",
+        ".op-sep{margin-top:18px;padding-top:10px;border-top:1px solid #333;}",
+        "table{border-collapse:collapse;margin:12px 0;} td,th{border:1px solid #333;padding:4px 6px;} h2,h3,h4{margin:16px 0 8px;}",
         "</style></head><body>",
         f"<h1>{html.escape(task_name)} Routing Preview @ step {step}</h1>",
     ]
@@ -403,12 +528,33 @@ def render_route_preview(
     for entry in diagnostics:
         layer_idx = int(entry["layer"])
         market_name = str(entry.get("market", "ffn"))
+        expert_styles = build_expert_styles(list(entry["expert_types"]))
+        capitals = entry["capitals"].cpu().tolist()
         cache = entry["cache"]
         winners = cache["winners"].cpu()
         bids = cache.get("bids")
         bids = bids.cpu() if bids is not None else None
         html_parts.append(f"<h2>Layer {layer_idx} | {html.escape(market_name)}</h2>")
-        print(f"[route-preview] task={task_name} layer={layer_idx} market={market_name}")
+        #print(f"[route-preview] task={task_name} layer={layer_idx} market={market_name}")
+        legend_chunks = []
+        for expert_idx, style in enumerate(expert_styles):
+            capital_value = float(capitals[expert_idx]) if expert_idx < len(capitals) else 0.0
+            legend_chunks.append(
+                "<span class=\"legend-item\">"
+                f"<span class=\"legend-swatch\" style=\"background:{html.escape(style['html'])};\"></span>"
+                f"{expert_idx}: {html.escape(style['label'])} | cap={capital_value:.3f}"
+                "</span>"
+            )
+        html_parts.append("<div class=\"legend\">" + "".join(legend_chunks) + "</div>")
+        #print(
+        #    "  legend:",
+        #    ", ".join(
+        #        f"{expert_idx}={style['label']}(cap={float(capitals[expert_idx]):.3f})"
+        #        for expert_idx, style in enumerate(expert_styles)
+        #    ),
+        #)
+
+        last_op_name = None
         for sample_idx in range(targets_cpu.size(0)):
             tokens = decode_display_stream(input_ids_cpu[sample_idx], targets_cpu[sample_idx])
             winners_row = winners[sample_idx].tolist()
@@ -419,8 +565,10 @@ def render_route_preview(
             else:
                 selected_bids = bids[sample_idx, torch.arange(winners.size(1)), winners[sample_idx]].tolist()
             op_name = OPERATION_NAME_BY_ID.get(int(op_ids_cpu[sample_idx].item()), "unknown")
+            if op_name != last_op_name:
+                html_parts.append(f"<div class=\"op-sep\"><h3>Operation: {html.escape(op_name)}</h3></div>")
+                last_op_name = op_name
 
-            ansi_tokens = []
             html_tokens = []
             rows = []
             bid_iter = selected_bids if selected_bids is not None else [None] * len(tokens)
@@ -429,28 +577,36 @@ def render_route_preview(
             ):
                 if not is_valid:
                     continue
-                ansi_tokens.append(colorize_token(token, int(winner), bool(is_answer)))
-                classes = ["sep" if token == "[SEP]" else ("rosa" if int(winner) == 1 else "rwkv")]
-                classes.append("answer" if is_answer else "prefix")
-                html_tokens.append(f"<span class=\"{' '.join(classes)}\">{html.escape(token)}</span>")
+                winner_idx = int(winner)
+                token_classes = ["token", "answer" if is_answer else "prefix"]
+                style_attr = ""
+                if token == "[SEP]":
+                    token_classes.append("sep")
+                elif 0 <= winner_idx < len(expert_styles):
+                    style_attr = f" style=\"color:{html.escape(expert_styles[winner_idx]['html'])};\""
+                html_tokens.append(
+                    f"<span class=\"{' '.join(token_classes)}\"{style_attr}>{html.escape(token)}</span>"
+                )
                 bid_display = "N/A" if bid_value is None else f"{float(bid_value):.4f}"
+                winner_label = expert_styles[winner_idx]["label"] if 0 <= winner_idx < len(expert_styles) else "unknown"
                 rows.append(
                     "<tr>"
-                    f"<td>{pos}</td><td>{html.escape(token)}</td><td>{int(winner)}</td>"
+                    f"<td>{pos}</td><td>{html.escape(token)}</td><td>{winner_idx}</td>"
+                    f"<td>{html.escape(winner_label)}</td>"
                     f"<td>{bid_display}</td><td>{int(bool(is_answer))}</td>"
                     "</tr>"
                 )
 
-            print(f"  sample={sample_idx} op={op_name} {' '.join(ansi_tokens)}")
-            html_parts.append(f"<h3>Sample {sample_idx} | {html.escape(op_name)}</h3>")
+            html_parts.append(f"<h4>Sample {sample_idx} | {html.escape(op_name)}</h4>")
             html_parts.append(f"<div>{' '.join(html_tokens)}</div>")
-            html_parts.append("<table><tr><th>pos</th><th>token</th><th>winner</th><th>bid</th><th>answer</th></tr>")
+            html_parts.append(
+                "<table><tr><th>pos</th><th>token</th><th>winner_id</th><th>winner</th><th>bid</th><th>answer</th></tr>"
+            )
             html_parts.extend(rows)
             html_parts.append("</table>")
 
     html_parts.append("</body></html>")
     html_path.write_text("".join(html_parts), encoding="utf-8")
-    print(f"[route-preview] saved={html_path}")
     model.train()
 
 
@@ -575,11 +731,15 @@ def save_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train small toy-sequence ROSA/CaMoE models")
     parser.add_argument("--data_dir", type=str, default="data/reverse_digits")
-    parser.add_argument("--model_kind", choices=["single_rosa", "single_rwkv", "camoe"], default="camoe")
+    parser.add_argument(
+        "--model_kind",
+        choices=["timemix_rosa_ffn", "timemix_ffn", "pure_rosa_ffn", "camoe"],
+        default="camoe",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_batch_size", type=int, default=256)
-    parser.add_argument("--steps", type=int, default=3000)
+    parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--eval_interval", type=int, default=250)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=1000)
@@ -601,11 +761,22 @@ def main() -> None:
     parser.add_argument("--rosa_bits", type=int, default=8)
     parser.add_argument("--rosa_truncation_length", type=int, default=8)
     parser.add_argument("--auction_noise_std", type=float, default=0.05)
+    parser.add_argument("--market_alpha_start", type=float, default=0.0)
+    parser.add_argument("--market_alpha_end", type=float, default=1.0)
+    parser.add_argument("--routing_entropy_reg", type=float, default=0.0)
+    parser.add_argument("--critic_shadow_prewarm", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--critic_shadow_market", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--routing_ste", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--ste_temperature_start", type=float, default=2.0)
+    parser.add_argument("--ste_temperature_mid", type=float, default=1.0)
+    parser.add_argument("--ste_temperature_end", type=float, default=0.3)
+    parser.add_argument("--ste_midpoint_steps", type=int, default=1500)
+    parser.add_argument("--ste_anneal_steps", type=int, default=4000)
     parser.add_argument("--depreciation", type=float, default=1e-3)
     parser.add_argument("--capital_ceiling", type=float, default=10.0)
-    parser.add_argument("--prewarm_steps", type=int, default=100)
-    parser.add_argument("--market_warmup_steps", type=int, default=100)
-    parser.add_argument("--critic_warmup_steps", type=int, default=200)
+    parser.add_argument("--prewarm_steps", type=int, default=1500)
+    parser.add_argument("--market_warmup_steps", type=int, default=1500)
+    parser.add_argument("--critic_warmup_steps", type=int, default=1000)
     parser.add_argument("--save_dir", type=str, default="checkpoints/reverse_digits")
     parser.add_argument("--artifact_dir", type=str, default="artifacts/reverse_digits")
     parser.add_argument("--max_eval_length", type=int, default=20)
@@ -644,18 +815,27 @@ def main() -> None:
     preview_rows = get_viz_samples(val_ds, task_name)
     preview_batch = move_batch(collate_fn(preview_rows), device)
 
-    config = build_config(args)
+    detected_seq_len = pad_to_chunk(infer_max_sequence_length(train_ds, val_ds, ood_ds))
+    config = build_config(args, seq_len=detected_seq_len)
+    print(
+        f"[config] task={task_name} detected_seq_len={detected_seq_len} "
+        f"(from train/val/ood max sample length)"
+    )
     if args.model_kind == "camoe":
         model: torch.nn.Module = CaMoE_Model(config).to(device)
         expert_params, critic_params = split_optim_params(model)
         optimizer = torch.optim.AdamW(expert_params, lr=args.lr, weight_decay=args.weight_decay)
         critic_optimizer = torch.optim.AdamW(critic_params, lr=args.critic_lr, weight_decay=args.weight_decay)
-    elif args.model_kind == "single_rwkv":
-        model = SingleRWKVReverseModel(config).to(device)
+    elif args.model_kind == "timemix_rosa_ffn":
+        model = BaselineTimeMixRosaRWKVFFN(config).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        critic_optimizer = None
+    elif args.model_kind == "timemix_ffn":
+        model = BaselineTimeMixRWKVFFN(config).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         critic_optimizer = None
     else:
-        model = SingleROSAReverseModel(config).to(device)
+        model = BaselinePureRosaRWKVFFN(config).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         critic_optimizer = None
 
@@ -684,11 +864,13 @@ def main() -> None:
 
         if args.model_kind == "camoe":
             phase, critic_alpha = get_phase(step, config)
+            ste_temperature = _compute_ste_temperature(step, config)
             optimizer.zero_grad(set_to_none=True)
             result = model(
                 batch["input_ids"],
                 batch["targets"],
                 critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
                 training=True,
                 uniform=(phase == "prewarm"),
             )
@@ -697,23 +879,33 @@ def main() -> None:
             optimizer.step()
 
             settle_results = []
-            if phase != "prewarm":
+            shadow_prewarm = phase == "prewarm" and config.critic_shadow_prewarm
+            shadow_market = phase == "market_warm" and config.critic_shadow_market
+            should_settle = phase != "prewarm" or shadow_prewarm
+            if should_settle:
                 with torch.no_grad():
                     settle_results = model.settle_all_layers(
                         result["loss"].detach(),
                         token_weight=batch["supervised_mask"].detach(),
+                        update_state=not shadow_prewarm,
                     )
 
             critic_loss_value = 0.0
-            if phase not in ("prewarm", "market_warm") and settle_results and step % config.critic_update_interval == 0:
+            should_train_critic = (phase not in ("prewarm", "market_warm")) or shadow_prewarm or shadow_market
+            if should_train_critic and settle_results and step % config.critic_update_interval == 0:
                 critic_optimizer.zero_grad(set_to_none=True)
-                critic_loss = model.compute_critic_loss(settle_results)
+                critic_loss = model.compute_critic_loss(
+                    settle_results,
+                    critic_alpha=critic_alpha,
+                    token_weight=(batch["supervised_mask"] * batch["valid_mask"]).detach(),
+                )
                 critic_loss.backward()
                 clip_grad_norm_(critic_params, 1.0)
                 critic_optimizer.step()
                 critic_loss_value = float(critic_loss.detach().item())
         else:
             phase, critic_alpha = "single", 1.0
+            ste_temperature = config.ste_temperature_end
             optimizer.zero_grad(set_to_none=True)
             result = model(batch["input_ids"], batch["targets"])
             result["loss_scalar"].backward()
@@ -725,6 +917,7 @@ def main() -> None:
         if step % args.log_interval == 0:
             logs = {
                 "train/loss": float(result["loss_scalar"].detach().item()),
+                "train/loss_main": float(result.get("loss_main_scalar", result["loss_scalar"]).detach().item()),
                 "train/answer_token_acc": float(train_token_acc.item()),
                 "train/exact_match": float(train_exact.item()),
                 "train/step_time_sec": float(time.time() - step_start),
@@ -732,6 +925,7 @@ def main() -> None:
             if args.model_kind == "camoe":
                 logs["train/critic_loss"] = float(critic_loss_value)
                 logs["train/critic_alpha"] = float(critic_alpha)
+                logs["train/ste_temperature"] = float(ste_temperature)
                 logs.update(market_logs_from_batch(model, batch))
             print(
                 f"step={step} task={task_name} kind={args.model_kind} phase={phase} "
@@ -748,6 +942,7 @@ def main() -> None:
                 device,
                 args.model_kind,
                 critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
                 uniform=(args.model_kind == "camoe" and phase == "prewarm"),
             )
             ood_metrics = evaluate_model(
@@ -756,6 +951,7 @@ def main() -> None:
                 device,
                 args.model_kind,
                 critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
                 uniform=(args.model_kind == "camoe" and phase == "prewarm"),
             )
             eval_logs = {
@@ -800,12 +996,14 @@ def main() -> None:
                     step,
                     task_name,
                     critic_alpha=critic_alpha,
+                    ste_temperature=ste_temperature,
                     uniform=(phase == "prewarm"),
                 )
                 preview_logs = preview_route_stats(model, preview_batch)
                 if preview_logs:
                     for key, value in sorted(preview_logs.items()):
-                        print(f"[route-stats] {key}={value:.4f}")
+                        #print(f"[route-stats] {key}={value:.4f}")
+                        pass
                     eval_logs.update(preview_logs)
             if HAS_SWANLAB and not args.no_swanlab:
                 swanlab.log(eval_logs, step=step)

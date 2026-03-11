@@ -33,18 +33,46 @@ PHASE_IDS = {
 }
 
 
+def _compute_market_alpha(step: int, config: CaMoEConfig) -> float:
+    start = config.prewarm_steps + config.market_warmup_steps
+    ramp = max(config.critic_warmup_steps, 1)
+    progress = min(max((step - start) / ramp, 0.0), 1.0)
+    return float(config.market_alpha_start + (config.market_alpha_end - config.market_alpha_start) * progress)
+
+
+def _compute_ste_temperature(step: int, config: CaMoEConfig) -> float:
+    if step < config.prewarm_steps:
+        return float(config.ste_temperature_start)
+    offset = step - config.prewarm_steps
+    total = max(config.ste_anneal_steps, 0)
+    mid = max(config.ste_midpoint_steps, 0)
+    if total == 0:
+        return float(config.ste_temperature_end)
+    if offset <= mid:
+        if mid == 0:
+            return float(config.ste_temperature_mid)
+        p = offset / mid
+        return float(config.ste_temperature_start + (config.ste_temperature_mid - config.ste_temperature_start) * p)
+    if offset <= total:
+        tail = total - mid
+        if tail <= 0:
+            return float(config.ste_temperature_end)
+        p = (offset - mid) / tail
+        return float(config.ste_temperature_mid + (config.ste_temperature_end - config.ste_temperature_mid) * p)
+    return float(config.ste_temperature_end)
+
+
 def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
     s1 = config.prewarm_steps
     s2 = s1 + config.market_warmup_steps
     s3 = s2 + config.critic_warmup_steps
     if step < s1:
-        return "prewarm", 0.0
+        return "prewarm", float(config.market_alpha_start)
     if step < s2:
-        return "market_warm", 0.0
+        return "market_warm", float(config.market_alpha_start)
     if step < s3:
-        alpha = (step - s2) / max(config.critic_warmup_steps, 1)
-        return "critic_warm", float(alpha)
-    return "full_market", 1.0
+        return "critic_warm", _compute_market_alpha(step, config)
+    return "full_market", float(config.market_alpha_end)
 
 
 def load_training_split(path: str) -> Dataset:
@@ -140,6 +168,17 @@ def main() -> None:
     parser.add_argument("--rosa_bits", type=int, default=None)
     parser.add_argument("--slim_rosa_heads", type=int, default=None)
     parser.add_argument("--rosa_truncation_length", type=int, default=None)
+    parser.add_argument("--market_alpha_start", type=float, default=None)
+    parser.add_argument("--market_alpha_end", type=float, default=None)
+    parser.add_argument("--routing_entropy_reg", type=float, default=None)
+    parser.add_argument("--critic_shadow_prewarm", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--critic_shadow_market", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--routing_ste", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--ste_temperature_start", type=float, default=None)
+    parser.add_argument("--ste_temperature_mid", type=float, default=None)
+    parser.add_argument("--ste_temperature_end", type=float, default=None)
+    parser.add_argument("--ste_midpoint_steps", type=int, default=None)
+    parser.add_argument("--ste_anneal_steps", type=int, default=None)
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--log_interval", type=int, default=100)
@@ -181,6 +220,28 @@ def main() -> None:
         config.slim_rosa_heads = args.slim_rosa_heads
     if args.rosa_truncation_length is not None:
         config.rosa_truncation_length = args.rosa_truncation_length
+    if args.market_alpha_start is not None:
+        config.market_alpha_start = args.market_alpha_start
+    if args.market_alpha_end is not None:
+        config.market_alpha_end = args.market_alpha_end
+    if args.routing_entropy_reg is not None:
+        config.routing_entropy_reg = args.routing_entropy_reg
+    if args.critic_shadow_prewarm is not None:
+        config.critic_shadow_prewarm = bool(args.critic_shadow_prewarm)
+    if args.critic_shadow_market is not None:
+        config.critic_shadow_market = bool(args.critic_shadow_market)
+    if args.routing_ste is not None:
+        config.routing_ste = bool(args.routing_ste)
+    if args.ste_temperature_start is not None:
+        config.ste_temperature_start = args.ste_temperature_start
+    if args.ste_temperature_mid is not None:
+        config.ste_temperature_mid = args.ste_temperature_mid
+    if args.ste_temperature_end is not None:
+        config.ste_temperature_end = args.ste_temperature_end
+    if args.ste_midpoint_steps is not None:
+        config.ste_midpoint_steps = args.ste_midpoint_steps
+    if args.ste_anneal_steps is not None:
+        config.ste_anneal_steps = args.ste_anneal_steps
     if args.no_compile:
         config.enable_compile = False
     if args.no_gradient_checkpointing:
@@ -246,6 +307,7 @@ def main() -> None:
         input_ids = batch[:, :-1]
         targets = batch[:, 1:]
         phase, critic_alpha = get_phase(step, config)
+        ste_temperature = _compute_ste_temperature(step, config)
 
         expert_optimizer.zero_grad(set_to_none=True)
         with amp_ctx():
@@ -253,6 +315,7 @@ def main() -> None:
                 input_ids,
                 targets,
                 critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
                 training=True,
                 uniform=(phase == "prewarm"),
             )
@@ -261,14 +324,25 @@ def main() -> None:
         expert_optimizer.step()
 
         settle_results = []
-        if phase != "prewarm":
+        shadow_prewarm = phase == "prewarm" and config.critic_shadow_prewarm
+        shadow_market = phase == "market_warm" and config.critic_shadow_market
+        should_settle = phase != "prewarm" or shadow_prewarm
+        if should_settle:
             with torch.no_grad():
-                settle_results = model.settle_all_layers(result["loss"].detach())
+                settle_results = model.settle_all_layers(
+                    result["loss"].detach(),
+                    update_state=not shadow_prewarm,
+                )
 
         critic_loss_value = None
-        if phase not in ("prewarm", "market_warm") and settle_results and step % config.critic_update_interval == 0:
+        should_train_critic = (phase not in ("prewarm", "market_warm")) or shadow_prewarm or shadow_market
+        if should_train_critic and settle_results and step % config.critic_update_interval == 0:
             critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss = model.compute_critic_loss(settle_results)
+            critic_loss = model.compute_critic_loss(
+                settle_results,
+                critic_alpha=critic_alpha,
+                token_weight=result["loss_mask"].detach().float(),
+            )
             critic_loss.backward()
             clip_grad_norm_(critic_params, 1.0)
             critic_optimizer.step()
@@ -286,7 +360,7 @@ def main() -> None:
             )
             if HAS_SWANLAB:
                 logs = {
-                    "Loss/Train_Main": float(result["loss_scalar"].detach().item()),
+                    "Loss/Train_Main": float(result.get("loss_main_scalar", result["loss_scalar"]).detach().item()),
                     "Loss/Train_Total": float(result["loss_scalar"].detach().item()),
                     "Loss/Train_Critic": float(critic_loss_value or 0.0),
                     "Loss/Aux_Balance": 0.0,
@@ -295,6 +369,7 @@ def main() -> None:
                     f"Phase/{phase}": 1.0,
                     "Market/RoutingEntropy": float(routing_entropy),
                     "Market/CriticAlpha": float(critic_alpha),
+                    "Market/STETemperature": float(ste_temperature),
                     "Runtime/CompileEnabled": float(config.enable_compile),
                     "Runtime/GradientCheckpointing": float(config.enable_gradient_checkpointing),
                 }

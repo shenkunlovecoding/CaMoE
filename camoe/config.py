@@ -45,6 +45,14 @@ class CaMoEConfig:
 
     # Auction
     auction_noise_std: float = 0.01
+    market_alpha_start: float = 0.0
+    market_alpha_end: float = 1.0
+    routing_ste: bool = True
+    ste_temperature_start: float = 2.0
+    ste_temperature_mid: float = 1.0
+    ste_temperature_end: float = 0.3
+    ste_midpoint_steps: int = 1500
+    ste_anneal_steps: int = 4000
 
     # Runtime
     enable_compile: bool = True
@@ -64,6 +72,9 @@ class CaMoEConfig:
     critic_update_interval: int = 8
     critic_lr: float = 3e-4
     critic_profit_clip: float = 1.0
+    routing_entropy_reg: float = 0.0
+    critic_shadow_prewarm: bool = True
+    critic_shadow_market: bool = True
 
     # Schedules
     prewarm_steps: int = 2000
@@ -110,6 +121,18 @@ class CaMoEConfig:
             raise ValueError("capital_ceiling must be greater than capital_floor.")
         if self.critic_profit_clip <= 0:
             raise ValueError("critic_profit_clip must be positive.")
+        if self.market_alpha_start < 0 or self.market_alpha_end < 0:
+            raise ValueError("market_alpha_start/end must be non-negative.")
+        if self.market_alpha_end < self.market_alpha_start:
+            raise ValueError("market_alpha_end must be >= market_alpha_start.")
+        if self.routing_entropy_reg < 0:
+            raise ValueError("routing_entropy_reg must be non-negative.")
+        if self.ste_temperature_start <= 0 or self.ste_temperature_mid <= 0 or self.ste_temperature_end <= 0:
+            raise ValueError("STE temperatures must be positive.")
+        if self.ste_midpoint_steps < 0 or self.ste_anneal_steps < 0:
+            raise ValueError("ste_midpoint_steps / ste_anneal_steps must be non-negative.")
+        if self.ste_anneal_steps > 0 and self.ste_midpoint_steps > self.ste_anneal_steps:
+            raise ValueError("ste_midpoint_steps must be <= ste_anneal_steps.")
 
     @property
     def head_size(self) -> int:

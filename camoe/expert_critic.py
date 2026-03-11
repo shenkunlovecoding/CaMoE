@@ -104,3 +104,19 @@ class CriticPair(nn.Module):
         pnl_a = self.critic_a.compute_pnl(pos_a, expert_profits)
         pnl_b = self.critic_b.compute_pnl(pos_b, expert_profits)
         return -(adv_a * pnl_a + adv_b * pnl_b)
+
+    def routing_entropy(
+        self,
+        x_detached: torch.Tensor,
+        expert_capitals: torch.Tensor,
+        critic_alpha: float = 1.0,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        positions = self.get_positions(x_detached)
+        bids = expert_capitals.view(1, 1, -1).to(positions.dtype) + float(critic_alpha) * positions
+        probs = torch.softmax(bids, dim=-1)
+        entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1)
+        if token_mask is None:
+            return entropy.mean()
+        weight = token_mask.to(entropy.dtype)
+        return (entropy * weight).sum() / weight.sum().clamp(min=1e-8)

@@ -5,6 +5,18 @@
 
 [English](NOTE.md) | [中文版](NOTE.zh-CN.md)
 
+## 0. 当前实现状态（v22.1）
+- 双市场 block 已落地：
+  - 序列市场：`TimeMixExpert` vs `ROSAExpert`
+  - FFN 市场：`RWKVExpert` / `DeepEmbedExpert` / `SlimDeepEmbedExpert`
+- 路由是 winner-takes-all + Vickrey 拍卖。
+- 训练使用 STE 路由：
+  - 前向硬 winner
+  - 反向软混合（支持温度退火）
+- 推理保持硬稀疏路由（`training=False`）。
+- Critic 支持在 `prewarm` 和 `market_warm` 进行影子训练；prewarm 不要求真实路由决策参与输出。
+- `FractalCaMoEPlaceholder` 当前仅为占位基础设施（默认不作为活跃市场专家）。
+
 ## 1. 异构专家（Tool-as-Expert）
 ### 概念
 ```python

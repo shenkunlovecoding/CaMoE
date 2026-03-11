@@ -13,42 +13,32 @@ CaMoE（Capital-driven Mixture of Experts，资本驱动的专家混合）是对
 CaMoE:    Auction(zero-param) → 基于资本竞价 → winner-takes-all
 ```
 
-## 🚀 当前版本（v22）
+## 🚀 当前版本（v22.1）
 ### 架构
 ```
 输入
   │
   ▼
 ┌─────────────────────────────────────────────┐
-│  Embedding + 可选 DeepEmbed                 │
+│  Embedding                                  │
 └─────────────────────────────────────────────┘
   │
   ▼（× n_layers）
 ┌─────────────────────────────────────────────┐
-│  RWKV-7 TimeMix（Attention 替代）           │
-│  - 线性复杂度 O(T)                          │
-│  - 动态状态演化                             │
-│  - 自定义 CUDA kernel（BF16/FP32）          │
+│  序列市场                                   │
+│  - TimeMixExpert vs ROSAExpert              │
+│  - 两者都吃完整序列更新状态                 │
+│  - 前向硬路由，反向 STE                     │
 ├─────────────────────────────────────────────┤
-│  CaMoE Block                                │
-│  ┌─────────────────────────────────────┐    │
-│  │  Vickrey 拍卖（零参数）             │    │
-│  │  - bid = capital + α × critic_pos   │    │
-│  │  - winner 支付第二高价格            │    │
-│  └─────────────────────────────────────┘    │
-│           │                                 │
-│           ▼                                 │
-│  ┌─────────────────────────────────────┐    │
-│  │  Experts（RWKVExpert × n_experts）  │    │
-│  │  - LayerNorm → Linear → SiLU → Linear│   │
-│  │  - 每个专家都有自己的资本 buffer    │    │
-│  └─────────────────────────────────────┘    │
-│           │                                 │
-│  ┌─────────────────────────────────────┐    │
-│  │  Critic Pair（方差降低）            │    │
-│  │  - 两个 critic 互为 baseline        │    │
-│  │  - 使用 REINFORCE 风格训练          │    │
-│  └─────────────────────────────────────┘    │
+│  FFN 市场                                   │
+│  - RWKVExpert / DeepEmbed / SlimDeepEmbed   │
+│  - Vickrey winner-takes-all                 │
+│  - 训练期 STE，评估期纯硬路由               │
+├─────────────────────────────────────────────┤
+│  Critic Pair                                │
+│  - REINFORCE 更新                           │
+│  - 可选路由熵正则                           │
+│  - prewarm/market_warm 影子训练             │
 └─────────────────────────────────────────────┘
   │
   ▼
@@ -60,26 +50,31 @@ CaMoE:    Auction(zero-param) → 基于资本竞价 → winner-takes-all
 输出
 ```
 
-### 训练阶段
+### 训练阶段（toy 默认配置）
 ```
-Step 0          s1              s2              s3
-  │──────────────│───────────────│───────────────│────────▶
-     prewarm       market_warm     critic_warm     full_market
+Step 0        1500         3000             5500+
+  │────────────│────────────│────────────────│────────▶
+    prewarm      market_warm   critic_warm      full_market
 
-  [uniform avg]   [auction on]    [critic ramps]  [full system]
-   所有专家训练     专家开始竞标      α: 0→1         全系统开启
+  uniform=True   auction on     critic α 渐进     全系统开启
+  （无硬路由）    + STE          + STE 退火
+
+STE 温度退火：
+  2.0  -> 1.0 -> 0.3
 ```
 
 ### 关键组件
 | 文件 | 说明 |
 | :--- | :--- |
-| `model.py` | 主体 `CaMoE_Model`，包含 RWKV backbone 与 expert blocks |
-| `block.py` | `CaMoE_Block`：auction → dispatch → experts |
+| `model.py` | 双市场主模型 `CaMoE_Model` |
+| `block.py` | 序列市场 + FFN 市场路由核心 |
 | `auction.py` | 零参数 Vickrey 二价拍卖 |
 | `capital.py` | `ExpertCapitalManager`：结算、折旧、EMA |
-| `expert_rwkv.py` | `RWKVExpert`：实际执行计算的专家 |
+| `expert_timemix.py` | 序列市场 TimeMix 专家 |
+| `expert_rosa.py` | Slim Wind ROSA 专家 |
+| `expert_rwkv.py` | RWKV FFN 专家 |
 | `expert_critic.py` | `CriticPair`：仓位预测 + REINFORCE |
-| `backbone.py` | 带自定义 CUDA kernel 的 RWKV-7 TimeMix |
+| `expert_deepembed.py` | FFN 市场 DeepEmbed 专家 |
 
 ### 市场机制
 ```python

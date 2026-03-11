@@ -48,6 +48,7 @@ class ExpertCapitalManager(nn.Module):
         token_loss: torch.Tensor,
         prices: torch.Tensor,
         token_weight: torch.Tensor | None = None,
+        update_state: bool = True,
     ) -> torch.Tensor:
         """
         Settle one layer and return expert profits shaped ``[E]``.
@@ -82,7 +83,8 @@ class ExpertCapitalManager(nn.Module):
             self.ema_decay * baseline + (1.0 - self.ema_decay) * mean_loss,
             running,
         )
-        self.running_loss[layer_idx].copy_(updated_running.to(self.running_loss.dtype))
+        if update_state:
+            self.running_loss[layer_idx].copy_(updated_running.to(self.running_loss.dtype))
 
         revenue = relative * caps.to(dtype=dtype)
         if token_weight is None:
@@ -99,7 +101,8 @@ class ExpertCapitalManager(nn.Module):
             next_caps = next_caps.clamp(min=self.capital_floor)
         else:
             next_caps = next_caps.clamp(min=self.capital_floor, max=self.capital_ceiling)
-        self.capitals[layer_idx].copy_(next_caps.to(self.capitals.dtype))
+        if update_state:
+            self.capitals[layer_idx].copy_(next_caps.to(self.capitals.dtype))
         return profit.detach()
 
     def sync_to_experts(self, layer_idx: int, experts: list[nn.Module]) -> None:

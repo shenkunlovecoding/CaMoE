@@ -5,6 +5,18 @@ The current v22 is the foundation. Below is where we're heading.
 
 [中文版](NOTE.zh-CN.md) | [English](NOTE.md)
 
+## 0. Current Implementation Status (v22.1)
+- Dual-market block is live:
+  - Sequence market: `TimeMixExpert` vs `ROSAExpert`
+  - FFN market: `RWKVExpert` / `DeepEmbedExpert` / `SlimDeepEmbedExpert`
+- Routing is winner-takes-all with Vickrey auction.
+- Training uses STE routing:
+  - hard winner in forward
+  - soft mixture in backward (temperature annealing supported)
+- Inference path remains hard sparse routing (`training=False`).
+- Critic supports shadow training in `prewarm` and `market_warm` without forcing real routing decisions in prewarm.
+- `FractalCaMoEPlaceholder` exists as infra placeholder only (not a default active market participant).
+
 ## 1. Heterogeneous Experts (Tool-as-Expert)
 ### Concept
 ```python

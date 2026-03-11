@@ -12,7 +12,11 @@ from .expert_rosa import ROSAExpert
 from .expert_rwkv import RWKVExpert
 from .expert_timemix import TimeMixExpert
 from .model import CaMoE_Model, load_camoe_checkpoint
-from .reverse_baselines import SingleROSAReverseModel, SingleRWKVReverseModel
+from .reverse_baselines import (
+    BaselinePureRosaRWKVFFN,
+    BaselineTimeMixRosaRWKVFFN,
+    BaselineTimeMixRWKVFFN,
+)
 
 __all__ = [
     "BaseExpert",
@@ -32,8 +36,9 @@ __all__ = [
     "RWKVExpert",
     "SlimDeepEmbedExpert",
     "TimeMixExpert",
-    "SingleROSAReverseModel",
-    "SingleRWKVReverseModel",
+    "BaselinePureRosaRWKVFFN",
+    "BaselineTimeMixRosaRWKVFFN",
+    "BaselineTimeMixRWKVFFN",
     "VERSION",
     "VickreyAuctionHouse",
     "get_config",

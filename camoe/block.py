@@ -26,6 +26,9 @@ class CaMoE_Block(nn.Module):
         sequence_auction_noise: float = 0.01,
         ffn_auction_noise: float = 0.01,
         use_gradient_checkpointing: bool = True,
+        use_routing_ste: bool = True,
+        ste_temperature: float = 1.0,
+        enable_shadow_critic_training: bool = True,
     ) -> None:
         super().__init__()
         self.timemix_expert = timemix_expert
@@ -36,6 +39,9 @@ class CaMoE_Block(nn.Module):
         self.critic_pair = ffn_critic_pair
         self.n_routable = len(ffn_experts)
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.use_routing_ste = bool(use_routing_ste)
+        self.ste_temperature = float(ste_temperature)
+        self.enable_shadow_critic_training = bool(enable_shadow_critic_training)
         self.sequence_auction = VickreyAuctionHouse(noise_std=sequence_auction_noise)
         self.ffn_auction = VickreyAuctionHouse(noise_std=ffn_auction_noise)
         self._cache: dict[str, dict[str, torch.Tensor]] = {}
@@ -49,14 +55,17 @@ class CaMoE_Block(nn.Module):
         x: torch.Tensor,
         v_first: torch.Tensor | None = None,
         critic_alpha: float = 1.0,
+        ste_temperature: float | None = None,
         training: bool = True,
         uniform: bool = False,
         **expert_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        ste_temp = self.ste_temperature if ste_temperature is None else float(ste_temperature)
         seq_out, next_v_first, seq_cache = self._forward_sequence_market(
             x,
             v_first=v_first,
             critic_alpha=critic_alpha,
+            ste_temperature=ste_temp,
             training=training,
             uniform=uniform,
             **expert_ctx,
@@ -66,6 +75,7 @@ class CaMoE_Block(nn.Module):
         ffn_out, ffn_cache = self._forward_ffn_market(
             x,
             critic_alpha=critic_alpha,
+            ste_temperature=ste_temp,
             training=training,
             uniform=uniform,
             **expert_ctx,
@@ -83,6 +93,7 @@ class CaMoE_Block(nn.Module):
         x: torch.Tensor,
         v_first: torch.Tensor | None,
         critic_alpha: float,
+        ste_temperature: float,
         training: bool,
         uniform: bool,
         **expert_ctx,
@@ -98,7 +109,27 @@ class CaMoE_Block(nn.Module):
         assert self.rosa_expert is not None
         rosa_out = self.rosa_expert(x, **expert_ctx)
         if uniform:
-            return (timemix_out + rosa_out) * 0.5, next_v_first, {}
+            output = (timemix_out + rosa_out) * 0.5
+            if training and self.enable_shadow_critic_training:
+                positions = self.sequence_critic_pair.get_positions(x.detach()).detach()
+                expert_caps = torch.stack([self.timemix_expert.capital, self.rosa_expert.capital]).to(x.device)
+                winners, prices, bids = self.sequence_auction(
+                    expert_caps,
+                    positions,
+                    critic_alpha=critic_alpha,
+                    training=training,
+                )
+                cache = {
+                    "winners": winners.detach(),
+                    "prices": prices.detach(),
+                    "bids": bids.detach(),
+                    "positions": positions.detach(),
+                    "expert_capitals": expert_caps.detach(),
+                    "x_detached": x.detach(),
+                    "timemix_state": timemix_state.detach(),
+                }
+                return output, next_v_first, cache
+            return output, next_v_first, {}
 
         positions = self.sequence_critic_pair.get_positions(x.detach()).detach()
         expert_caps = torch.stack([self.timemix_expert.capital, self.rosa_expert.capital]).to(x.device)
@@ -109,7 +140,13 @@ class CaMoE_Block(nn.Module):
             training=training,
         )
         winner_mask = winners.unsqueeze(-1).eq(1)
-        output = torch.where(winner_mask, rosa_out, timemix_out)
+        hard_output = torch.where(winner_mask, rosa_out, timemix_out)
+        if training and self.use_routing_ste:
+            probs = torch.softmax(bids / ste_temperature, dim=-1)
+            soft_output = timemix_out * probs[:, :, 0:1] + rosa_out * probs[:, :, 1:2]
+            output = soft_output + (hard_output - soft_output).detach()
+        else:
+            output = hard_output
         cache = {
             "winners": winners.detach(),
             "prices": prices.detach(),
@@ -125,12 +162,32 @@ class CaMoE_Block(nn.Module):
         self,
         x: torch.Tensor,
         critic_alpha: float,
+        ste_temperature: float,
         training: bool,
         uniform: bool,
         **expert_ctx,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if uniform:
-            return self._forward_uniform_ffn(x, **expert_ctx), {}
+            output = self._forward_uniform_ffn(x, **expert_ctx)
+            if training and self.enable_shadow_critic_training:
+                positions = self.critic_pair.get_positions(x.detach()).detach()
+                expert_caps = torch.stack([expert.capital for expert in self.ffn_experts]).to(x.device)
+                winners, prices, bids = self.ffn_auction(
+                    expert_caps,
+                    positions,
+                    critic_alpha=critic_alpha,
+                    training=training,
+                )
+                cache = {
+                    "winners": winners.detach(),
+                    "prices": prices.detach(),
+                    "bids": bids.detach(),
+                    "positions": positions.detach(),
+                    "expert_capitals": expert_caps.detach(),
+                    "x_detached": x.detach(),
+                }
+                return output, cache
+            return output, {}
 
         positions = self.critic_pair.get_positions(x.detach()).detach()
         expert_caps = torch.stack([expert.capital for expert in self.ffn_experts]).to(x.device)
@@ -140,7 +197,9 @@ class CaMoE_Block(nn.Module):
             critic_alpha=critic_alpha,
             training=training,
         )
-        if self.training and self.use_gradient_checkpointing:
+        if training and self.use_routing_ste:
+            output = self._dispatch_ffn_ste(x, winners, bids, ste_temperature=ste_temperature, **expert_ctx)
+        elif self.training and self.use_gradient_checkpointing:
             output = checkpoint(
                 self._dispatch_ffn,
                 x,
@@ -197,6 +256,22 @@ class CaMoE_Block(nn.Module):
     def _forward_uniform_ffn(self, x: torch.Tensor, **expert_ctx) -> torch.Tensor:
         outputs = [expert(x, **expert_ctx) for expert in self.ffn_experts]
         return sum(outputs) / len(outputs)
+
+    def _dispatch_ffn_ste(
+        self,
+        x: torch.Tensor,
+        winners: torch.Tensor,
+        bids: torch.Tensor,
+        ste_temperature: float,
+        **expert_ctx,
+    ) -> torch.Tensor:
+        outputs = [expert(x, **expert_ctx) for expert in self.ffn_experts]
+        all_out = torch.stack(outputs, dim=2)
+        hard_index = winners.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x.size(-1))
+        hard_out = torch.gather(all_out, dim=2, index=hard_index).squeeze(2)
+        probs = torch.softmax(bids / ste_temperature, dim=-1).unsqueeze(-1)
+        soft_out = (all_out * probs).sum(dim=2)
+        return soft_out + (hard_out - soft_out).detach()
 
     def sequence_experts(self) -> list[BaseExpert]:
         if self.rosa_expert is None:

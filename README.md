@@ -13,42 +13,32 @@ Traditional MoE:  Router(learned) → softmax → top-k → experts
 CaMoE:           Auction(zero-param) → capital-based bidding → winner-takes-all
 ```
 
-## 🚀 Current Version (v22)
+## 🚀 Current Version (v22.1)
 ### Architecture
 ```
 Input
   │
   ▼
 ┌─────────────────────────────────────────────┐
-│  Embedding + Optional DeepEmbed             │
+│  Embedding                                  │
 └─────────────────────────────────────────────┘
   │
   ▼ (× n_layers)
 ┌─────────────────────────────────────────────┐
-│  RWKV-7 TimeMix (Attention Alternative)     │
-│  - Linear complexity O(T)                   │
-│  - Dynamic state evolution                  │
-│  - Custom CUDA kernel (BF16/FP32)           │
+│  Sequence Market                            │
+│  - TimeMixExpert vs ROSAExpert              │
+│  - Full-sequence state update for both      │
+│  - Winner output with STE backward          │
 ├─────────────────────────────────────────────┤
-│  CaMoE Block                                │
-│  ┌─────────────────────────────────────┐    │
-│  │  Vickrey Auction (zero parameters)  │    │
-│  │  - bid = capital + α × critic_pos   │    │
-│  │  - winner pays second-highest price │    │
-│  └─────────────────────────────────────┘    │
-│           │                                 │
-│           ▼                                 │
-│  ┌─────────────────────────────────────┐    │
-│  │  Experts (RWKVExpert × n_experts)   │    │
-│  │  - LayerNorm → Linear → SiLU → Linear│   │
-│  │  - Each owns capital buffer         │    │
-│  └─────────────────────────────────────┘    │
-│           │                                 │
-│  ┌─────────────────────────────────────┐    │
-│  │  Critic Pair (variance reduction)   │    │
-│  │  - Two critics as mutual baselines  │    │
-│  │  - REINFORCE-style training         │    │
-│  └─────────────────────────────────────┘    │
+│  FFN Market                                 │
+│  - RWKVExpert / DeepEmbed / SlimDeepEmbed   │
+│  - Vickrey winner-takes-all                 │
+│  - STE during training, hard winner at eval │
+├─────────────────────────────────────────────┤
+│  Critic Pair                                │
+│  - REINFORCE update                         │
+│  - Entropy regularization (optional)        │
+│  - Shadow training in prewarm/market_warm   │
 └─────────────────────────────────────────────┘
   │
   ▼
@@ -60,26 +50,31 @@ Input
 Output
 ```
 
-### Training Phases
+### Training Phases (default toy recipe)
 ```
-Step 0          s1              s2              s3
-  │──────────────│───────────────│───────────────│────────▶
-     prewarm       market_warm     critic_warm     full_market
-     
-  [uniform avg]   [auction on]    [critic ramps]  [full system]
-   all experts    experts bid       α: 0→1        everything on
+Step 0        1500         3000             5500+
+  │────────────│────────────│────────────────│────────▶
+    prewarm      market_warm   critic_warm      full_market
+
+  uniform=True   auction on     critic α ramps   full system
+  (no hard route)  + STE        + STE anneal      hard eval route
+
+STE temperature anneal:
+  2.0  -> 1.0 -> 0.3
 ```
 
 ### Key Components
 | File | Description |
 | :--- | :--- |
-| `model.py` | Main CaMoE_Model with RWKV backbone + expert blocks |
-| `block.py` | CaMoE_Block: auction → dispatch → experts |
+| `model.py` | Main `CaMoE_Model` with dual-market blocks |
+| `block.py` | Sequence market + FFN market routing logic |
 | `auction.py` | Zero-parameter Vickrey second-price auction |
 | `capital.py` | ExpertCapitalManager: settlement, depreciation, EMA |
-| `expert_rwkv.py` | RWKVExpert: the actual compute unit |
+| `expert_timemix.py` | TimeMix expert for sequence market |
+| `expert_rosa.py` | Slim Wind ROSA sequence expert |
+| `expert_rwkv.py` | RWKV FFN expert |
 | `expert_critic.py` | CriticPair: position prediction + REINFORCE |
-| `backbone.py` | RWKV-7 TimeMix with custom CUDA kernels |
+| `expert_deepembed.py` | DeepEmbed experts in FFN market |
 
 ### Market Mechanics
 ```python

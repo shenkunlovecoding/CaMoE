@@ -67,6 +67,7 @@ class CaMoE_Model(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         critic_alpha: float = 1.0,
+        ste_temperature: float | None = None,
         training: bool = True,
         uniform: bool = False,
     ) -> dict[str, torch.Tensor]:
@@ -79,6 +80,7 @@ class CaMoE_Model(nn.Module):
                 x,
                 v_first=v_first,
                 critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
                 training=training,
                 uniform=uniform,
                 token_ids=input_ids,
@@ -98,7 +100,9 @@ class CaMoE_Model(nn.Module):
             valid_mask = targets.ne(self.config.ignore_index)
             valid_count = valid_mask.sum().clamp(min=1)
             result["loss"] = loss
-            result["loss_scalar"] = (loss * valid_mask.to(loss.dtype)).sum() / valid_count
+            main_loss = (loss * valid_mask.to(loss.dtype)).sum() / valid_count
+            result["loss_main_scalar"] = main_loss
+            result["loss_scalar"] = main_loss
             result["loss_mask"] = valid_mask
 
         return result
@@ -107,6 +111,7 @@ class CaMoE_Model(nn.Module):
         self,
         token_loss: torch.Tensor,
         token_weight: torch.Tensor | None = None,
+        update_state: bool = True,
     ) -> list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]]:
         all_profits: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]] = []
         for layer_idx, block in enumerate(self.blocks):
@@ -122,13 +127,15 @@ class CaMoE_Model(nn.Module):
                     token_loss=token_loss,
                     prices=seq_cache["prices"],
                     token_weight=token_weight,
+                    update_state=update_state,
                 )
                 seq_critic_profit = seq_profit.clamp(
                     min=-self.config.critic_profit_clip,
                     max=self.config.critic_profit_clip,
                 )
                 adv_a, adv_b = block.sequence_critic_pair.settle_both(seq_cache["x_detached"], seq_critic_profit)
-                self.sequence_capital_manager.sync_to_experts(layer_idx, block.sequence_experts())
+                if update_state:
+                    self.sequence_capital_manager.sync_to_experts(layer_idx, block.sequence_experts())
                 all_profits.append(
                     {
                         "layer": layer_idx,
@@ -149,13 +156,15 @@ class CaMoE_Model(nn.Module):
                     token_loss=token_loss,
                     prices=ffn_cache["prices"],
                     token_weight=token_weight,
+                    update_state=update_state,
                 )
                 ffn_critic_profit = ffn_profit.clamp(
                     min=-self.config.critic_profit_clip,
                     max=self.config.critic_profit_clip,
                 )
                 adv_a, adv_b = block.critic_pair.settle_both(ffn_cache["x_detached"], ffn_critic_profit)
-                self.ffn_capital_manager.sync_to_experts(layer_idx, list(block.experts))
+                if update_state:
+                    self.ffn_capital_manager.sync_to_experts(layer_idx, list(block.experts))
                 all_profits.append(
                     {
                         "layer": layer_idx,
@@ -173,9 +182,13 @@ class CaMoE_Model(nn.Module):
     def compute_critic_loss(
         self,
         settle_results: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]],
+        critic_alpha: float = 1.0,
+        token_weight: torch.Tensor | None = None,
+        entropy_reg: float | None = None,
     ) -> torch.Tensor:
         total_loss: torch.Tensor | None = None
         count = 0
+        entropy_lambda = self.config.routing_entropy_reg if entropy_reg is None else float(entropy_reg)
         for result in settle_results:
             layer_idx = int(result["layer"])
             market = str(result["market"])
@@ -190,6 +203,14 @@ class CaMoE_Model(nn.Module):
                 result["adv_a"],
                 result["adv_b"],
             )
+            if entropy_lambda > 0:
+                entropy_bonus = critic_pair.routing_entropy(
+                    cache["x_detached"],
+                    cache["expert_capitals"].detach(),
+                    critic_alpha=critic_alpha,
+                    token_mask=token_weight,
+                )
+                loss = loss - entropy_lambda * entropy_bonus
             total_loss = loss if total_loss is None else (total_loss + loss)
             count += 1
 
@@ -447,6 +468,9 @@ class CaMoE_Model(nn.Module):
             sequence_auction_noise=self.config.auction_noise_std,
             ffn_auction_noise=self.config.auction_noise_std,
             use_gradient_checkpointing=self.config.enable_gradient_checkpointing,
+            use_routing_ste=self.config.routing_ste,
+            ste_temperature=self.config.ste_temperature_end,
+            enable_shadow_critic_training=(self.config.critic_shadow_prewarm or self.config.critic_shadow_market),
         )
 
     def _maybe_compile_modules(self) -> None:
