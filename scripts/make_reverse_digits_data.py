@@ -29,6 +29,9 @@ BRACKET_ID = 25
 MASK_ID = 26
 LPAREN_ID = 27
 RPAREN_ID = 28
+PLUS_ID = 29
+MINUS_ID = 30
+ADDSUB_ID = 31
 
 IGNORE_INDEX = -100
 
@@ -45,6 +48,7 @@ OPERATION_ID_BY_NAME = {
     "running_max": 9,
     "sum_threshold": 10,
     "bracket_depth": 11,
+    "addsub_40": 12,
 }
 
 CONTROL_TOKEN_BY_OPERATION = {
@@ -60,6 +64,7 @@ CONTROL_TOKEN_BY_OPERATION = {
     "running_max": RUNMAX_ID,
     "sum_threshold": THRESH_ID,
     "bracket_depth": BRACKET_ID,
+    "addsub_40": ADDSUB_ID,
 }
 
 
@@ -340,6 +345,45 @@ def build_bracket_depth_example(
     )
 
 
+def _random_decimal_string(length: int, rng: random.Random) -> str:
+    first = str(rng.randrange(1, 10))
+    rest = "".join(str(rng.randrange(10)) for _ in range(max(length - 1, 0)))
+    return first + rest
+
+
+def build_addsub_40_example(
+    length: int,
+    rng: random.Random,
+    task_name: str = "addsub_40",
+) -> dict[str, list[int] | int | str]:
+    del length
+    width = 40
+    lhs = int(_random_decimal_string(width, rng))
+    rhs = int(_random_decimal_string(width, rng))
+    is_add = rng.random() < 0.5
+
+    if is_add:
+        op_token = PLUS_ID
+        answer = lhs + rhs
+    else:
+        if lhs < rhs:
+            lhs, rhs = rhs, lhs
+        op_token = MINUS_ID
+        answer = lhs - rhs
+
+    prefix_tokens = [encode_digit(int(ch)) for ch in str(lhs)]
+    prefix_tokens.append(op_token)
+    prefix_tokens.extend(encode_digit(int(ch)) for ch in str(rhs))
+
+    return _make_row(
+        prefix_tokens=prefix_tokens,
+        output_tokens=encode_decimal_number(answer),
+        length=width,
+        task_name=task_name,
+        operation_name="addsub_40",
+    )
+
+
 TASK_BUILDERS = {
     "reverse_digits": build_reverse_example,
     "copy_digits": build_copy_example,
@@ -353,6 +397,7 @@ TASK_BUILDERS = {
     "running_max": build_running_max_example,
     "sum_threshold": build_sum_threshold_example,
     "bracket_depth": build_bracket_depth_example,
+    "addsub_40": build_addsub_40_example,
     "mixed_digits": None,
     "mixed_all_digits": None,
     "mixed_v3": None,

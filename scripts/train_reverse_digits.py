@@ -18,9 +18,14 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 from camoe.config import CaMoEConfig
 from camoe.model import CaMoE_Model
+from camoe.expert_rosa import ROSAExpert
 from camoe.reverse_baselines import (
     BaselinePureRosaRWKVFFN,
     BaselineTimeMixRosaRWKVFFN,
@@ -53,6 +58,9 @@ BRACKET_ID = 25
 MASK_ID = 26
 LPAREN_ID = 27
 RPAREN_ID = 28
+PLUS_ID = 29
+MINUS_ID = 30
+ADDSUB_ID = 31
 IGNORE_INDEX = -100
 TOKEN_NAMES = {
     PAD_ID: "[PAD]",
@@ -74,6 +82,9 @@ TOKEN_NAMES = {
     MASK_ID: "[MASK]",
     LPAREN_ID: "(",
     RPAREN_ID: ")",
+    PLUS_ID: "+",
+    MINUS_ID: "-",
+    ADDSUB_ID: "[ADDSUB]",
 }
 TOKEN_NAMES.update({4 + value: str(value) for value in range(10)})
 ANSI_YELLOW = "\033[93m"
@@ -111,6 +122,7 @@ OPERATION_NAME_BY_ID = {
     9: "running_max",
     10: "sum_threshold",
     11: "bracket_depth",
+    12: "addsub_40",
 }
 
 
@@ -244,7 +256,7 @@ def split_optim_params(model: CaMoE_Model) -> tuple[list[torch.nn.Parameter], li
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "critic_pair" in name:
+        if "reward_critic" in name:
             critic_params.append(param)
         else:
             expert_params.append(param)
@@ -252,16 +264,40 @@ def split_optim_params(model: CaMoE_Model) -> tuple[list[torch.nn.Parameter], li
 
 
 def _compute_market_alpha(step: int, config: CaMoEConfig) -> float:
-    start = config.prewarm_steps + config.market_warmup_steps
-    ramp = max(config.critic_warmup_steps, 1)
-    progress = min(max((step - start) / ramp, 0.0), 1.0)
-    return float(config.market_alpha_start + (config.market_alpha_end - config.market_alpha_start) * progress)
+    del step, config
+    return 1.0
+
+
+def _compute_market_weight(step: int, config: CaMoEConfig) -> float:
+    if step < config.uniform_warmup_steps:
+        return 0.0
+    ramp = max(config.market_ramp_steps, 0)
+    if ramp == 0:
+        return 1.0
+    progress = min(max(step - config.uniform_warmup_steps, 0) / ramp, 1.0)
+    return float(progress)
+
+
+def _compute_exploration_epsilon(step: int, config: CaMoEConfig) -> float:
+    if step < config.uniform_warmup_steps:
+        return 1.0
+    ramp = max(config.market_ramp_steps, 0)
+    if ramp == 0:
+        return float(config.exploration_epsilon)
+    progress = min(max(step - config.uniform_warmup_steps, 0) / ramp, 1.0)
+    return float(1.0 - progress * (1.0 - config.exploration_epsilon))
+
+
+def _set_exploration_epsilon(model: CaMoE_Model, exploration_epsilon: float) -> None:
+    if model.sequence_capital_manager is not None:
+        model.sequence_capital_manager.exploration_epsilon = float(exploration_epsilon)
+    model.ffn_capital_manager.exploration_epsilon = float(exploration_epsilon)
 
 
 def _compute_ste_temperature(step: int, config: CaMoEConfig) -> float:
-    if step < config.prewarm_steps:
+    if step < config.uniform_warmup_steps:
         return float(config.ste_temperature_start)
-    offset = step - config.prewarm_steps
+    offset = step - config.uniform_warmup_steps
     total = max(config.ste_anneal_steps, 0)
     mid = max(config.ste_midpoint_steps, 0)
     if total == 0:
@@ -281,16 +317,17 @@ def _compute_ste_temperature(step: int, config: CaMoEConfig) -> float:
 
 
 def get_phase(step: int, config: CaMoEConfig) -> tuple[str, float]:
-    s1 = config.prewarm_steps
-    s2 = s1 + config.market_warmup_steps
-    s3 = s2 + config.critic_warmup_steps
-    if step < s1:
-        return "prewarm", float(config.market_alpha_start)
-    if step < s2:
-        return "market_warm", float(config.market_alpha_start)
-    if step < s3:
-        return "critic_warm", _compute_market_alpha(step, config)
-    return "full_market", float(config.market_alpha_end)
+    if step < config.uniform_warmup_steps:
+        return "uniform_warmup", 1.0
+    return "full_market", 1.0
+
+
+def filter_dataset_by_operation(dataset: Dataset, operation_name: str | None) -> Dataset:
+    if not operation_name:
+        return dataset
+    return dataset.filter(
+        lambda row: (row.get("operation") or row.get("task")) == operation_name
+    )
 
 
 def infer_max_sequence_length(*datasets: Dataset) -> int:
@@ -307,7 +344,7 @@ def infer_max_sequence_length(*datasets: Dataset) -> int:
 
 def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
     return CaMoEConfig(
-        vocab_size=29,
+        vocab_size=32,
         dim=args.dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -317,7 +354,7 @@ def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
         n_rosa_experts=1,
         ffn_expand=4,
         tie_weights=True,
-        rosa_backend="wind",
+        rosa_backend=args.rosa_backend,
         rosa_bits=args.rosa_bits,
         slim_rosa_heads=args.slim_rosa_heads,
         rosa_truncation_length=args.rosa_truncation_length,
@@ -325,6 +362,12 @@ def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
         deepembed_expand=args.deepembed_expand,
         slim_deepembed_rank=args.slim_deepembed_rank,
         auction_noise_std=args.auction_noise_std,
+        routing_noise_std=args.routing_noise_std,
+        exploration_epsilon=args.exploration_epsilon,
+        bet_fraction=args.bet_fraction,
+        price_lr=args.price_lr,
+        price_temperature=args.price_temperature,
+        liquidity_floor=args.liquidity_floor,
         market_alpha_start=args.market_alpha_start,
         market_alpha_end=args.market_alpha_end,
         routing_ste=bool(args.routing_ste),
@@ -333,6 +376,7 @@ def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
         ste_temperature_end=args.ste_temperature_end,
         ste_midpoint_steps=args.ste_midpoint_steps,
         ste_anneal_steps=args.ste_anneal_steps,
+        market_ramp_steps=args.market_ramp_steps,
         enable_compile=False,
         enable_gradient_checkpointing=False,
         expert_capital_init=1.0,
@@ -342,11 +386,15 @@ def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
         capital_ceiling=args.capital_ceiling,
         depreciation=args.depreciation,
         critic_hidden_dim=None,
+        reward_hidden_dim=args.reward_hidden_dim,
         critic_update_interval=args.critic_update_interval,
         critic_lr=args.critic_lr,
+        reward_scale=args.reward_scale,
+        reward_eps=args.reward_eps,
         routing_entropy_reg=args.routing_entropy_reg,
         critic_shadow_prewarm=bool(args.critic_shadow_prewarm),
         critic_shadow_market=bool(args.critic_shadow_market),
+        uniform_warmup_steps=args.uniform_warmup_steps,
         prewarm_steps=args.prewarm_steps,
         market_warmup_steps=args.market_warmup_steps,
         critic_warmup_steps=args.critic_warmup_steps,
@@ -367,6 +415,7 @@ def evaluate_model(
     critic_alpha: float = 1.0,
     ste_temperature: float = 0.3,
     uniform: bool = False,
+    market_weight: float = 1.0,
 ) -> dict[str, float]:
     model.eval()
     loss_sum = 0.0
@@ -390,6 +439,7 @@ def evaluate_model(
                     ste_temperature=ste_temperature,
                     training=False,
                     uniform=uniform,
+                    market_weight=market_weight,
                 )
             else:
                 result = model(batch["input_ids"], batch["targets"])
@@ -490,6 +540,7 @@ def render_route_preview(
     critic_alpha: float,
     ste_temperature: float,
     uniform: bool,
+    market_weight: float,
 ) -> None:
     model.eval()
     with torch.no_grad():
@@ -500,6 +551,7 @@ def render_route_preview(
             ste_temperature=ste_temperature,
             training=False,
             uniform=uniform,
+            market_weight=market_weight,
         )
     diagnostics = model.get_market_diagnostics()
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -532,8 +584,8 @@ def render_route_preview(
         capitals = entry["capitals"].cpu().tolist()
         cache = entry["cache"]
         winners = cache["winners"].cpu()
-        bids = cache.get("bids")
-        bids = bids.cpu() if bids is not None else None
+        expected_profit = cache.get("expected_profit")
+        expected_profit = expected_profit.cpu() if expected_profit is not None else None
         html_parts.append(f"<h2>Layer {layer_idx} | {html.escape(market_name)}</h2>")
         #print(f"[route-preview] task={task_name} layer={layer_idx} market={market_name}")
         legend_chunks = []
@@ -560,10 +612,12 @@ def render_route_preview(
             winners_row = winners[sample_idx].tolist()
             answer_row = answer_mask_cpu[sample_idx].tolist()
             valid_row = valid_mask_cpu[sample_idx].tolist()
-            if bids is None:
-                selected_bids = None
+            if expected_profit is None:
+                selected_scores = None
             else:
-                selected_bids = bids[sample_idx, torch.arange(winners.size(1)), winners[sample_idx]].tolist()
+                selected_scores = expected_profit[
+                    sample_idx, torch.arange(winners.size(1)), winners[sample_idx]
+                ].tolist()
             op_name = OPERATION_NAME_BY_ID.get(int(op_ids_cpu[sample_idx].item()), "unknown")
             if op_name != last_op_name:
                 html_parts.append(f"<div class=\"op-sep\"><h3>Operation: {html.escape(op_name)}</h3></div>")
@@ -571,7 +625,7 @@ def render_route_preview(
 
             html_tokens = []
             rows = []
-            bid_iter = selected_bids if selected_bids is not None else [None] * len(tokens)
+            bid_iter = selected_scores if selected_scores is not None else [None] * len(tokens)
             for pos, (token, winner, is_answer, is_valid, bid_value) in enumerate(
                 zip(tokens, winners_row, answer_row, valid_row, bid_iter)
             ):
@@ -600,8 +654,8 @@ def render_route_preview(
             html_parts.append(f"<h4>Sample {sample_idx} | {html.escape(op_name)}</h4>")
             html_parts.append(f"<div>{' '.join(html_tokens)}</div>")
             html_parts.append(
-                "<table><tr><th>pos</th><th>token</th><th>winner_id</th><th>winner</th><th>bid</th><th>answer</th></tr>"
-            )
+                    "<table><tr><th>pos</th><th>token</th><th>winner_id</th><th>winner</th><th>score</th><th>answer</th></tr>"
+                )
             html_parts.extend(rows)
             html_parts.append("</table>")
 
@@ -641,6 +695,122 @@ def preview_route_stats(model: CaMoE_Model, batch: dict[str, torch.Tensor]) -> d
             rosa_share = (rosa_share * token_mask).sum() / token_mask.sum().clamp(min=1e-8)
             stats[f"preview/{op_name}/layer_{layer_idx}/rosa_share_answer"] = float(rosa_share.item())
     return stats
+
+
+def _iter_rosa_experts(model: torch.nn.Module) -> list[tuple[str, ROSAExpert]]:
+    experts: list[tuple[str, ROSAExpert]] = []
+    if isinstance(model, CaMoE_Model):
+        for layer_idx, block in enumerate(model.blocks):
+            if block.rosa_expert is not None:
+                experts.append((f"layer_{layer_idx}", block.rosa_expert))
+        return experts
+
+    rosa_layers = getattr(model, "rosa_layers", None)
+    if rosa_layers is None:
+        return experts
+    for layer_idx, expert in enumerate(rosa_layers):
+        if isinstance(expert, ROSAExpert):
+            experts.append((f"layer_{layer_idx}", expert))
+    return experts
+
+
+def emit_inner_language_log(
+    *,
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    step: int,
+    task_name: str,
+    model_kind: str,
+    artifact_dir: Path,
+    critic_alpha: float,
+    ste_temperature: float,
+    uniform: bool,
+    market_weight: float,
+) -> dict[str, float]:
+    rosa_experts = _iter_rosa_experts(model)
+    if not rosa_experts:
+        return {}
+
+    captured_inputs: dict[str, torch.Tensor] = {}
+    handles = []
+    for label, expert in rosa_experts:
+        def _hook(module, inputs, label=label):
+            if inputs:
+                captured_inputs[label] = inputs[0].detach()
+
+        handles.append(expert.register_forward_pre_hook(_hook))
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        if model_kind == "camoe":
+            model(
+                batch["input_ids"],
+                batch["targets"],
+                critic_alpha=critic_alpha,
+                ste_temperature=ste_temperature,
+                training=False,
+                uniform=uniform,
+                market_weight=market_weight,
+            )
+        else:
+            model(batch["input_ids"], batch["targets"])
+    for handle in handles:
+        handle.remove()
+    model.train(was_training)
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    text_path = artifact_dir / f"step_{step:06d}_inner_language.txt"
+    lines = [f"task={task_name} step={step} model_kind={model_kind}"]
+    logs: dict[str, float] = {}
+
+    for label, expert in rosa_experts:
+        x_in = captured_inputs.get(label)
+        if x_in is None:
+            continue
+        summary = expert.summarize_symbol_language(x_in, valid_mask=batch["valid_mask"])
+        prefix = f"inner_lang/{label}"
+        logs[f"{prefix}/q_bit_balance"] = float(summary["q_bit_balance"])
+        logs[f"{prefix}/q_margin_mean"] = float(summary["q_margin_mean"])
+        logs[f"{prefix}/q_vocab_mean"] = float(summary["q_vocab_mean"])
+        logs[f"{prefix}/q_entropy_mean"] = float(summary["q_entropy_mean"])
+        logs[f"{prefix}/q_repeat_rate_mean"] = float(summary["q_repeat_rate_mean"])
+
+        print(
+            f"[inner-lang][step {step}] {label} "
+            f"backend={summary['backend']} bits={summary['bits_per_symbol']} heads={summary['heads']} "
+            f"q_vocab_mean={float(summary['q_vocab_mean']):.2f} "
+            f"q_entropy_mean={float(summary['q_entropy_mean']):.3f} "
+            f"q_repeat_rate={float(summary['q_repeat_rate_mean']):.3f} "
+            f"q_bit_balance={float(summary['q_bit_balance']):.3f} "
+            f"q_margin_mean={float(summary['q_margin_mean']):.3f}"
+        )
+        lines.append(
+            f"[{label}] backend={summary['backend']} bits={summary['bits_per_symbol']} heads={summary['heads']} "
+            f"valid_tokens={summary['valid_tokens']} q_vocab_mean={float(summary['q_vocab_mean']):.4f} "
+            f"q_entropy_mean={float(summary['q_entropy_mean']):.4f} "
+            f"q_repeat_rate_mean={float(summary['q_repeat_rate_mean']):.4f} "
+            f"q_bit_balance={float(summary['q_bit_balance']):.4f} "
+            f"q_margin_mean={float(summary['q_margin_mean']):.4f}"
+        )
+
+        for head_name, items in summary["top_q_symbols"].items():
+            joined = ", ".join(items)
+            print(f"[inner-lang][step {step}] {label} {head_name} top_q={joined}")
+            lines.append(f"[{label}] {head_name} top_q={joined}")
+
+        for stream_name, stream_map in (
+            ("q", summary["sample0_q"]),
+            ("k", summary["sample0_k"]),
+            ("v", summary["sample0_v"]),
+        ):
+            for head_name, symbols in stream_map.items():
+                joined = " ".join(symbols)
+                print(f"[inner-lang][step {step}] {label} sample0_{stream_name}_{head_name}={joined}")
+                lines.append(f"[{label}] sample0_{stream_name}_{head_name}={joined}")
+
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return logs
 
 
 def market_logs_from_batch(
@@ -705,6 +875,122 @@ def market_logs_from_batch(
     return logs
 
 
+def _format_tensor_list(tensor: torch.Tensor | None, digits: int = 4) -> list[float] | None:
+    if tensor is None:
+        return None
+    flat = tensor.detach().float().cpu().reshape(-1).tolist()
+    return [round(float(value), digits) for value in flat]
+
+
+def _set_force_winner(
+    model: CaMoE_Model,
+    *,
+    sequence_idx: int | None,
+    ffn_idx: int | None,
+) -> None:
+    if model.sequence_capital_manager is not None:
+        model.sequence_capital_manager.force_winner = sequence_idx
+    model.ffn_capital_manager.force_winner = ffn_idx
+
+
+def emit_debug_step(
+    *,
+    step: int,
+    model: CaMoE_Model,
+    batch: dict[str, torch.Tensor],
+    result: dict[str, torch.Tensor],
+    settle_results: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]],
+    phase: str,
+    ste_temperature: float,
+    exploration_epsilon: float,
+    critic_loss_value: float,
+) -> None:
+    supervised = float(batch["supervised_mask"].sum().item())
+    valid = float(batch["valid_mask"].sum().item())
+    print(
+        f"[debug][step {step}] phase={phase} "
+        f"loss_scalar={float(result['loss_scalar'].detach().item()):.6f} "
+        f"loss_main={float(result.get('loss_main_scalar', result['loss_scalar']).detach().item()):.6f} "
+        f"critic_loss={float(critic_loss_value):.6f} "
+        f"ste_temperature={float(ste_temperature):.4f} "
+        f"exploration_epsilon={float(exploration_epsilon):.4f} "
+        f"supervised_tokens={supervised:.0f} valid_tokens={valid:.0f}"
+    )
+
+    settle_map = {(int(item["layer"]), str(item["market"])): item for item in settle_results}
+    diagnostics = model.get_market_diagnostics()
+    for entry in diagnostics:
+        layer_idx = int(entry["layer"])
+        market_name = str(entry.get("market", "ffn"))
+        expert_types = list(entry.get("expert_types", []))
+        caps = entry.get("capitals")
+        prices = entry.get("prices")
+        q = entry.get("q")
+        loss_ema = entry.get("loss_ema")
+        cache = entry.get("cache", {})
+        winners = cache.get("winners")
+        pred_reward = cache.get("pred_reward")
+        expected_profit = cache.get("expected_profit")
+        exploration_mask = cache.get("exploration_mask")
+        if winners is None:
+            continue
+
+        winners_cpu = winners.detach().cpu()
+        winner_hist = torch.bincount(winners_cpu.reshape(-1), minlength=len(expert_types)).float()
+        winner_hist = winner_hist / winner_hist.sum().clamp(min=1.0)
+        preview_steps = min(12, winners_cpu.size(1))
+        preview_winners = winners_cpu[0, :preview_steps].tolist()
+
+        print(
+            f"[debug][step {step}] L{layer_idx}/{market_name} "
+            f"experts={expert_types} "
+            f"loss_ema={None if loss_ema is None else round(float(loss_ema.detach().item()), 6)}"
+        )
+        print(
+            f"[debug][step {step}] L{layer_idx}/{market_name} "
+            f"caps={_format_tensor_list(caps)} "
+            f"prices={_format_tensor_list(prices)} "
+            f"q={_format_tensor_list(q)} "
+            f"winner_hist={_format_tensor_list(winner_hist)}"
+        )
+
+        if pred_reward is not None:
+            chosen_pred = torch.gather(pred_reward, dim=-1, index=winners.unsqueeze(-1)).squeeze(-1)
+            pred_preview = chosen_pred[0, :preview_steps].detach().cpu().tolist()
+            pred_preview = [round(float(value), 4) for value in pred_preview]
+        else:
+            pred_preview = None
+
+        if expected_profit is not None:
+            chosen_profit = torch.gather(expected_profit, dim=-1, index=winners.unsqueeze(-1)).squeeze(-1)
+            profit_preview = chosen_profit[0, :preview_steps].detach().cpu().tolist()
+            profit_preview = [round(float(value), 4) for value in profit_preview]
+        else:
+            profit_preview = None
+
+        exploration_rate = (
+            None
+            if exploration_mask is None
+            else round(float(exploration_mask.float().mean().detach().cpu().item()), 4)
+        )
+        print(
+            f"[debug][step {step}] L{layer_idx}/{market_name} "
+            f"sample0_winners={preview_winners} "
+            f"sample0_pred_reward={pred_preview} "
+            f"sample0_expected_profit={profit_preview} "
+            f"exploration_rate={exploration_rate}"
+        )
+
+        settle = settle_map.get((layer_idx, market_name))
+        if settle is not None:
+            print(
+                f"[debug][step {step}] L{layer_idx}/{market_name} "
+                f"profit={_format_tensor_list(settle.get('profit'))} "
+                f"avg_reward={_format_tensor_list(settle.get('avg_reward'))} "
+                f"winner_share={_format_tensor_list(settle.get('winner_share'))}"
+            )
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -731,6 +1017,10 @@ def save_checkpoint(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train small toy-sequence ROSA/CaMoE models")
     parser.add_argument("--data_dir", type=str, default="data/reverse_digits")
+    parser.add_argument("--task_filter", type=str, default="reverse_digits")
+    parser.add_argument("--mode", choices=["normal", "debug", "single-debug"], default="normal")
+    parser.add_argument("--debug_sequence_expert_idx", type=int, default=0)
+    parser.add_argument("--debug_ffn_expert_idx", type=int, default=0)
     parser.add_argument(
         "--model_kind",
         choices=["timemix_rosa_ffn", "timemix_ffn", "pure_rosa_ffn", "camoe"],
@@ -742,12 +1032,24 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--eval_interval", type=int, default=250)
     parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--inner_language_log_interval", type=int, default=0)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--critic_update_interval", type=int, default=8)
+    parser.add_argument("--bet_fraction", type=float, default=0.05)
+    parser.add_argument("--price_lr", type=float, default=0.02)
+    parser.add_argument("--price_temperature", type=float, default=1.0)
+    parser.add_argument("--liquidity_floor", type=float, default=0.02)
+    parser.add_argument("--reward_scale", type=float, default=5.0)
+    parser.add_argument("--reward_eps", type=float, default=1e-8)
+    parser.add_argument("--reward_hidden_dim", type=int, default=None)
+    parser.add_argument("--uniform_warmup_steps", type=int, default=1500)
+    parser.add_argument("--market_ramp_steps", type=int, default=1000)
+    parser.add_argument("--routing_noise_std", type=float, default=0.05)
+    parser.add_argument("--exploration_epsilon", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--dim", type=int, default=64)
@@ -758,6 +1060,7 @@ def main() -> None:
     parser.add_argument("--deepembed_expand", type=int, default=4)
     parser.add_argument("--slim_deepembed_rank", type=int, default=32)
     parser.add_argument("--slim_rosa_heads", type=int, default=8)
+    parser.add_argument("--rosa_backend", type=str, default="wind", choices=["wind", "soft", "sufa", "scan"])
     parser.add_argument("--rosa_bits", type=int, default=8)
     parser.add_argument("--rosa_truncation_length", type=int, default=8)
     parser.add_argument("--auction_noise_std", type=float, default=0.05)
@@ -779,6 +1082,9 @@ def main() -> None:
     parser.add_argument("--critic_warmup_steps", type=int, default=1000)
     parser.add_argument("--save_dir", type=str, default="checkpoints/reverse_digits")
     parser.add_argument("--artifact_dir", type=str, default="artifacts/reverse_digits")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--stop_on_val_exact", action="store_true")
+    parser.add_argument("--stop_on_val_exact_threshold", type=float, default=0.0)
     parser.add_argument("--max_eval_length", type=int, default=20)
     parser.add_argument("--no_swanlab", action="store_true")
     args = parser.parse_args()
@@ -787,6 +1093,13 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     task_name, train_ds, val_ds, ood_ds = load_splits(args.data_dir)
+    train_ds = filter_dataset_by_operation(train_ds, args.task_filter)
+    val_ds = filter_dataset_by_operation(val_ds, args.task_filter)
+    ood_ds = filter_dataset_by_operation(ood_ds, args.task_filter)
+    if len(train_ds) == 0 or len(val_ds) == 0 or len(ood_ds) == 0:
+        raise ValueError(f"task_filter={args.task_filter!r} produced an empty split from {args.data_dir}.")
+    if args.task_filter:
+        task_name = args.task_filter
     collate_fn = build_collate_fn()
     train_loader = DataLoader(
         train_ds,
@@ -816,16 +1129,39 @@ def main() -> None:
     preview_batch = move_batch(collate_fn(preview_rows), device)
 
     detected_seq_len = pad_to_chunk(infer_max_sequence_length(train_ds, val_ds, ood_ds))
-    config = build_config(args, seq_len=detected_seq_len)
+    resume_payload: dict | None = None
+    resume_path = Path(args.resume) if args.resume else None
+    if resume_path is not None:
+        resume_payload = torch.load(resume_path, map_location="cpu")
+        config = CaMoEConfig.from_mapping(resume_payload["config"])
+        config.seq_len = detected_seq_len
+        config.total_steps = args.steps
+        config.batch_size = args.batch_size
+        config.lr = args.lr
+        config.critic_lr = args.critic_lr
+    else:
+        config = build_config(args, seq_len=detected_seq_len)
     print(
         f"[config] task={task_name} detected_seq_len={detected_seq_len} "
         f"(from train/val/ood max sample length)"
     )
+    if args.mode == "single-debug" and args.model_kind != "camoe":
+        raise ValueError("mode=single-debug requires --model_kind camoe.")
     if args.model_kind == "camoe":
         model: torch.nn.Module = CaMoE_Model(config).to(device)
         expert_params, critic_params = split_optim_params(model)
         optimizer = torch.optim.AdamW(expert_params, lr=args.lr, weight_decay=args.weight_decay)
         critic_optimizer = torch.optim.AdamW(critic_params, lr=args.critic_lr, weight_decay=args.weight_decay)
+        sequence_debug_idx = None
+        ffn_debug_idx = None
+        if args.mode == "single-debug":
+            sequence_debug_idx = max(0, min(args.debug_sequence_expert_idx, 1))
+            ffn_debug_idx = max(0, min(args.debug_ffn_expert_idx, config.total_ffn_experts - 1))
+        _set_force_winner(
+            model,
+            sequence_idx=sequence_debug_idx,
+            ffn_idx=ffn_debug_idx,
+        )
     elif args.model_kind == "timemix_rosa_ffn":
         model = BaselineTimeMixRosaRWKVFFN(config).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -857,14 +1193,35 @@ def main() -> None:
     artifact_dir = Path(args.artifact_dir) / task_name / args.model_kind
     train_iter = infinite_loader(train_loader)
     model.train()
+    start_step = 0
 
-    for step in range(args.steps):
+    if resume_payload is not None:
+        model.load_state_dict(resume_payload["model"])
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        if critic_optimizer is not None and "critic_optimizer" in resume_payload:
+            critic_optimizer.load_state_dict(resume_payload["critic_optimizer"])
+        start_step = int(resume_payload.get("step", -1)) + 1
+        swanlab_run_id = resume_payload.get("swanlab_run_id", swanlab_run_id)
+        print(f"[resume] path={resume_path} start_step={start_step}")
+        if start_step >= args.steps:
+            raise ValueError(
+                f"Resume checkpoint already reached step={start_step - 1}, "
+                f"which is not less than requested --steps={args.steps}."
+            )
+
+    final_step = start_step - 1
+    stop_reason: str | None = None
+    for step in range(start_step, args.steps):
         step_start = time.time()
         batch = move_batch(next(train_iter), device)
 
         if args.model_kind == "camoe":
             phase, critic_alpha = get_phase(step, config)
+            uniform = phase == "uniform_warmup"
             ste_temperature = _compute_ste_temperature(step, config)
+            dynamic_eps = 0.0 if args.mode == "single-debug" else _compute_exploration_epsilon(step, config)
+            market_weight = _compute_market_weight(step, config)
+            _set_exploration_epsilon(model, dynamic_eps)
             optimizer.zero_grad(set_to_none=True)
             result = model(
                 batch["input_ids"],
@@ -872,27 +1229,22 @@ def main() -> None:
                 critic_alpha=critic_alpha,
                 ste_temperature=ste_temperature,
                 training=True,
-                uniform=(phase == "prewarm"),
+                uniform=uniform,
+                market_weight=market_weight,
             )
             result["loss_scalar"].backward()
             clip_grad_norm_(expert_params, config.grad_clip)
             optimizer.step()
 
-            settle_results = []
-            shadow_prewarm = phase == "prewarm" and config.critic_shadow_prewarm
-            shadow_market = phase == "market_warm" and config.critic_shadow_market
-            should_settle = phase != "prewarm" or shadow_prewarm
-            if should_settle:
-                with torch.no_grad():
-                    settle_results = model.settle_all_layers(
-                        result["loss"].detach(),
-                        token_weight=batch["supervised_mask"].detach(),
-                        update_state=not shadow_prewarm,
-                    )
+            with torch.no_grad():
+                settle_results = model.settle_all_layers(
+                    result["loss"].detach(),
+                    token_weight=batch["supervised_mask"].detach(),
+                    update_state=not uniform,
+                )
 
             critic_loss_value = 0.0
-            should_train_critic = (phase not in ("prewarm", "market_warm")) or shadow_prewarm or shadow_market
-            if should_train_critic and settle_results and step % config.critic_update_interval == 0:
+            if settle_results and not uniform:
                 critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss = model.compute_critic_loss(
                     settle_results,
@@ -903,15 +1255,33 @@ def main() -> None:
                 clip_grad_norm_(critic_params, 1.0)
                 critic_optimizer.step()
                 critic_loss_value = float(critic_loss.detach().item())
+            if args.mode in {"debug", "single-debug"}:
+                emit_debug_step(
+                    step=step,
+                    model=model,
+                    batch=batch,
+                    result=result,
+                    settle_results=settle_results,
+                    phase=phase,
+                    ste_temperature=ste_temperature,
+                    exploration_epsilon=dynamic_eps,
+                    critic_loss_value=critic_loss_value,
+                )
         else:
             phase, critic_alpha = "single", 1.0
             ste_temperature = config.ste_temperature_end
+            market_weight = 1.0
             optimizer.zero_grad(set_to_none=True)
             result = model(batch["input_ids"], batch["targets"])
             result["loss_scalar"].backward()
             clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
             critic_loss_value = 0.0
+            if args.mode in {"debug", "single-debug"}:
+                print(
+                    f"[debug][step {step}] phase={phase} "
+                    f"loss_scalar={float(result['loss_scalar'].detach().item()):.6f}"
+                )
 
         train_token_acc, train_exact = masked_metrics(result["logits"], batch["targets"], batch["supervised_mask"])
         if step % args.log_interval == 0:
@@ -924,8 +1294,9 @@ def main() -> None:
             }
             if args.model_kind == "camoe":
                 logs["train/critic_loss"] = float(critic_loss_value)
-                logs["train/critic_alpha"] = float(critic_alpha)
                 logs["train/ste_temperature"] = float(ste_temperature)
+                logs["train/exploration_epsilon"] = float(dynamic_eps)
+                logs["train/market_weight"] = float(market_weight)
                 logs.update(market_logs_from_batch(model, batch))
             print(
                 f"step={step} task={task_name} kind={args.model_kind} phase={phase} "
@@ -943,7 +1314,8 @@ def main() -> None:
                 args.model_kind,
                 critic_alpha=critic_alpha,
                 ste_temperature=ste_temperature,
-                uniform=(args.model_kind == "camoe" and phase == "prewarm"),
+                uniform=(phase == "uniform_warmup"),
+                market_weight=market_weight,
             )
             ood_metrics = evaluate_model(
                 model,
@@ -952,7 +1324,8 @@ def main() -> None:
                 args.model_kind,
                 critic_alpha=critic_alpha,
                 ste_temperature=ste_temperature,
-                uniform=(args.model_kind == "camoe" and phase == "prewarm"),
+                uniform=(phase == "uniform_warmup"),
+                market_weight=market_weight,
             )
             eval_logs = {
                 "val/loss": val_metrics["loss"],
@@ -988,7 +1361,7 @@ def main() -> None:
                 print(f"[eval-by-op] val {' '.join(val_by_op)}")
             if ood_by_op:
                 print(f"[eval-by-op] ood {' '.join(ood_by_op)}")
-            if args.model_kind == "camoe" and phase != "prewarm":
+            if args.model_kind == "camoe":
                 render_route_preview(
                     model,
                     preview_batch,
@@ -997,7 +1370,8 @@ def main() -> None:
                     task_name,
                     critic_alpha=critic_alpha,
                     ste_temperature=ste_temperature,
-                    uniform=(phase == "prewarm"),
+                    uniform=(phase == "uniform_warmup"),
+                    market_weight=market_weight,
                 )
                 preview_logs = preview_route_stats(model, preview_batch)
                 if preview_logs:
@@ -1005,8 +1379,30 @@ def main() -> None:
                         #print(f"[route-stats] {key}={value:.4f}")
                         pass
                     eval_logs.update(preview_logs)
+            if (
+                args.inner_language_log_interval > 0
+                and (step % args.inner_language_log_interval == 0 or step == args.steps - 1)
+            ):
+                inner_logs = emit_inner_language_log(
+                    model=model,
+                    batch=preview_batch,
+                    step=step,
+                    task_name=task_name,
+                    model_kind=args.model_kind,
+                    artifact_dir=artifact_dir,
+                    critic_alpha=critic_alpha,
+                    ste_temperature=ste_temperature,
+                    uniform=(phase == "uniform_warmup"),
+                    market_weight=market_weight,
+                )
+                eval_logs.update(inner_logs)
             if HAS_SWANLAB and not args.no_swanlab:
                 swanlab.log(eval_logs, step=step)
+            if args.stop_on_val_exact and val_metrics["exact_match"] >= args.stop_on_val_exact_threshold:
+                stop_reason = f"val_exact={val_metrics['exact_match']:.4f}"
+                final_step = step
+                print(f"[early-stop] step={step} reason={stop_reason}")
+                break
 
         if step > 0 and step % args.save_interval == 0:
             save_checkpoint(
@@ -1018,16 +1414,19 @@ def main() -> None:
                 critic_optimizer=critic_optimizer,
                 swanlab_run_id=swanlab_run_id,
             )
+        final_step = step
 
     save_checkpoint(
         save_dir / "final.pth",
         model,
         optimizer,
-        args.steps - 1,
+        final_step,
         config,
         critic_optimizer=critic_optimizer,
         swanlab_run_id=swanlab_run_id,
     )
+    if stop_reason is not None:
+        print(f"[done] stopped early at step={final_step} ({stop_reason})")
 
 
 if __name__ == "__main__":

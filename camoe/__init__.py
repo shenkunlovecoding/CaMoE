@@ -1,11 +1,11 @@
-"""CaMoE v22 public API."""
+"""CaMoE public API."""
 
-from .auction import VickreyAuctionHouse
+from .auction import PredictionMarketRouter
 from .block import CaMoE_Block
-from .capital import ExpertCapitalManager
+from .capital import MarketStateManager
 from .config import CONFIG_0_1B, CONFIG_0_4B, VERSION, CaMoEConfig, get_config
 from .expert_base import BaseExpert
-from .expert_critic import CriticExpert, CriticPair
+from .expert_critic import RewardCritic
 from .expert_deepembed import DeepEmbedExpert, SlimDeepEmbedExpert
 from .expert_fractal import ExpansionRightLedger, FractalBlueprint, FractalCaMoEPlaceholder
 from .expert_rosa import ROSAExpert
@@ -25,14 +25,14 @@ __all__ = [
     "CaMoE_Model",
     "CONFIG_0_1B",
     "CONFIG_0_4B",
-    "CriticExpert",
-    "CriticPair",
     "DeepEmbedExpert",
     "ExpansionRightLedger",
-    "ExpertCapitalManager",
     "FractalBlueprint",
     "FractalCaMoEPlaceholder",
+    "MarketStateManager",
+    "PredictionMarketRouter",
     "ROSAExpert",
+    "RewardCritic",
     "RWKVExpert",
     "SlimDeepEmbedExpert",
     "TimeMixExpert",
@@ -40,7 +40,6 @@ __all__ = [
     "BaselineTimeMixRosaRWKVFFN",
     "BaselineTimeMixRWKVFFN",
     "VERSION",
-    "VickreyAuctionHouse",
     "get_config",
     "load_camoe_checkpoint",
 ]

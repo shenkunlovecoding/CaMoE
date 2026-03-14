@@ -1,11 +1,11 @@
-"""Minimal configuration for CaMoE v22.1."""
+"""Minimal configuration for prediction-market CaMoE."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Mapping
 
-VERSION = "v22.1"
+VERSION = "v23.0"
 
 
 @dataclass
@@ -47,12 +47,19 @@ class CaMoEConfig:
     auction_noise_std: float = 0.01
     market_alpha_start: float = 0.0
     market_alpha_end: float = 1.0
+    routing_noise_std: float = 0.01
+    exploration_epsilon: float = 0.02
+    bet_fraction: float = 0.05
+    price_lr: float = 0.02
+    price_temperature: float = 1.0
+    liquidity_floor: float = 0.02
     routing_ste: bool = True
     ste_temperature_start: float = 2.0
     ste_temperature_mid: float = 1.0
     ste_temperature_end: float = 0.3
     ste_midpoint_steps: int = 1500
     ste_anneal_steps: int = 4000
+    market_ramp_steps: int = 1000
 
     # Runtime
     enable_compile: bool = True
@@ -69,14 +76,18 @@ class CaMoEConfig:
 
     # Critic
     critic_hidden_dim: int | None = None
+    reward_hidden_dim: int | None = None
     critic_update_interval: int = 8
     critic_lr: float = 3e-4
     critic_profit_clip: float = 1.0
+    reward_scale: float = 5.0
+    reward_eps: float = 1e-8
     routing_entropy_reg: float = 0.0
     critic_shadow_prewarm: bool = True
     critic_shadow_market: bool = True
 
     # Schedules
+    uniform_warmup_steps: int = 2000
     prewarm_steps: int = 2000
     market_warmup_steps: int = 3000
     critic_warmup_steps: int = 5000
@@ -96,11 +107,11 @@ class CaMoEConfig:
         if self.n_experts < 0 or self.n_deepembed_experts < 0 or self.n_slim_deepembed_experts < 0:
             raise ValueError("Expert counts must be non-negative.")
         if self.total_ffn_experts < 2:
-            raise ValueError("winner-takes-all Vickrey routing requires at least 2 FFN-market experts.")
+            raise ValueError("prediction-market routing requires at least 2 FFN-market experts.")
         if self.n_rosa_experts not in (0, 1):
-            raise ValueError("v22.1 supports either 0 or 1 sequence ROSA expert per layer.")
-        if self.rosa_backend != "wind":
-            raise ValueError("v22.1 only supports rosa_backend='wind'.")
+            raise ValueError("The current implementation supports either 0 or 1 sequence ROSA expert per layer.")
+        if self.rosa_backend not in {"wind", "soft", "sufa", "scan"}:
+            raise ValueError("rosa_backend must be one of {'wind', 'soft', 'sufa', 'scan'}.")
         if self.slim_rosa_heads is not None and self.slim_rosa_heads <= 0:
             raise ValueError("slim_rosa_heads must be positive when provided.")
         if self.rosa_bits <= 0:
@@ -119,6 +130,26 @@ class CaMoEConfig:
             raise ValueError("fractal_expansion_cost must be non-negative.")
         if self.capital_ceiling <= self.capital_floor:
             raise ValueError("capital_ceiling must be greater than capital_floor.")
+        if self.routing_noise_std < 0:
+            raise ValueError("routing_noise_std must be non-negative.")
+        if not 0 <= self.exploration_epsilon <= 1:
+            raise ValueError("exploration_epsilon must be in [0, 1].")
+        if self.bet_fraction < 0:
+            raise ValueError("bet_fraction must be non-negative.")
+        if self.price_lr < 0:
+            raise ValueError("price_lr must be non-negative.")
+        if self.price_temperature <= 0:
+            raise ValueError("price_temperature must be positive.")
+        if not 0 <= self.liquidity_floor < 1:
+            raise ValueError("liquidity_floor must be in [0, 1).")
+        if self.reward_scale <= 0:
+            raise ValueError("reward_scale must be positive.")
+        if self.reward_eps <= 0:
+            raise ValueError("reward_eps must be positive.")
+        if self.reward_hidden_dim is not None and self.reward_hidden_dim <= 0:
+            raise ValueError("reward_hidden_dim must be positive when provided.")
+        if self.uniform_warmup_steps < 0:
+            raise ValueError("uniform_warmup_steps must be non-negative.")
         if self.critic_profit_clip <= 0:
             raise ValueError("critic_profit_clip must be positive.")
         if self.market_alpha_start < 0 or self.market_alpha_end < 0:
@@ -133,6 +164,8 @@ class CaMoEConfig:
             raise ValueError("ste_midpoint_steps / ste_anneal_steps must be non-negative.")
         if self.ste_anneal_steps > 0 and self.ste_midpoint_steps > self.ste_anneal_steps:
             raise ValueError("ste_midpoint_steps must be <= ste_anneal_steps.")
+        if self.market_ramp_steps < 0:
+            raise ValueError("market_ramp_steps must be non-negative.")
 
     @property
     def head_size(self) -> int:

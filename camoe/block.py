@@ -1,4 +1,4 @@
-"""CaMoE v22.1 block with sequence and FFN markets."""
+"""CaMoE block with prediction-market routing."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from .auction import VickreyAuctionHouse
+from .auction import PredictionMarketRouter
 from .expert_base import BaseExpert
-from .expert_critic import CriticPair
-from .expert_timemix import TimeMixExpert
+from .expert_critic import RewardCritic
 from .expert_rosa import ROSAExpert
+from .expert_timemix import TimeMixExpert
 
 
 class CaMoE_Block(nn.Module):
@@ -21,34 +21,31 @@ class CaMoE_Block(nn.Module):
         timemix_expert: TimeMixExpert,
         rosa_expert: ROSAExpert | None,
         ffn_experts: list[BaseExpert],
-        sequence_critic_pair: CriticPair | None,
-        ffn_critic_pair: CriticPair,
-        sequence_auction_noise: float = 0.01,
-        ffn_auction_noise: float = 0.01,
+        sequence_reward_critic: RewardCritic | None,
+        ffn_reward_critic: RewardCritic,
+        routing_noise_std: float = 0.01,
         use_gradient_checkpointing: bool = True,
         use_routing_ste: bool = True,
         ste_temperature: float = 1.0,
-        enable_shadow_critic_training: bool = True,
     ) -> None:
         super().__init__()
         self.timemix_expert = timemix_expert
         self.rosa_expert = rosa_expert
         self.ffn_experts = nn.ModuleList(ffn_experts)
         self.experts = self.ffn_experts
-        self.sequence_critic_pair = sequence_critic_pair
-        self.critic_pair = ffn_critic_pair
+        self.sequence_reward_critic = sequence_reward_critic
+        self.ffn_reward_critic = ffn_reward_critic
         self.n_routable = len(ffn_experts)
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
         self.use_routing_ste = bool(use_routing_ste)
         self.ste_temperature = float(ste_temperature)
-        self.enable_shadow_critic_training = bool(enable_shadow_critic_training)
-        self.sequence_auction = VickreyAuctionHouse(noise_std=sequence_auction_noise)
-        self.ffn_auction = VickreyAuctionHouse(noise_std=ffn_auction_noise)
+        self.sequence_router = PredictionMarketRouter(noise_std=routing_noise_std)
+        self.ffn_router = PredictionMarketRouter(noise_std=routing_noise_std)
         self._cache: dict[str, dict[str, torch.Tensor]] = {}
 
     @property
     def has_sequence_market(self) -> bool:
-        return self.rosa_expert is not None and self.sequence_critic_pair is not None
+        return self.rosa_expert is not None and self.sequence_reward_critic is not None
 
     def forward(
         self,
@@ -58,26 +55,32 @@ class CaMoE_Block(nn.Module):
         ste_temperature: float | None = None,
         training: bool = True,
         uniform: bool = False,
+        market_weight: float = 1.0,
+        sequence_state: dict[str, torch.Tensor | float] | None = None,
+        ffn_state: dict[str, torch.Tensor | float] | None = None,
         **expert_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del critic_alpha
         ste_temp = self.ste_temperature if ste_temperature is None else float(ste_temperature)
         seq_out, next_v_first, seq_cache = self._forward_sequence_market(
             x,
             v_first=v_first,
-            critic_alpha=critic_alpha,
             ste_temperature=ste_temp,
             training=training,
             uniform=uniform,
+            market_weight=market_weight,
+            sequence_state=sequence_state,
             **expert_ctx,
         )
         x = x + seq_out
 
         ffn_out, ffn_cache = self._forward_ffn_market(
             x,
-            critic_alpha=critic_alpha,
             ste_temperature=ste_temp,
             training=training,
             uniform=uniform,
+            market_weight=market_weight,
+            ffn_state=ffn_state,
             **expert_ctx,
         )
         x = x + ffn_out
@@ -92,10 +95,11 @@ class CaMoE_Block(nn.Module):
         self,
         x: torch.Tensor,
         v_first: torch.Tensor | None,
-        critic_alpha: float,
         ste_temperature: float,
         training: bool,
         uniform: bool,
+        market_weight: float,
+        sequence_state: dict[str, torch.Tensor | float] | None,
         **expert_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         timemix_out, next_v_first, timemix_state = self.timemix_expert(
@@ -107,52 +111,44 @@ class CaMoE_Block(nn.Module):
             return timemix_out, next_v_first, {}
 
         assert self.rosa_expert is not None
+        assert self.sequence_reward_critic is not None
         rosa_out = self.rosa_expert(x, **expert_ctx)
         if uniform:
-            output = (timemix_out + rosa_out) * 0.5
-            if training and self.enable_shadow_critic_training:
-                positions = self.sequence_critic_pair.get_positions(x.detach()).detach()
-                expert_caps = torch.stack([self.timemix_expert.capital, self.rosa_expert.capital]).to(x.device)
-                winners, prices, bids = self.sequence_auction(
-                    expert_caps,
-                    positions,
-                    critic_alpha=critic_alpha,
-                    training=training,
-                )
-                cache = {
-                    "winners": winners.detach(),
-                    "prices": prices.detach(),
-                    "bids": bids.detach(),
-                    "positions": positions.detach(),
-                    "expert_capitals": expert_caps.detach(),
-                    "x_detached": x.detach(),
-                    "timemix_state": timemix_state.detach(),
-                }
-                return output, next_v_first, cache
-            return output, next_v_first, {}
+            return (timemix_out + rosa_out) * 0.5, next_v_first, {}
 
-        positions = self.sequence_critic_pair.get_positions(x.detach()).detach()
-        expert_caps = torch.stack([self.timemix_expert.capital, self.rosa_expert.capital]).to(x.device)
-        winners, prices, bids = self.sequence_auction(
-            expert_caps,
-            positions,
-            critic_alpha=critic_alpha,
+        if sequence_state is None:
+            raise ValueError("sequence_state is required when sequence prediction-market routing is enabled.")
+
+        reward_logits = self.sequence_reward_critic(x.detach())
+        route = self.sequence_router(
+            expert_capitals=sequence_state["capital"],
+            q=sequence_state["q"],
+            reward_logits=reward_logits,
+            bet_fraction=float(sequence_state["bet_fraction"]),
+            price_temperature=float(sequence_state["price_temperature"]),
+            liquidity_floor=float(sequence_state["liquidity_floor"]),
+            exploration_epsilon=float(sequence_state["exploration_epsilon"]),
+            force_winner=sequence_state.get("force_winner"),
             training=training,
         )
-        winner_mask = winners.unsqueeze(-1).eq(1)
+
+        winner_mask = route["winners"].unsqueeze(-1).eq(1)
         hard_output = torch.where(winner_mask, rosa_out, timemix_out)
         if training and self.use_routing_ste:
-            probs = torch.softmax(bids / ste_temperature, dim=-1)
+            probs = torch.softmax(route["score"] / ste_temperature, dim=-1)
             soft_output = timemix_out * probs[:, :, 0:1] + rosa_out * probs[:, :, 1:2]
-            output = soft_output + (hard_output - soft_output).detach()
+            market_output = soft_output + (hard_output - soft_output).detach()
         else:
-            output = hard_output
+            market_output = hard_output
+
+        if market_weight < 1.0:
+            uniform_output = (timemix_out + rosa_out) * 0.5
+            output = market_weight * market_output + (1.0 - market_weight) * uniform_output
+        else:
+            output = market_output
+
         cache = {
-            "winners": winners.detach(),
-            "prices": prices.detach(),
-            "bids": bids.detach(),
-            "positions": positions.detach(),
-            "expert_capitals": expert_caps.detach(),
+            **{key: value.detach() for key, value in route.items()},
             "x_detached": x.detach(),
             "timemix_state": timemix_state.detach(),
         }
@@ -161,61 +157,59 @@ class CaMoE_Block(nn.Module):
     def _forward_ffn_market(
         self,
         x: torch.Tensor,
-        critic_alpha: float,
         ste_temperature: float,
         training: bool,
         uniform: bool,
+        market_weight: float,
+        ffn_state: dict[str, torch.Tensor | float] | None,
         **expert_ctx,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if uniform:
-            output = self._forward_uniform_ffn(x, **expert_ctx)
-            if training and self.enable_shadow_critic_training:
-                positions = self.critic_pair.get_positions(x.detach()).detach()
-                expert_caps = torch.stack([expert.capital for expert in self.ffn_experts]).to(x.device)
-                winners, prices, bids = self.ffn_auction(
-                    expert_caps,
-                    positions,
-                    critic_alpha=critic_alpha,
-                    training=training,
-                )
-                cache = {
-                    "winners": winners.detach(),
-                    "prices": prices.detach(),
-                    "bids": bids.detach(),
-                    "positions": positions.detach(),
-                    "expert_capitals": expert_caps.detach(),
-                    "x_detached": x.detach(),
-                }
-                return output, cache
-            return output, {}
+            return self._forward_uniform_ffn(x, **expert_ctx), {}
 
-        positions = self.critic_pair.get_positions(x.detach()).detach()
-        expert_caps = torch.stack([expert.capital for expert in self.ffn_experts]).to(x.device)
-        winners, prices, bids = self.ffn_auction(
-            expert_caps,
-            positions,
-            critic_alpha=critic_alpha,
+        if ffn_state is None:
+            raise ValueError("ffn_state is required when FFN prediction-market routing is enabled.")
+
+        reward_logits = self.ffn_reward_critic(x.detach())
+        route = self.ffn_router(
+            expert_capitals=ffn_state["capital"],
+            q=ffn_state["q"],
+            reward_logits=reward_logits,
+            bet_fraction=float(ffn_state["bet_fraction"]),
+            price_temperature=float(ffn_state["price_temperature"]),
+            liquidity_floor=float(ffn_state["liquidity_floor"]),
+            exploration_epsilon=float(ffn_state["exploration_epsilon"]),
+            force_winner=ffn_state.get("force_winner"),
             training=training,
         )
+
         if training and self.use_routing_ste:
-            output = self._dispatch_ffn_ste(x, winners, bids, ste_temperature=ste_temperature, **expert_ctx)
+            market_output = self._dispatch_ffn_ste(
+                x,
+                route["winners"],
+                route["score"],
+                ste_temperature=ste_temperature,
+                **expert_ctx,
+            )
         elif self.training and self.use_gradient_checkpointing:
-            output = checkpoint(
+            market_output = checkpoint(
                 self._dispatch_ffn,
                 x,
-                winners,
+                route["winners"],
                 use_reentrant=False,
                 **expert_ctx,
             )
         else:
-            output = self._dispatch_ffn(x, winners, **expert_ctx)
+            market_output = self._dispatch_ffn(x, route["winners"], **expert_ctx)
+
+        if market_weight < 1.0:
+            uniform_output = self._forward_uniform_ffn(x, **expert_ctx)
+            output = market_weight * market_output + (1.0 - market_weight) * uniform_output
+        else:
+            output = market_output
 
         cache = {
-            "winners": winners.detach(),
-            "prices": prices.detach(),
-            "bids": bids.detach(),
-            "positions": positions.detach(),
-            "expert_capitals": expert_caps.detach(),
+            **{key: value.detach() for key, value in route.items()},
             "x_detached": x.detach(),
         }
         return output, cache
@@ -261,7 +255,7 @@ class CaMoE_Block(nn.Module):
         self,
         x: torch.Tensor,
         winners: torch.Tensor,
-        bids: torch.Tensor,
+        score: torch.Tensor,
         ste_temperature: float,
         **expert_ctx,
     ) -> torch.Tensor:
@@ -269,7 +263,7 @@ class CaMoE_Block(nn.Module):
         all_out = torch.stack(outputs, dim=2)
         hard_index = winners.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x.size(-1))
         hard_out = torch.gather(all_out, dim=2, index=hard_index).squeeze(2)
-        probs = torch.softmax(bids / ste_temperature, dim=-1).unsqueeze(-1)
+        probs = torch.softmax(score / ste_temperature, dim=-1).unsqueeze(-1)
         soft_out = (all_out * probs).sum(dim=2)
         return soft_out + (hard_out - soft_out).detach()
 

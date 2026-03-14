@@ -1,122 +1,48 @@
-"""Critic experts for pure-market CaMoE."""
+"""Reward critics for prediction-market CaMoE."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .expert_base import BaseExpert
 
-
-class CriticExpert(BaseExpert):
-    """
-    Market critic that takes long/short positions on routable experts.
-
-    The critic never participates in token routing and is trained only through
-    the separate REINFORCE-style objective.
-    """
+class RewardCritic(nn.Module):
+    """Predict per-token realized reward for each routable expert."""
 
     def __init__(
         self,
         dim: int,
         n_routable: int,
         hidden_dim: int | None = None,
-        capital_init: float = 0.5,
-        capital_floor: float = 0.01,
-        capital_ceiling: float | None = None,
     ) -> None:
-        super().__init__(
-            capital_init=capital_init,
-            capital_floor=capital_floor,
-            capital_ceiling=capital_ceiling,
-        )
+        super().__init__()
         hidden_dim = hidden_dim or max(1, dim // 4)
         self.n_routable = int(n_routable)
-        self.position_net = nn.Sequential(
+        self.reward_net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, self.n_routable),
-            nn.Tanh(),
         )
 
-    @property
-    def expert_type(self) -> str:
-        return "critic"
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.reward_net(x)
 
-    @property
-    def is_routable(self) -> bool:
-        return False
+    def predict_reward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward(x))
 
-    def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
-        del ctx
-        return self.position_net(x)
-
-    def compute_pnl(
-        self,
-        positions: torch.Tensor,
-        expert_profits: torch.Tensor,
-    ) -> torch.Tensor:
-        per_token = (positions * expert_profits.view(1, 1, -1)).sum(dim=-1)
-        return per_token.mean()
-
-
-class CriticPair(nn.Module):
-    """Two critics that use each other as variance-reduction baselines."""
-
-    def __init__(self, dim: int, n_routable: int, **critic_kwargs) -> None:
-        super().__init__()
-        self.critic_a = CriticExpert(dim, n_routable, **critic_kwargs)
-        self.critic_b = CriticExpert(dim, n_routable, **critic_kwargs)
-
-    def get_positions(self, x: torch.Tensor) -> torch.Tensor:
-        pos_a = self.critic_a(x)
-        pos_b = self.critic_b(x)
-        return (pos_a + pos_b) / 2
-
-    def settle_both(
+    def supervised_loss(
         self,
         x_detached: torch.Tensor,
-        expert_profits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pos_a = self.critic_a(x_detached)
-        pos_b = self.critic_b(x_detached)
-
-        pnl_a = self.critic_a.compute_pnl(pos_a, expert_profits)
-        pnl_b = self.critic_b.compute_pnl(pos_b, expert_profits)
-
-        self.critic_a.settle(pnl_a.detach())
-        self.critic_b.settle(pnl_b.detach())
-
-        adv_a = pnl_a - pnl_b.detach()
-        adv_b = pnl_b - pnl_a.detach()
-        return adv_a.detach(), adv_b.detach()
-
-    def reinforce_loss(
-        self,
-        x_detached: torch.Tensor,
-        expert_profits: torch.Tensor,
-        adv_a: torch.Tensor,
-        adv_b: torch.Tensor,
+        winners: torch.Tensor,
+        realized_reward: torch.Tensor,
+        token_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        pos_a = self.critic_a(x_detached)
-        pos_b = self.critic_b(x_detached)
-
-        pnl_a = self.critic_a.compute_pnl(pos_a, expert_profits)
-        pnl_b = self.critic_b.compute_pnl(pos_b, expert_profits)
-        return -(adv_a * pnl_a + adv_b * pnl_b)
-
-    def routing_entropy(
-        self,
-        x_detached: torch.Tensor,
-        expert_capitals: torch.Tensor,
-        critic_alpha: float = 1.0,
-        token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        positions = self.get_positions(x_detached)
-        bids = expert_capitals.view(1, 1, -1).to(positions.dtype) + float(critic_alpha) * positions
-        probs = torch.softmax(bids, dim=-1)
-        entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1)
-        if token_mask is None:
-            return entropy.mean()
-        weight = token_mask.to(entropy.dtype)
-        return (entropy * weight).sum() / weight.sum().clamp(min=1e-8)
+        pred_reward = self.predict_reward(x_detached)
+        chosen_reward = torch.gather(pred_reward, dim=-1, index=winners.unsqueeze(-1)).squeeze(-1)
+        weight = (
+            torch.ones_like(realized_reward, dtype=chosen_reward.dtype, device=chosen_reward.device)
+            if token_weight is None
+            else torch.as_tensor(token_weight, device=chosen_reward.device, dtype=chosen_reward.dtype)
+        )
+        loss = (chosen_reward - realized_reward).pow(2) * weight
+        return loss.sum() / weight.sum().clamp(min=1e-8)

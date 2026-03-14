@@ -1,4 +1,4 @@
-"""Simple generation utility for CaMoE v22."""
+"""Simple generation utility for prediction-market CaMoE."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float) ->
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate text with CaMoE v22")
+    parser = argparse.ArgumentParser(description="Generate text with prediction-market CaMoE")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
@@ -100,7 +100,10 @@ def main() -> None:
                 cache = block.get_cache()
                 if not cache:
                     continue
-                winner = int(cache["winners"][0, -1].item())
+                market_cache = cache.get("ffn") or cache.get("sequence") or {}
+                if "winners" not in market_cache:
+                    continue
+                winner = int(market_cache["winners"][0, -1].item())
                 usage[layer_idx].update([winner])
 
             sequence = torch.cat([sequence, next_token], dim=1)

@@ -2,6 +2,41 @@
 
 本文档记录 CaMoE v22 之后的重要架构与训练接口变更。
 
+## v23.0 - 2026-03-14
+
+### Breaking Changes
+
+- 路由语义从 Vickrey 二价拍卖重构为 prediction-market 路由。
+- `CriticPair` / REINFORCE 路径被 `RewardCritic` 监督学习路径替代。
+- 训练流程从 `prewarm / market_warm / critic_warm / full_market` 四阶段收敛为 `uniform_warmup -> full_market` 两阶段。
+- 市场状态不再只看专家资本；每层市场现在显式维护 `wallet(capital)`、`q`、`price` 和共享 `loss_ema`。
+
+### Added
+
+- `PredictionMarketRouter`：基于 `shares * (pred_reward - price)` 的 Top-1 路由。
+- `MarketStateManager`：管理每层钱包、价格、共享 reward baseline 与 settlement。
+- `RewardCritic`：按 token 预测各专家 realized reward 的监督式 critic。
+- `market_weight` 与 `exploration_epsilon` 调度，用于从 uniform warmup 平滑切到 full market。
+- `tests/test_prediction_market.py`：覆盖价格归一化、结算不变性、reward critic mask、模型集成和 warmup 行为。
+- `camoe/rosa_soft_adapter.py` 与 `ROSAExpert(backend in {"wind","soft","sufa","scan"})`，支持本地 `rosa_soft` 路径与 Wind ROSA 并存。
+- toy 数据扩展：
+  - `pattern_complete`
+  - `delayed_copy`
+  - `first_repeat`
+  - `running_max`
+  - `sum_threshold`
+  - `bracket_depth`
+  - `addsub_40`
+  - `mixed_v3`
+
+### Changed
+
+- `CaMoE_Block` 的序列市场和 FFN 市场统一到同一套 prediction-market 路由接口。
+- 训练脚本与 toy 训练脚本改用 `uniform_warmup`、`market_ramp_steps`、`routing_noise_std`、`exploration_epsilon` 等新配置。
+- `market_metrics()` 改为输出 wallet、price、predicted reward、expected profit、exploration 等新诊断指标。
+- `eval.py` 的路由统计适配新的 block cache 结构。
+- README / README.zh-CN 全面切到 `v23.0` 的 prediction-market 叙述与用法说明。
+
 ## v22.2 - 2026-03-14
 
 ### Added

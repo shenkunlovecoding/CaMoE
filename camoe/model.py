@@ -1,4 +1,4 @@
-"""Pure-market CaMoE model (v22.1 dual-market)."""
+"""Prediction-market CaMoE model."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .block import CaMoE_Block
-from .capital import ExpertCapitalManager
+from .capital import MarketStateManager
 from .config import CONFIG_0_4B, CaMoEConfig
-from .expert_critic import CriticPair
+from .expert_critic import RewardCritic
 from .expert_base import BaseExpert
 from .expert_deepembed import DeepEmbedExpert, SlimDeepEmbedExpert
 from .expert_fractal import FractalBlueprint, FractalCaMoEPlaceholder
@@ -22,7 +22,7 @@ from .expert_timemix import TimeMixExpert
 
 
 class CaMoE_Model(nn.Module):
-    """Stacked dual-market CaMoE with sequence and FFN auctions per layer."""
+    """Stacked dual-market CaMoE with prediction-market routing."""
 
     def __init__(self, config: CaMoEConfig) -> None:
         super().__init__()
@@ -37,28 +37,41 @@ class CaMoE_Model(nn.Module):
             self.lm_head.weight = self.emb.weight
 
         self.sequence_capital_manager = (
-            ExpertCapitalManager(
+            MarketStateManager(
                 n_layers=config.n_layers,
                 n_experts_per_layer=2,
                 capital_init=config.expert_capital_init,
                 ema_decay=config.ema_decay,
                 capital_floor=config.capital_floor,
                 capital_ceiling=config.capital_ceiling,
-                depreciation=config.depreciation,
+                price_lr=config.price_lr,
+                price_temperature=config.price_temperature,
+                liquidity_floor=config.liquidity_floor,
+                exploration_epsilon=config.exploration_epsilon,
+                reward_scale=config.reward_scale,
+                reward_eps=config.reward_eps,
+                bet_fraction=config.bet_fraction,
             )
             if config.n_rosa_experts > 0
             else None
         )
-        self.ffn_capital_manager = ExpertCapitalManager(
+        self.ffn_capital_manager = MarketStateManager(
             n_layers=config.n_layers,
             n_experts_per_layer=config.total_ffn_experts,
             capital_init=config.expert_capital_init,
             ema_decay=config.ema_decay,
             capital_floor=config.capital_floor,
             capital_ceiling=config.capital_ceiling,
-            depreciation=config.depreciation,
+            price_lr=config.price_lr,
+            price_temperature=config.price_temperature,
+            liquidity_floor=config.liquidity_floor,
+            exploration_epsilon=config.exploration_epsilon,
+            reward_scale=config.reward_scale,
+            reward_eps=config.reward_eps,
+            bet_fraction=config.bet_fraction,
         )
         self.capital_manager = self.ffn_capital_manager
+        self._last_settle_results: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
         self._sync_all_capitals_to_experts()
         self._maybe_compile_modules()
 
@@ -70,19 +83,29 @@ class CaMoE_Model(nn.Module):
         ste_temperature: float | None = None,
         training: bool = True,
         uniform: bool = False,
+        market_weight: float = 1.0,
     ) -> dict[str, torch.Tensor]:
+        del critic_alpha
         batch, steps = input_ids.shape
         x = self.emb(input_ids)
 
         v_first = None
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
+            seq_state = (
+                self.sequence_capital_manager.route_state(layer_idx)
+                if self.sequence_capital_manager is not None and block.has_sequence_market
+                else None
+            )
+            ffn_state = self.ffn_capital_manager.route_state(layer_idx)
             x, v_first = block(
                 x,
                 v_first=v_first,
-                critic_alpha=critic_alpha,
                 ste_temperature=ste_temperature,
                 training=training,
                 uniform=uniform,
+                market_weight=market_weight,
+                sequence_state=seq_state,
+                ffn_state=ffn_state,
                 token_ids=input_ids,
             )
 
@@ -113,7 +136,9 @@ class CaMoE_Model(nn.Module):
         token_weight: torch.Tensor | None = None,
         update_state: bool = True,
     ) -> list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]]:
-        all_profits: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]] = []
+        all_results: list[dict[str, torch.Tensor | int | str | dict[str, torch.Tensor]]] = []
+        self._last_settle_results = {}
+
         for layer_idx, block in enumerate(self.blocks):
             cache = block.get_cache()
             if not cache:
@@ -121,63 +146,53 @@ class CaMoE_Model(nn.Module):
 
             seq_cache = cache.get("sequence", {})
             if self.sequence_capital_manager is not None and seq_cache:
-                seq_profit = self.sequence_capital_manager.settle_layer(
+                seq_result = self.sequence_capital_manager.settle_layer(
                     layer_idx=layer_idx,
                     winners=seq_cache["winners"],
                     token_loss=token_loss,
                     prices=seq_cache["prices"],
+                    shares=seq_cache["shares"],
                     token_weight=token_weight,
                     update_state=update_state,
                 )
-                seq_critic_profit = seq_profit.clamp(
-                    min=-self.config.critic_profit_clip,
-                    max=self.config.critic_profit_clip,
-                )
-                adv_a, adv_b = block.sequence_critic_pair.settle_both(seq_cache["x_detached"], seq_critic_profit)
                 if update_state:
                     self.sequence_capital_manager.sync_to_experts(layer_idx, block.sequence_experts())
-                all_profits.append(
-                    {
-                        "layer": layer_idx,
-                        "market": "sequence",
-                        "profit": seq_profit,
-                        "critic_profit": seq_critic_profit,
-                        "adv_a": adv_a,
-                        "adv_b": adv_b,
-                        "cache": seq_cache,
-                    }
-                )
+                packed = {
+                    "layer": layer_idx,
+                    "market": "sequence",
+                    "cache": seq_cache,
+                    **seq_result,
+                }
+                all_results.append(packed)
+                self._last_settle_results[(layer_idx, "sequence")] = {
+                    key: value.detach().clone() for key, value in seq_result.items()
+                }
 
             ffn_cache = cache.get("ffn", {})
             if ffn_cache:
-                ffn_profit = self.ffn_capital_manager.settle_layer(
+                ffn_result = self.ffn_capital_manager.settle_layer(
                     layer_idx=layer_idx,
                     winners=ffn_cache["winners"],
                     token_loss=token_loss,
                     prices=ffn_cache["prices"],
+                    shares=ffn_cache["shares"],
                     token_weight=token_weight,
                     update_state=update_state,
                 )
-                ffn_critic_profit = ffn_profit.clamp(
-                    min=-self.config.critic_profit_clip,
-                    max=self.config.critic_profit_clip,
-                )
-                adv_a, adv_b = block.critic_pair.settle_both(ffn_cache["x_detached"], ffn_critic_profit)
                 if update_state:
                     self.ffn_capital_manager.sync_to_experts(layer_idx, list(block.experts))
-                all_profits.append(
-                    {
-                        "layer": layer_idx,
-                        "market": "ffn",
-                        "profit": ffn_profit,
-                        "critic_profit": ffn_critic_profit,
-                        "adv_a": adv_a,
-                        "adv_b": adv_b,
-                        "cache": ffn_cache,
-                    }
-                )
+                packed = {
+                    "layer": layer_idx,
+                    "market": "ffn",
+                    "cache": ffn_cache,
+                    **ffn_result,
+                }
+                all_results.append(packed)
+                self._last_settle_results[(layer_idx, "ffn")] = {
+                    key: value.detach().clone() for key, value in ffn_result.items()
+                }
 
-        return all_profits
+        return all_results
 
     def compute_critic_loss(
         self,
@@ -186,31 +201,23 @@ class CaMoE_Model(nn.Module):
         token_weight: torch.Tensor | None = None,
         entropy_reg: float | None = None,
     ) -> torch.Tensor:
+        del critic_alpha, entropy_reg
         total_loss: torch.Tensor | None = None
         count = 0
-        entropy_lambda = self.config.routing_entropy_reg if entropy_reg is None else float(entropy_reg)
         for result in settle_results:
             layer_idx = int(result["layer"])
             market = str(result["market"])
             block = self.blocks[layer_idx]
-            critic_pair = block.sequence_critic_pair if market == "sequence" else block.critic_pair
-            if critic_pair is None:
+            reward_critic = block.sequence_reward_critic if market == "sequence" else block.ffn_reward_critic
+            if reward_critic is None:
                 continue
             cache = result["cache"]
-            loss = critic_pair.reinforce_loss(
+            loss = reward_critic.supervised_loss(
                 cache["x_detached"],
-                result["critic_profit"].detach(),
-                result["adv_a"],
-                result["adv_b"],
+                cache["winners"],
+                result["realized_reward"].detach(),
+                token_weight=token_weight,
             )
-            if entropy_lambda > 0:
-                entropy_bonus = critic_pair.routing_entropy(
-                    cache["x_detached"],
-                    cache["expert_capitals"].detach(),
-                    critic_alpha=critic_alpha,
-                    token_mask=token_weight,
-                )
-                loss = loss - entropy_lambda * entropy_bonus
             total_loss = loss if total_loss is None else (total_loss + loss)
             count += 1
 
@@ -233,6 +240,9 @@ class CaMoE_Model(nn.Module):
                         "market": "sequence",
                         "expert_types": [expert.expert_type for expert in block.sequence_experts()],
                         "capitals": self.sequence_capital_manager.capitals[layer_idx].detach().clone(),
+                        "q": self.sequence_capital_manager.q[layer_idx].detach().clone(),
+                        "loss_ema": self.sequence_capital_manager.loss_ema[layer_idx].detach().clone(),
+                        "prices": self.sequence_capital_manager.prices(layer_idx).detach().clone(),
                         "cache": {key: value.detach().clone() for key, value in seq_cache.items()},
                     }
                 )
@@ -245,6 +255,9 @@ class CaMoE_Model(nn.Module):
                         "market": "ffn",
                         "expert_types": [expert.expert_type for expert in block.experts],
                         "capitals": self.ffn_capital_manager.capitals[layer_idx].detach().clone(),
+                        "q": self.ffn_capital_manager.q[layer_idx].detach().clone(),
+                        "loss_ema": self.ffn_capital_manager.loss_ema[layer_idx].detach().clone(),
+                        "prices": self.ffn_capital_manager.prices(layer_idx).detach().clone(),
                         "cache": {key: value.detach().clone() for key, value in ffn_cache.items()},
                     }
                 )
@@ -256,135 +269,95 @@ class CaMoE_Model(nn.Module):
         token_mask: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
     ) -> dict[str, float]:
+        del critic_alpha
         metrics: dict[str, float] = {}
         diagnostics = self.get_market_diagnostics()
         for entry in diagnostics:
             layer_idx = int(entry["layer"])
             market = str(entry.get("market", "ffn"))
             caps = entry["capitals"].float()
+            q = entry["q"].float()
+            prices = entry["prices"].float()
             prefix = f"{market}/layer_{layer_idx}"
-            metrics[f"{prefix}/capital_mean"] = float(caps.mean().item())
-            metrics[f"{prefix}/capital_min"] = float(caps.min().item())
-            metrics[f"{prefix}/capital_max"] = float(caps.max().item())
-            sorted_caps, _ = torch.sort(caps.float())
-            n = sorted_caps.numel()
-            idx = torch.arange(1, n + 1, device=sorted_caps.device, dtype=sorted_caps.dtype)
-            gini = ((2 * idx - n - 1) * sorted_caps).sum() / (n * sorted_caps.sum().clamp(min=1e-6))
-            metrics[f"{prefix}/capital_gini"] = float(gini.item())
+
+            metrics[f"{prefix}/wallet_mean"] = float(caps.mean().item())
+            metrics[f"{prefix}/wallet_min"] = float(caps.min().item())
+            metrics[f"{prefix}/wallet_max"] = float(caps.max().item())
+            metrics[f"{prefix}/wallet_gini"] = float(self._gini(caps).item())
+            metrics[f"{prefix}/price_min"] = float(prices.min().item())
+            metrics[f"{prefix}/price_max"] = float(prices.max().item())
 
             cache = entry["cache"]
             winners = cache["winners"]
-            bids = cache.get("bids")
-            positions = cache.get("positions")
+            pred_reward = cache.get("pred_reward")
+            expected_profit = cache.get("expected_profit")
+
             answer_mask = self._resolve_mask(token_mask, winners)
             active_mask = self._resolve_mask(valid_mask, winners)
             if active_mask is None:
                 active_mask = torch.ones_like(winners, dtype=torch.float32)
             answer_mask = answer_mask * active_mask if answer_mask is not None else active_mask
-            prefix_mask = (active_mask - answer_mask).clamp(min=0.0)
 
             winner_hist_all = self._winner_histogram(winners, caps.numel(), active_mask)
             winner_hist_answer = self._winner_histogram(winners, caps.numel(), answer_mask)
             entropy_all = self._entropy(winner_hist_all)
             entropy_answer = self._entropy(winner_hist_answer)
-            metrics[f"{prefix}/routing_entropy_all"] = float(entropy_all.item())
+            metrics[f"{prefix}/routing_entropy"] = float(entropy_all.item())
             metrics[f"{prefix}/routing_entropy_answer"] = float(entropy_answer.item())
+
+            if pred_reward is not None:
+                chosen_pred = torch.gather(pred_reward, dim=-1, index=winners.unsqueeze(-1)).squeeze(-1)
+                metrics[f"{prefix}/pred_reward_mean"] = float(self._masked_mean(chosen_pred, active_mask).item())
+
+            if expected_profit is not None:
+                chosen_profit = torch.gather(expected_profit, dim=-1, index=winners.unsqueeze(-1)).squeeze(-1)
+                metrics[f"{prefix}/expected_profit_mean"] = float(self._masked_mean(chosen_profit, active_mask).item())
+            exploration_mask = cache.get("exploration_mask")
+            if exploration_mask is not None:
+                metrics[f"{prefix}/exploration_rate"] = float(exploration_mask.float().mean().item())
+
+            settlement = self._last_settle_results.get((layer_idx, market))
+            if settlement is not None:
+                metrics[f"{prefix}/realized_reward_mean"] = float(
+                    self._masked_mean(settlement["realized_reward"], active_mask).item()
+                )
+                metrics[f"{prefix}/token_profit_mean"] = float(
+                    self._masked_mean(settlement["token_profit"], active_mask).item()
+                )
 
             expert_types = list(entry["expert_types"])
             type_to_indices: dict[str, list[int]] = {}
             for expert_idx, expert_type in enumerate(expert_types):
                 type_to_indices.setdefault(expert_type, []).append(expert_idx)
-                metrics[f"{prefix}/expert_{expert_idx}/capital"] = float(caps[expert_idx].item())
-                metrics[f"{prefix}/expert_{expert_idx}/winner_share_all"] = float(winner_hist_all[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/wallet"] = float(caps[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/price"] = float(prices[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/q"] = float(q[expert_idx].item())
+                metrics[f"{prefix}/expert_{expert_idx}/winner_share"] = float(winner_hist_all[expert_idx].item())
                 metrics[f"{prefix}/expert_{expert_idx}/winner_share_answer"] = float(
                     winner_hist_answer[expert_idx].item()
                 )
-                if bids is not None:
-                    metrics[f"{prefix}/expert_{expert_idx}/bid_mean_prefix"] = float(
-                        self._masked_mean(bids[:, :, expert_idx], prefix_mask).item()
-                    )
-                    metrics[f"{prefix}/expert_{expert_idx}/bid_mean_answer"] = float(
-                        self._masked_mean(bids[:, :, expert_idx], answer_mask).item()
-                    )
-                if positions is not None:
-                    metrics[f"{prefix}/expert_{expert_idx}/position_mean_answer"] = float(
-                        self._masked_mean(positions[:, :, expert_idx], answer_mask).item()
-                    )
 
             for expert_type, indices in type_to_indices.items():
                 idx_tensor = torch.tensor(indices, device=caps.device, dtype=torch.long)
-                metrics[f"{prefix}/capital_{expert_type}"] = float(caps.index_select(0, idx_tensor).mean().item())
-                metrics[f"{prefix}/winner_share_answer_{expert_type}"] = float(
+                metrics[f"{prefix}/wallet_{expert_type}"] = float(caps.index_select(0, idx_tensor).mean().item())
+                metrics[f"{prefix}/price_{expert_type}"] = float(prices.index_select(0, idx_tensor).mean().item())
+                metrics[f"{prefix}/winner_share_{expert_type}"] = float(
                     winner_hist_answer.index_select(0, idx_tensor).mean().item()
                 )
-                if bids is not None:
-                    type_bids = bids.index_select(-1, idx_tensor)
-                    metrics[f"{prefix}/bid_mean_prefix_{expert_type}"] = float(
-                        self._masked_mean(type_bids.mean(dim=-1), prefix_mask).item()
-                    )
-                    metrics[f"{prefix}/bid_mean_answer_{expert_type}"] = float(
-                        self._masked_mean(type_bids.mean(dim=-1), answer_mask).item()
-                    )
-                if positions is not None:
-                    type_positions = positions.index_select(-1, idx_tensor)
-                    metrics[f"{prefix}/position_mean_answer_{expert_type}"] = float(
-                        self._masked_mean(type_positions.mean(dim=-1), answer_mask).item()
-                    )
 
             if market == "ffn":
-                metrics[f"layer_{layer_idx}/capital_mean"] = metrics[f"{prefix}/capital_mean"]
-                metrics[f"layer_{layer_idx}/capital_min"] = metrics[f"{prefix}/capital_min"]
-                metrics[f"layer_{layer_idx}/capital_max"] = metrics[f"{prefix}/capital_max"]
-                metrics[f"layer_{layer_idx}/capital_gini"] = metrics[f"{prefix}/capital_gini"]
-                metrics[f"layer_{layer_idx}/routing_entropy"] = metrics[f"{prefix}/routing_entropy_all"]
-                metrics[f"layer_{layer_idx}/routing_entropy_all"] = metrics[f"{prefix}/routing_entropy_all"]
-                metrics[f"layer_{layer_idx}/routing_entropy_answer"] = metrics[f"{prefix}/routing_entropy_answer"]
-                metrics[f"L{layer_idx}/Gini"] = metrics[f"{prefix}/capital_gini"]
-                metrics[f"L{layer_idx}/WinnerFromAdjustedEntropy"] = metrics[f"{prefix}/routing_entropy_answer"]
-                metrics[f"L{layer_idx}/WeightEntropy"] = 0.0
-                metrics[f"L{layer_idx}/MarketAlpha"] = float(critic_alpha)
-                critic_cap = (
-                    self.blocks[layer_idx].critic_pair.critic_a.capital.float()
-                    + self.blocks[layer_idx].critic_pair.critic_b.capital.float()
-                ) / 2.0
-                metrics[f"L{layer_idx}/CriticCap"] = float(critic_cap.item())
-                for expert_idx, _expert_type in enumerate(expert_types):
-                    metrics[f"layer_{layer_idx}/expert_{expert_idx}/capital"] = metrics[
-                        f"{prefix}/expert_{expert_idx}/capital"
-                    ]
-                    metrics[f"layer_{layer_idx}/expert_{expert_idx}/winner_share_answer"] = metrics[
-                        f"{prefix}/expert_{expert_idx}/winner_share_answer"
-                    ]
-                    if f"{prefix}/expert_{expert_idx}/bid_mean_prefix" in metrics:
-                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_prefix"] = metrics[
-                            f"{prefix}/expert_{expert_idx}/bid_mean_prefix"
-                        ]
-                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_answer"] = metrics[
-                            f"{prefix}/expert_{expert_idx}/bid_mean_answer"
-                        ]
-                    if f"{prefix}/expert_{expert_idx}/position_mean_answer" in metrics:
-                        metrics[f"layer_{layer_idx}/expert_{expert_idx}/position_mean_answer"] = metrics[
-                            f"{prefix}/expert_{expert_idx}/position_mean_answer"
-                        ]
-                for expert_type in type_to_indices:
-                    metrics[f"layer_{layer_idx}/capital_{expert_type}"] = metrics[f"{prefix}/capital_{expert_type}"]
-                    metrics[f"layer_{layer_idx}/winner_share_answer_{expert_type}"] = metrics[
-                        f"{prefix}/winner_share_answer_{expert_type}"
-                    ]
-                    if f"{prefix}/bid_mean_prefix_{expert_type}" in metrics:
-                        metrics[f"layer_{layer_idx}/bid_mean_prefix_{expert_type}"] = metrics[
-                            f"{prefix}/bid_mean_prefix_{expert_type}"
-                        ]
-                        metrics[f"layer_{layer_idx}/bid_mean_answer_{expert_type}"] = metrics[
-                            f"{prefix}/bid_mean_answer_{expert_type}"
-                        ]
-                    if f"{prefix}/position_mean_answer_{expert_type}" in metrics:
-                        metrics[f"layer_{layer_idx}/position_mean_answer_{expert_type}"] = metrics[
-                            f"{prefix}/position_mean_answer_{expert_type}"
-                        ]
+                metrics[f"layer_{layer_idx}/wallet_mean"] = metrics[f"{prefix}/wallet_mean"]
+                metrics[f"layer_{layer_idx}/wallet_min"] = metrics[f"{prefix}/wallet_min"]
+                metrics[f"layer_{layer_idx}/wallet_max"] = metrics[f"{prefix}/wallet_max"]
+                metrics[f"layer_{layer_idx}/wallet_gini"] = metrics[f"{prefix}/wallet_gini"]
+                metrics[f"layer_{layer_idx}/price_max"] = metrics[f"{prefix}/price_max"]
+                metrics[f"layer_{layer_idx}/routing_entropy"] = metrics[f"{prefix}/routing_entropy"]
+                metrics[f"L{layer_idx}/Gini"] = metrics[f"{prefix}/wallet_gini"]
+
         return metrics
 
     def _build_block(self, layer_idx: int) -> CaMoE_Block:
+        reward_hidden = self.config.reward_hidden_dim or self.config.critic_hidden_dim
         timemix_expert = TimeMixExpert(
             dim=self.config.dim,
             n_layers=self.config.n_layers,
@@ -395,7 +368,7 @@ class CaMoE_Model(nn.Module):
             capital_ceiling=self.config.capital_ceiling,
         )
         rosa_expert = None
-        sequence_critic_pair = None
+        sequence_reward_critic = None
         if self.config.n_rosa_experts > 0:
             rosa_expert = ROSAExpert(
                 dim=self.config.dim,
@@ -408,13 +381,10 @@ class CaMoE_Model(nn.Module):
                 capital_floor=self.config.capital_floor,
                 capital_ceiling=self.config.capital_ceiling,
             )
-            sequence_critic_pair = CriticPair(
+            sequence_reward_critic = RewardCritic(
                 dim=self.config.dim,
                 n_routable=2,
-                hidden_dim=self.config.critic_hidden_dim,
-                capital_init=self.config.critic_capital_init,
-                capital_floor=self.config.capital_floor,
-                capital_ceiling=self.config.capital_ceiling,
+                hidden_dim=reward_hidden,
             )
 
         ffn_experts: list[BaseExpert] = []
@@ -451,26 +421,21 @@ class CaMoE_Model(nn.Module):
                     capital_ceiling=self.config.capital_ceiling,
                 )
             )
-        ffn_critic_pair = CriticPair(
+        ffn_reward_critic = RewardCritic(
             dim=self.config.dim,
             n_routable=self.config.total_ffn_experts,
-            hidden_dim=self.config.critic_hidden_dim,
-            capital_init=self.config.critic_capital_init,
-            capital_floor=self.config.capital_floor,
-            capital_ceiling=self.config.capital_ceiling,
+            hidden_dim=reward_hidden,
         )
         return CaMoE_Block(
             timemix_expert=timemix_expert,
             rosa_expert=rosa_expert,
             ffn_experts=ffn_experts,
-            sequence_critic_pair=sequence_critic_pair,
-            ffn_critic_pair=ffn_critic_pair,
-            sequence_auction_noise=self.config.auction_noise_std,
-            ffn_auction_noise=self.config.auction_noise_std,
+            sequence_reward_critic=sequence_reward_critic,
+            ffn_reward_critic=ffn_reward_critic,
+            routing_noise_std=self.config.routing_noise_std,
             use_gradient_checkpointing=self.config.enable_gradient_checkpointing,
             use_routing_ste=self.config.routing_ste,
             ste_temperature=self.config.ste_temperature_end,
-            enable_shadow_critic_training=(self.config.critic_shadow_prewarm or self.config.critic_shadow_market),
         )
 
     def _maybe_compile_modules(self) -> None:
@@ -483,11 +448,8 @@ class CaMoE_Model(nn.Module):
             self._compile_forward(block.rosa_expert, compile_mode)
             for expert in block.ffn_experts:
                 self._compile_forward(expert, compile_mode)
-            if block.sequence_critic_pair is not None:
-                self._compile_forward(block.sequence_critic_pair.critic_a.position_net, compile_mode)
-                self._compile_forward(block.sequence_critic_pair.critic_b.position_net, compile_mode)
-            self._compile_forward(block.critic_pair.critic_a.position_net, compile_mode)
-            self._compile_forward(block.critic_pair.critic_b.position_net, compile_mode)
+            self._compile_forward(block.sequence_reward_critic, compile_mode)
+            self._compile_forward(block.ffn_reward_critic, compile_mode)
 
     @staticmethod
     def _compile_forward(module: nn.Module | None, compile_mode: str) -> None:
@@ -584,6 +546,13 @@ class CaMoE_Model(nn.Module):
     @staticmethod
     def _entropy(prob: torch.Tensor) -> torch.Tensor:
         return -(prob * torch.log(prob + 1e-9)).sum()
+
+    @staticmethod
+    def _gini(values: torch.Tensor) -> torch.Tensor:
+        sorted_values, _ = torch.sort(values.float())
+        n = sorted_values.numel()
+        idx = torch.arange(1, n + 1, device=sorted_values.device, dtype=sorted_values.dtype)
+        return ((2 * idx - n - 1) * sorted_values).sum() / (n * sorted_values.sum().clamp(min=1e-6))
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

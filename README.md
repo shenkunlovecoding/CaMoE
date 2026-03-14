@@ -1,128 +1,240 @@
-# CaMoE: Capital-driven Mixture of Experts
-*“Not a model, but a living cognitive economy.”*
+# CaMoE: Capital-Driven Mixture of Experts
+*Prediction-market routing for sparse experts.*
 
 [中文版](README.zh-CN.md) | [English](README.md)
 
-## 🎯 What is CaMoE?
-CaMoE (Capital-driven Mixture of Experts) is a radical rethinking of sparse expert models. Instead of learned routers with auxiliary losses, CaMoE uses zero-parameter Vickrey auctions where experts bid their accumulated capital for the right to process tokens.
+## What Is CaMoE?
+CaMoE is a sparse MoE architecture where routing is treated as a prediction market instead of a learned router with auxiliary balancing losses.
 
-**Core insight:** Let market dynamics handle what gradient descent struggles with—load balancing, expert specialization, and adaptive computation.
+In the current implementation, every market keeps:
+- a wallet for each expert (`capital`, budget only)
+- a market belief vector `q`
+- normalized prices `p` with `sum(p)=1`
+- a supervised reward critic that predicts token-level payout for each expert
 
-```
-Traditional MoE:  Router(learned) → softmax → top-k → experts
-CaMoE:           Auction(zero-param) → capital-based bidding → winner-takes-all
+Current routing path:
+
+```text
+Traditional MoE: learned router -> logits -> top-k experts
+CaMoE v23:       market prices + expert wallets + reward critic -> top-1 winner
 ```
 
-## 🚀 Current Version (v22.1)
-### Architecture
-```
+## Current Version
+`v23.0` is the prediction-market rewrite. The runtime path no longer uses:
+- Vickrey second-price auctions
+- critic pairs
+- REINFORCE settlement
+- four-stage `prewarm / market_warm / critic_warm / full_market`
+
+It now uses:
+- shared prediction-market routing in both markets
+- supervised `RewardCritic`
+- token-level `shares * (reward - price)` settlement
+- two phases: `uniform_warmup` -> `full_market`
+
+## Architecture
+
+```text
 Input
-  │
-  ▼
-┌─────────────────────────────────────────────┐
-│  Embedding                                  │
-└─────────────────────────────────────────────┘
-  │
-  ▼ (× n_layers)
-┌─────────────────────────────────────────────┐
-│  Sequence Market                            │
-│  - TimeMixExpert vs ROSAExpert              │
-│  - Full-sequence state update for both      │
-│  - Winner output with STE backward          │
-├─────────────────────────────────────────────┤
-│  FFN Market                                 │
-│  - RWKVExpert / DeepEmbed / SlimDeepEmbed   │
-│  - Vickrey winner-takes-all                 │
-│  - STE during training, hard winner at eval │
-├─────────────────────────────────────────────┤
-│  Critic Pair                                │
-│  - REINFORCE update                         │
-│  - Entropy regularization (optional)        │
-│  - Shadow training in prewarm/market_warm   │
-└─────────────────────────────────────────────┘
-  │
-  ▼
-┌─────────────────────────────────────────────┐
-│  LM Head (tied weights)                     │
-└─────────────────────────────────────────────┘
-  │
-  ▼
+  |
+  v
+Embedding
+  |
+  v  x n_layers
++------------------------------------------------------+
+| Sequence Market                                      |
+| - TimeMixExpert vs ROSAExpert                        |
+| - shared router semantics                            |
+| - hard Top-1 route, STE soft mixing in training      |
++------------------------------------------------------+
+| FFN Market                                           |
+| - RWKVExpert / DeepEmbed / SlimDeepEmbed             |
+| - same prediction-market router                      |
+| - hard Top-1 route, STE soft mixing in training      |
++------------------------------------------------------+
+| Reward Critics                                       |
+| - one supervised critic per market                   |
+| - predict per-token reward for each routable expert  |
++------------------------------------------------------+
+  |
+  v
+LM Head
+  |
+  v
 Output
 ```
 
-### Training Phases (default toy recipe)
-```
-Step 0        1500         3000             5500+
-  │────────────│────────────│────────────────│────────▶
-    prewarm      market_warm   critic_warm      full_market
+## Market Mechanics
+Per layer and per market:
 
-  uniform=True   auction on     critic α ramps   full system
-  (no hard route)  + STE        + STE anneal      hard eval route
-
-STE temperature anneal:
-  2.0  -> 1.0 -> 0.3
+```python
+wallet[i]   # expert budget, stored in the existing capital buffer
+q[i]        # market belief state
+price[i] = (1 - liquidity_floor) * softmax(q / T) + liquidity_floor / K
 ```
 
-### Key Components
+Routing:
+
+```python
+stake[i]  = bet_fraction * wallet[i]
+shares[i] = stake[i] / price[i]          # computed once at batch-start
+
+pred_reward[t, i] = sigmoid(reward_critic(x_t)[i])
+score[t, i] = shares[i] * (pred_reward[t, i] - price[i])
+
+winner[t] = argmax(score[t])
+```
+
+Training-time exploration:
+- Gaussian routing noise via `routing_noise_std`
+- epsilon exploration via `exploration_epsilon`
+
+Settlement:
+
+```python
+reward[t] = sigmoid(
+    reward_scale * (market_loss_ema - token_loss[t]) / (abs(market_loss_ema) + reward_eps)
+)
+
+token_profit[t] = shares[winner[t]] * (reward[t] - price[winner[t]])
+wallet_update[i] = mean(token_profit[t] for tokens won by expert i, weighted over the batch)
+q[i] += price_lr * (avg_reward_i - price[i])   # only for experts that won tokens
+```
+
+Important implementation detail:
+- `shares` are priced once at the start of the batch from the current wallets and prices, then reused for all tokens in that batch.
+- `loss_ema` is shared per market, not per expert.
+- Experts that do not win tokens in a batch do not change wallet or `q`.
+
+## Training Schedule
+Default schedule is two-phase:
+
+```text
+Step 0                     uniform_warmup_steps                end
+  |-----------------------------------|------------------------->
+          uniform_warmup                          full_market
+```
+
+`uniform_warmup`
+- uniform mixing output
+- no wallet updates
+- no price updates
+- no reward-critic training
+
+`full_market`
+- prediction-market routing enabled
+- wallet settlement enabled
+- price updates enabled
+- reward critic trained every step
+
+## Repository Map
 | File | Description |
 | :--- | :--- |
-| `model.py` | Main `CaMoE_Model` with dual-market blocks |
-| `block.py` | Sequence market + FFN market routing logic |
-| `auction.py` | Zero-parameter Vickrey second-price auction |
-| `capital.py` | ExpertCapitalManager: settlement, depreciation, EMA |
-| `expert_timemix.py` | TimeMix expert for sequence market |
-| `expert_rosa.py` | Slim Wind ROSA sequence expert |
-| `expert_rwkv.py` | RWKV FFN expert |
-| `expert_critic.py` | CriticPair: position prediction + REINFORCE |
-| `expert_deepembed.py` | DeepEmbed experts in FFN market |
+| `camoe/model.py` | Main `CaMoE_Model` assembly and settlement loop |
+| `camoe/block.py` | Sequence and FFN market routing within a block |
+| `camoe/auction.py` | `PredictionMarketRouter` |
+| `camoe/capital.py` | `MarketStateManager` for wallets, prices, and shared EMA |
+| `camoe/expert_critic.py` | `RewardCritic` |
+| `camoe/expert_timemix.py` | TimeMix sequence expert |
+| `camoe/expert_rosa.py` | Wind ROSA sequence expert |
+| `camoe/expert_rwkv.py` | RWKV FFN expert |
+| `camoe/expert_deepembed.py` | DeepEmbed experts |
+| `train.py` | Main training entrypoint |
+| `scripts/train_reverse_digits.py` | Toy-task trainer and route visualizer |
+| `tests/test_prediction_market.py` | Core prediction-market unit tests |
 
-### Market Mechanics
-```python
-# Bidding
-bid = expert_capital + critic_alpha * critic_position + noise
-
-# Settlement (per token)
-profit = (baseline_loss - actual_loss) × capital - price_paid - depreciation
-capital_new = capital + profit
-
-# Self-balancing:
-# - Rich experts bid high → win more → pay more → high risk
-# - Poor experts bid low → find niche → low cost → can recover
-```
-
-## 📊 Quick Start
-### Installation
+## Quick Start
+### Install
 ```bash
-git clone https://github.com/your-repo/camoe.git
-cd camoe
-pip install torch datasets
+pip install -r requirements.txt
 ```
 
-### Training
+### Train
 ```bash
 python train.py \
     --scale 0.1b \
     --data /path/to/tokenized_dataset \
-    --save_dir checkpoints/ \
+    --save_dir checkpoints/v23 \
     --batch_size 4 \
     --seq_len 512 \
-    --steps 10000
+    --steps 10000 \
+    --bet_fraction 0.05 \
+    --price_lr 0.02 \
+    --liquidity_floor 0.02 \
+    --reward_scale 5.0 \
+    --exploration_epsilon 0.02
 ```
 
-### Key Arguments
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--scale` | 0.4b | Model size: 0.1b or 0.4b |
-| `--lr` | config | Expert learning rate |
-| `--critic_lr` | config | Critic learning rate |
-| `--amp` | off | Enable BF16 mixed precision |
-| `--no_compile` | off | Disable torch.compile |
-
-## 📈 Metrics to Watch
-```python
-# Healthy training signs:
-routing_entropy > 1.0        # Multiple experts being used
-capital_gini < 0.7           # No monopoly
-capital_min > floor          # No mass bankruptcy  
-loss decreasing              # Obviously
+### Toy Smoke / Visualization
+```bash
+python scripts/train_reverse_digits.py \
+    --model_kind camoe \
+    --steps 10000 \
+    --no_swanlab
 ```
+
+### Generate
+```bash
+python eval.py \
+    --checkpoint /path/to/checkpoint.pth \
+    --prompt "Hello" \
+    --device cuda
+```
+
+### LM Eval Harness
+```bash
+python lmeval.py \
+    --pretrained /path/to/checkpoint.pth \
+    --tasks lambada_openai \
+    --device cuda
+```
+
+## Important Arguments
+| Argument | Meaning |
+| :--- | :--- |
+| `--bet_fraction` | Fraction of wallet converted to stake each forward pass |
+| `--price_lr` | How quickly market beliefs `q` react to realized reward |
+| `--price_temperature` | Softmax temperature for market prices |
+| `--liquidity_floor` | Prevents any expert price from collapsing to zero |
+| `--reward_scale` | Sharpness of reward calibration from loss improvement |
+| `--reward_eps` | Numerical stabilizer in reward computation |
+| `--reward_hidden_dim` | Hidden width of the reward critic |
+| `--routing_noise_std` | Gaussian noise added to routing score in training |
+| `--exploration_epsilon` | Random winner override rate in training |
+| `--uniform_warmup_steps` | Length of the uniform warmup phase |
+| `--routing_ste` | Enable STE soft mixing during training |
+
+## Metrics To Watch
+Healthy training usually looks like:
+
+```text
+price_max stays below full monopoly
+wallet_gini stays bounded
+wallet_min stays above floor
+realized_reward_mean tracks above price for good specialists
+expected_profit_mean is not flat zero
+routing_entropy does not collapse too early
+exploration_rate matches the configured epsilon
+main LM loss keeps falling
+```
+
+The model now logs wallet-, price-, and reward-centric diagnostics instead of old bid/capital/critic-alpha metrics.
+
+## Testing
+Core prediction-market tests:
+
+```bash
+python -m unittest tests.test_prediction_market -v
+```
+
+Static syntax check:
+
+```bash
+python -m compileall camoe train.py scripts/train_reverse_digits.py tests
+```
+
+## Notes
+- Existing `capital` buffers are still named `capital`, but in `v23` they mean budget, not a direct reward multiplier.
+- Old checkpoints from the Vickrey / REINFORCE era are not expected to load cleanly.
+- Some legacy CLI flags may still exist in helper scripts for compatibility, but they are not part of the `v23` routing semantics.
+- Inference uses strict hard Top-1 routing.
