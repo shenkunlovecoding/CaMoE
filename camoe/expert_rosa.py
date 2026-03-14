@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from .expert_base import BaseExpert
 from .rosa_soft_adapter import rosa_soft
+from .soft_rosa_adapter import soft_rosa_exact, soft_rosa_qkv1bit
 from .wind_rosa_adapter import wind_rosa
 
 
@@ -41,6 +42,18 @@ class ROSAExpert(BaseExpert):
     3. ROSA retrieval modulates a continuous stream through a GLU-like fusion path.
     """
 
+    _SUPPORTED_BACKENDS = {
+        "wind",
+        "soft",
+        "sufa",
+        "scan",
+        "soft_exact",
+        "soft_qkv1bit",
+        "soft_qkv1bit_reference",
+        "soft_qkv1bit_triton",
+        "soft_qkv1bit_cuda",
+    }
+
     def __init__(
         self,
         dim: int,
@@ -58,9 +71,9 @@ class ROSAExpert(BaseExpert):
             capital_floor=capital_floor,
             capital_ceiling=capital_ceiling,
         )
-        if backend not in {"wind", "soft", "sufa", "scan"}:
+        if backend not in self._SUPPORTED_BACKENDS:
             raise ValueError(
-                f"ROSAExpert supports backend in {{'wind', 'soft', 'sufa', 'scan'}}, got {backend!r}"
+                f"ROSAExpert supports backend in {sorted(self._SUPPORTED_BACKENDS)!r}, got {backend!r}"
             )
         if slim_heads <= 0 or bits_per_symbol <= 0:
             raise ValueError("ROSA expert requires positive slim_heads and bits_per_symbol.")
@@ -136,6 +149,32 @@ class ROSAExpert(BaseExpert):
                 padded_v,
                 bits_per_symbol=self.bits_per_symbol,
                 truncation_length=self.truncation_length,
+            )
+        elif self.backend == "soft_exact":
+            padded_q, padded_k, padded_v = self._maybe_pad_sequence(q_logits, k_logits, v_logits)
+            out = soft_rosa_exact(
+                padded_q,
+                padded_k,
+                padded_v,
+                bits_per_symbol=self.bits_per_symbol,
+                truncation_length=self.truncation_length,
+            )
+        elif self.backend.startswith("soft_qkv1bit"):
+            if self.bits_per_symbol != 1:
+                raise ValueError(
+                    f"{self.backend!r} requires bits_per_symbol == 1, got {self.bits_per_symbol}."
+                )
+            backend_name = self.backend.removeprefix("soft_qkv1bit").lstrip("_") or "auto"
+            q = StraightThroughSign.apply(q_logits)
+            k = StraightThroughSign.apply(k_logits)
+            v = StraightThroughSign.apply(v_logits)
+            padded_q, padded_k, padded_v = self._maybe_pad_sequence(q, k, v)
+            out = soft_rosa_qkv1bit(
+                padded_q,
+                padded_k,
+                padded_v,
+                truncation_length=self.truncation_length,
+                backend=backend_name,
             )
         else:
             padded_q, padded_k, padded_v = self._maybe_pad_sequence(q_logits, k_logits, v_logits)

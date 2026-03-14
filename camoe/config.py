@@ -110,8 +110,22 @@ class CaMoEConfig:
             raise ValueError("prediction-market routing requires at least 2 FFN-market experts.")
         if self.n_rosa_experts not in (0, 1):
             raise ValueError("The current implementation supports either 0 or 1 sequence ROSA expert per layer.")
-        if self.rosa_backend not in {"wind", "soft", "sufa", "scan"}:
-            raise ValueError("rosa_backend must be one of {'wind', 'soft', 'sufa', 'scan'}.")
+        if self.rosa_backend not in {
+            "wind",
+            "soft",
+            "sufa",
+            "scan",
+            "soft_exact",
+            "soft_qkv1bit",
+            "soft_qkv1bit_reference",
+            "soft_qkv1bit_triton",
+            "soft_qkv1bit_cuda",
+        }:
+            raise ValueError(
+                "rosa_backend must be one of {'wind', 'soft', 'sufa', 'scan', "
+                "'soft_exact', 'soft_qkv1bit', 'soft_qkv1bit_reference', "
+                "'soft_qkv1bit_triton', 'soft_qkv1bit_cuda'}."
+            )
         if self.slim_rosa_heads is not None and self.slim_rosa_heads <= 0:
             raise ValueError("slim_rosa_heads must be positive when provided.")
         if self.rosa_bits <= 0:

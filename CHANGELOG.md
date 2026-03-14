@@ -13,12 +13,19 @@
 
 ### Added
 
+- `wind_rosa/` 与 `Soft_ROSA/` 现已作为 vendored 源码快照直接纳入主仓库管理，不再依赖嵌套 git repo。
 - `PredictionMarketRouter`：基于 `shares * (pred_reward - price)` 的 Top-1 路由。
 - `MarketStateManager`：管理每层钱包、价格、共享 reward baseline 与 settlement。
 - `RewardCritic`：按 token 预测各专家 realized reward 的监督式 critic。
 - `market_weight` 与 `exploration_epsilon` 调度，用于从 uniform warmup 平滑切到 full market。
 - `tests/test_prediction_market.py`：覆盖价格归一化、结算不变性、reward critic mask、模型集成和 warmup 行为。
 - `camoe/rosa_soft_adapter.py` 与 `ROSAExpert(backend in {"wind","soft","sufa","scan"})`，支持本地 `rosa_soft` 路径与 Wind ROSA 并存。
+- `camoe/soft_rosa_adapter.py` 与新的实验性 backend：
+  - `soft_exact`
+  - `soft_qkv1bit`
+  - `soft_qkv1bit_reference`
+  - `soft_qkv1bit_triton`
+  - `soft_qkv1bit_cuda`
 - toy 数据扩展：
   - `pattern_complete`
   - `delayed_copy`
@@ -35,6 +42,9 @@
 - 训练脚本与 toy 训练脚本改用 `uniform_warmup`、`market_ramp_steps`、`routing_noise_std`、`exploration_epsilon` 等新配置。
 - `market_metrics()` 改为输出 wallet、price、predicted reward、expected profit、exploration 等新诊断指标。
 - `eval.py` 的路由统计适配新的 block cache 结构。
+- `ROSAExpert` 现在允许直接切到 vendored `Soft_ROSA`：
+  - `soft_exact` 走 exact soft DP
+  - `soft_qkv1bit*` 在 `rosa_bits == 1` 时提供额外加速路径
 - README / README.zh-CN 全面切到 `v23.0` 的 prediction-market 叙述与用法说明。
 
 ## v22.2 - 2026-03-14

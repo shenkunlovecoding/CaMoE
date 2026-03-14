@@ -13,6 +13,7 @@ from camoe.expert_critic import RewardCritic
 from camoe.expert_rosa import ROSAExpert
 from camoe.model import CaMoE_Model
 from camoe.rosa_soft_adapter import rosa_soft
+from camoe.soft_rosa_adapter import soft_rosa_exact, soft_rosa_qkv1bit
 
 
 class DummyTimeMixExpert(BaseExpert):
@@ -134,6 +135,39 @@ class PredictionMarketTests(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (2, 6, 8))
         out.sum().backward()
         self.assertTrue(torch.isfinite(x.grad).all().item())
+
+    def test_rosa_expert_soft_exact_backend_smoke(self) -> None:
+        expert = ROSAExpert(
+            dim=8,
+            slim_heads=2,
+            bits_per_symbol=4,
+            backend="soft_exact",
+            truncation_length=4,
+            sequence_length=6,
+        )
+        x = torch.randn(2, 6, 8, requires_grad=True)
+        out = expert(x)
+        self.assertEqual(tuple(out.shape), (2, 6, 8))
+        out.sum().backward()
+        self.assertTrue(torch.isfinite(x.grad).all().item())
+
+    def test_soft_rosa_qkv1bit_reference_smoke(self) -> None:
+        q = torch.randn(2, 6, 4, requires_grad=True)
+        k = torch.randn(2, 6, 4, requires_grad=True)
+        v = torch.randn(2, 6, 4, requires_grad=True)
+        out = soft_rosa_qkv1bit(q, k, v, truncation_length=4, backend="reference")
+        self.assertEqual(tuple(out.shape), (2, 6, 4))
+        out.sum().backward()
+        self.assertTrue(torch.isfinite(q.grad).all().item())
+
+    def test_soft_rosa_exact_adapter_smoke(self) -> None:
+        q = torch.randn(1, 6, 8, requires_grad=True)
+        k = torch.randn(1, 6, 8, requires_grad=True)
+        v = torch.randn(1, 6, 8, requires_grad=True)
+        out = soft_rosa_exact(q, k, v, bits_per_symbol=4, truncation_length=4)
+        self.assertEqual(tuple(out.shape), (1, 6, 8))
+        out.sum().backward()
+        self.assertTrue(torch.isfinite(q.grad).all().item())
 
     def test_rosa_symbol_language_summary_smoke(self) -> None:
         expert = ROSAExpert(

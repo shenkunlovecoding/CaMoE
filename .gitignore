@@ -42,7 +42,6 @@ tmp/
 tree.exe
 
 # Local cloned repos / vendored extras not tracked in this repo
-Soft_ROSA/
 rosa_soft/docs/
 rosa_soft/legacy/
 rosa_soft/modules/

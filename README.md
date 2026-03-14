@@ -143,6 +143,42 @@ Step 0                     uniform_warmup_steps                end
 | `scripts/train_reverse_digits.py` | Toy-task trainer and route visualizer |
 | `tests/test_prediction_market.py` | Core prediction-market unit tests |
 
+## Vendored ROSA Backends
+The repository now vendors three local ROSA-family codebases directly in-tree:
+
+- `wind_rosa/`
+  - vendored hard symbolic CUDA backend
+  - local adapter: `camoe/wind_rosa_adapter.py`
+- `rosa_soft/`
+  - vendored proxy / SUFA / scan operators
+  - local adapter: `camoe/rosa_soft_adapter.py`
+- `Soft_ROSA/`
+  - vendored experimental exact Soft DP and QKV-1bit kernels
+  - local adapter: `camoe/soft_rosa_adapter.py`
+
+Supported `rosa_backend` values now include:
+
+- `wind`
+- `soft`
+- `sufa`
+- `scan`
+- `soft_exact`
+- `soft_qkv1bit`
+- `soft_qkv1bit_reference`
+- `soft_qkv1bit_triton`
+- `soft_qkv1bit_cuda`
+
+Practical guidance:
+
+- `wind` remains the default hard symbolic path.
+- `soft_exact` is an experimental exact soft-DP backend.
+- `soft_qkv1bit*` is experimental and intended for `rosa_bits == 1`; this is the path with the extra QKV-1bit acceleration.
+
+## License Notes
+- `wind_rosa/` is vendored under its included MIT license.
+- `Soft_ROSA/` is vendored under its included MIT license.
+- `rosa_soft/` keeps its vendored license files in-tree as well.
+
 ## Quick Start
 ### Install
 ```bash
