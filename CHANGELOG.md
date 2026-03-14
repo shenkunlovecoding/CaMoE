@@ -2,6 +2,39 @@
 
 本文档记录 CaMoE v22 之后的重要架构与训练接口变更。
 
+## v22.2 - 2026-03-14
+
+### Added
+
+- `rosa_soft` SUFA 实验 GPU 快路径：
+  - `proxy_triton`
+  - `truncated_cuda`
+- `rosa_sufa_ops(..., kernel=...)` 调度入口，支持：
+  - `auto`
+  - `torch`
+  - `proxy_triton`
+  - `truncated_cuda`
+- `CAMOE_ROSA_SUFA_KERNEL` 环境变量，用于在 `backend="sufa"` 下切换实验 kernel。
+- `truncated_cuda` 多-spec 进程内编译缓存，支持同一进程内混用多个 `(T, C, K)` 规格。
+- `scripts/benchmark_rosa_sufa_kernels.py`，用于对比 `torch / proxy_triton / truncated_cuda` 的 forward 与 step 耗时。
+- `tests/test_rosa_sufa_kernels.py`，覆盖：
+  - `proxy_triton` 与 torch 参考实现对齐
+  - `auto` fallback/warning
+  - `truncated_cuda` hard forward 参考正确性
+  - 多-spec 单进程 smoke
+
+### Changed
+
+- `backend="sufa"` 默认入口保持不变，但在 CUDA 条件满足时，`kernel="auto"` 会优先尝试 `proxy_triton`。
+- `truncated_cuda` 保持为显式 opt-in 实验路径，不会被 `auto` 自动选中。
+- `truncated_cuda` backward 回退为现有 SUFA proxy gradient 路径；取消 exact CUDA backward 作为默认实现，因为它没有带来更好的 step-time 收益。
+
+### Notes
+
+- 当前实验路径以 CaMoE 主场景为准：CUDA、`bits_per_symbol <= 8`、`suffix_window <= 8`、`schmitt_trigger == 0`。
+- `proxy_triton` 以“保留现有 SUFA 语义”为目标，只替换 proxy 侧窗口展开与衰减内核。
+- `truncated_cuda` 以“更激进的 forward 提速”为目标，hard forward 语义为截断版本，训练时仍通过 SUFA proxy backward 近似求梯度。
+
 ## v22.1 - 2026-03-09
 
 ### Breaking Changes
