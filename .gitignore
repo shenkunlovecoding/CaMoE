@@ -34,3 +34,18 @@ logs/
 build/
 dist/
 *.so
+
+# Local artifacts / temp outputs
+artifacts/
+output/
+tmp/
+tree.exe
+
+# Local cloned repos / vendored extras not tracked in this repo
+Soft_ROSA/
+rosa_soft/docs/
+rosa_soft/legacy/
+rosa_soft/modules/
+rosa_soft/rwkv_cuda/
+rosa_soft/test/
+rosa_soft/utils/
