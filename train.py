@@ -185,7 +185,24 @@ def main() -> None:
     parser.add_argument("--deepembed_expand", type=int, default=None)
     parser.add_argument("--slim_deepembed_rank", type=int, default=None)
     parser.add_argument("--n_rosa_experts", type=int, default=None)
-    parser.add_argument("--rosa_backend", type=str, default=None, choices=["wind", "soft", "sufa", "scan"])
+    parser.add_argument(
+        "--rosa_backend",
+        type=str,
+        default=None,
+        choices=[
+            "wind",
+            "soft",
+            "sufa",
+            "scan",
+            "soft_exact",
+            "soft_exact_serial",
+            "soft_exact_cuda",
+            "soft_exact_triton",
+            "soft_qkv1bit",
+            "soft_qkv1bit_triton",
+            "soft_qkv1bit_cuda",
+        ],
+    )
     parser.add_argument("--rosa_bits", type=int, default=None)
     parser.add_argument("--slim_rosa_heads", type=int, default=None)
     parser.add_argument("--rosa_truncation_length", type=int, default=None)

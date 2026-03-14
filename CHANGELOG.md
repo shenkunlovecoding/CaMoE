@@ -22,8 +22,10 @@
 - `camoe/rosa_soft_adapter.py` 与 `ROSAExpert(backend in {"wind","soft","sufa","scan"})`，支持本地 `rosa_soft` 路径与 Wind ROSA 并存。
 - `camoe/soft_rosa_adapter.py` 与新的实验性 backend：
   - `soft_exact`
+  - `soft_exact_serial`
+  - `soft_exact_cuda`
+  - `soft_exact_triton`
   - `soft_qkv1bit`
-  - `soft_qkv1bit_reference`
   - `soft_qkv1bit_triton`
   - `soft_qkv1bit_cuda`
 - toy 数据扩展：
@@ -43,8 +45,15 @@
 - `market_metrics()` 改为输出 wallet、price、predicted reward、expected profit、exploration 等新诊断指标。
 - `eval.py` 的路由统计适配新的 block cache 结构。
 - `ROSAExpert` 现在允许直接切到 vendored `Soft_ROSA`：
-  - `soft_exact` 走 exact soft DP
+  - `soft_exact` 走 exact soft DP，并默认选择 adapter 侧可用 scan backend
+  - `soft_exact_serial / soft_exact_cuda / soft_exact_triton` 可显式固定 exact soft DP 的 scan 实现
   - `soft_qkv1bit*` 在 `rosa_bits == 1` 时提供额外加速路径
+- `scripts/benchmark_rosa_backends.py` 现在会覆盖完整的 Soft_ROSA benchmark 路径：
+  - `soft_exact_serial`
+  - `soft_exact_cuda`
+  - `soft_exact_triton`
+  - `soft_qkv1bit_cuda`
+  - `soft_qkv1bit_triton`
 - README / README.zh-CN 全面切到 `v23.0` 的 prediction-market 叙述与用法说明。
 
 ## v22.2 - 2026-03-14

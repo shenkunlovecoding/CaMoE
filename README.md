@@ -163,16 +163,34 @@ Supported `rosa_backend` values now include:
 - `sufa`
 - `scan`
 - `soft_exact`
+- `soft_exact_serial`
+- `soft_exact_cuda`
+- `soft_exact_triton`
 - `soft_qkv1bit`
-- `soft_qkv1bit_reference`
 - `soft_qkv1bit_triton`
 - `soft_qkv1bit_cuda`
 
 Practical guidance:
 
 - `wind` remains the default hard symbolic path.
-- `soft_exact` is an experimental exact soft-DP backend.
+- `soft_exact` uses the adapter default selection for the Soft_ROSA diagonal scan backend.
+- `soft_exact_serial` forces the exact soft-DP reference path and is mainly useful as a correctness baseline.
+- `soft_exact_cuda` forces the CUDA diagonal scan kernel.
+- `soft_exact_triton` forces the Triton diagonal scan kernel.
 - `soft_qkv1bit*` is experimental and intended for `rosa_bits == 1`; this is the path with the extra QKV-1bit acceleration.
+
+### Backend Benchmarking
+Use the backend benchmark helper to compare the routed `ROSAExpert` implementations end to end:
+
+```bash
+python scripts/benchmark_rosa_backends.py --device cuda
+```
+
+Notes:
+
+- On CUDA, the default benchmark set now includes `soft_exact_cuda`, `soft_exact_triton`, `soft_qkv1bit_cuda`, and `soft_qkv1bit_triton` when they are applicable.
+- `soft_exact_serial` is intentionally much slower and is meant for reference comparisons.
+- On Windows, Triton availability still depends on the local environment; unsupported Triton paths will be reported as `skip`.
 
 ## License Notes
 - `wind_rosa/` is vendored under its included MIT license.

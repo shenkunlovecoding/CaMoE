@@ -52,6 +52,7 @@ def soft_rosa_exact(
     *,
     bits_per_symbol: int,
     truncation_length: int,
+    scan_backend: str = "auto",
 ) -> torch.Tensor:
     soft_rosa_ops, _ = _load_soft_rosa_ops()
     q_bhtd = _reshape_btd_to_bhtd(q, bits_per_symbol)
@@ -62,6 +63,7 @@ def soft_rosa_exact(
         k_bhtd,
         v_bhtd,
         max_lookback=truncation_length,
+        scan_backend=scan_backend,
     )
     return _reshape_bhtd_to_btd(out).to(v.dtype)
 

@@ -143,6 +143,55 @@ Step 0                     uniform_warmup_steps                结束
 | `scripts/train_reverse_digits.py` | toy 任务训练与路由可视化 |
 | `tests/test_prediction_market.py` | prediction-market 核心单测 |
 
+## Vendored ROSA 后端
+仓库目前直接内置了三套 ROSA 家族本地代码：
+
+- `wind_rosa/`
+  - vendored 的 hard symbolic CUDA backend
+  - 本地 adapter：`camoe/wind_rosa_adapter.py`
+- `rosa_soft/`
+  - vendored 的 proxy / SUFA / scan 算子
+  - 本地 adapter：`camoe/rosa_soft_adapter.py`
+- `Soft_ROSA/`
+  - vendored 的 experimental exact Soft DP 与 QKV-1bit kernel
+  - 本地 adapter：`camoe/soft_rosa_adapter.py`
+
+当前支持的 `rosa_backend` 包括：
+
+- `wind`
+- `soft`
+- `sufa`
+- `scan`
+- `soft_exact`
+- `soft_exact_serial`
+- `soft_exact_cuda`
+- `soft_exact_triton`
+- `soft_qkv1bit`
+- `soft_qkv1bit_triton`
+- `soft_qkv1bit_cuda`
+
+实用建议：
+
+- `wind` 仍然是默认的 hard symbolic 路径。
+- `soft_exact` 使用 adapter 默认选择的 Soft_ROSA diagonal scan backend。
+- `soft_exact_serial` 会强制走 exact soft-DP 参考实现，主要用于正确性或基线对比。
+- `soft_exact_cuda` 会强制走 CUDA diagonal scan kernel。
+- `soft_exact_triton` 会强制走 Triton diagonal scan kernel。
+- `soft_qkv1bit*` 是实验路径，主要用于 `rosa_bits == 1` 时的额外 QKV-1bit 加速。
+
+### 后端 Benchmark
+可以用下面的脚本对 routed `ROSAExpert` 后端做端到端对比：
+
+```bash
+python scripts/benchmark_rosa_backends.py --device cuda
+```
+
+说明：
+
+- 在 CUDA 环境下，默认 benchmark 集合会自动包含 `soft_exact_cuda`、`soft_exact_triton`、`soft_qkv1bit_cuda`、`soft_qkv1bit_triton`。
+- `soft_exact_serial` 明显更慢，主要用于参考对照。
+- 在 Windows 上，Triton 是否可用仍取决于本地环境；不支持时脚本会输出 `skip`。
+
 ## 快速开始
 ### 安装
 ```bash

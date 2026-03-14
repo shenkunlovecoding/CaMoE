@@ -116,15 +116,18 @@ class CaMoEConfig:
             "sufa",
             "scan",
             "soft_exact",
+            "soft_exact_serial",
+            "soft_exact_cuda",
+            "soft_exact_triton",
             "soft_qkv1bit",
-            "soft_qkv1bit_reference",
             "soft_qkv1bit_triton",
             "soft_qkv1bit_cuda",
         }:
             raise ValueError(
                 "rosa_backend must be one of {'wind', 'soft', 'sufa', 'scan', "
-                "'soft_exact', 'soft_qkv1bit', 'soft_qkv1bit_reference', "
-                "'soft_qkv1bit_triton', 'soft_qkv1bit_cuda'}."
+                "'soft_exact', 'soft_exact_serial', 'soft_exact_cuda', "
+                "'soft_exact_triton', 'soft_qkv1bit', 'soft_qkv1bit_triton', "
+                "'soft_qkv1bit_cuda'}."
             )
         if self.slim_rosa_heads is not None and self.slim_rosa_heads <= 0:
             raise ValueError("slim_rosa_heads must be positive when provided.")

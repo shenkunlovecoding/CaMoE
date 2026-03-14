@@ -48,8 +48,10 @@ class ROSAExpert(BaseExpert):
         "sufa",
         "scan",
         "soft_exact",
+        "soft_exact_serial",
+        "soft_exact_cuda",
+        "soft_exact_triton",
         "soft_qkv1bit",
-        "soft_qkv1bit_reference",
         "soft_qkv1bit_triton",
         "soft_qkv1bit_cuda",
     }
@@ -150,7 +152,8 @@ class ROSAExpert(BaseExpert):
                 bits_per_symbol=self.bits_per_symbol,
                 truncation_length=self.truncation_length,
             )
-        elif self.backend == "soft_exact":
+        elif self.backend.startswith("soft_exact"):
+            exact_backend = self.backend.removeprefix("soft_exact").lstrip("_") or "auto"
             padded_q, padded_k, padded_v = self._maybe_pad_sequence(q_logits, k_logits, v_logits)
             out = soft_rosa_exact(
                 padded_q,
@@ -158,6 +161,7 @@ class ROSAExpert(BaseExpert):
                 padded_v,
                 bits_per_symbol=self.bits_per_symbol,
                 truncation_length=self.truncation_length,
+                scan_backend=exact_backend,
             )
         elif self.backend.startswith("soft_qkv1bit"):
             if self.bits_per_symbol != 1:
