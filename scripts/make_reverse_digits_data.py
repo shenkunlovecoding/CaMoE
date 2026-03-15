@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 import random
 
 from datasets import Dataset, DatasetDict
+import typer
 
 PAD_ID = 0
 BOS_ID = 1
@@ -49,6 +49,7 @@ OPERATION_ID_BY_NAME = {
     "sum_threshold": 10,
     "bracket_depth": 11,
     "addsub_40": 12,
+    "pattern_continue": 13,
 }
 
 CONTROL_TOKEN_BY_OPERATION = {
@@ -59,6 +60,7 @@ CONTROL_TOKEN_BY_OPERATION = {
     "majority_vote": MAJORITY_ID,
     "count_ones": COUNT_ID,
     "pattern_complete": PATTERN_ID,
+    "pattern_continue": PATTERN_ID,
     "delayed_copy": DELAY_ID,
     "first_repeat": REPEAT_ID,
     "running_max": RUNMAX_ID,
@@ -206,6 +208,31 @@ def build_pattern_complete_example(
         length=length,
         task_name=task_name,
         operation_name="pattern_complete",
+    )
+
+
+def build_pattern_continue_example(
+    length: int,
+    rng: random.Random,
+    task_name: str = "pattern_continue",
+) -> dict[str, list[int] | int | str]:
+    """
+    Continue a cyclic digit pattern from a visible prefix.
+
+    The model sees the first part of the progression and must emit the entire
+    remaining suffix, making this a full sequence continuation task instead of
+    a single masked-token recovery task.
+    """
+    total_len = max(4, length)
+    prefix_len = rng.randint(2, total_len - 2)
+    start = rng.randrange(10)
+    digits = [(start + offset) % 10 for offset in range(total_len)]
+    return _make_row(
+        prefix_tokens=[encode_digit(value) for value in digits[:prefix_len]],
+        output_tokens=[encode_digit(value) for value in digits[prefix_len:]],
+        length=total_len,
+        task_name=task_name,
+        operation_name="pattern_continue",
     )
 
 
@@ -392,6 +419,7 @@ TASK_BUILDERS = {
     "majority_vote": build_majority_vote_example,
     "count_ones": build_count_ones_example,
     "pattern_complete": build_pattern_complete_example,
+    "pattern_continue": build_pattern_continue_example,
     "delayed_copy": build_delayed_copy_example,
     "first_repeat": build_first_repeat_example,
     "running_max": build_running_max_example,
@@ -401,6 +429,56 @@ TASK_BUILDERS = {
     "mixed_digits": None,
     "mixed_all_digits": None,
     "mixed_v3": None,
+}
+
+TASK_DESCRIPTIONS = {
+    "reverse_digits": "Reverse the input digit sequence token by token.",
+    "copy_digits": "Copy the input digit sequence exactly.",
+    "parity_digits": "Predict whether the count of odd digits is odd or even.",
+    "cumsum_mod10": "Emit the running sum modulo 10 at each position.",
+    "majority_vote": "For a binary digit sequence, output whether ones are the strict majority.",
+    "count_ones": "Count how many ones appear in a binary sequence and output the decimal result.",
+    "pattern_complete": "Recover a single masked digit inside a simple cyclic pattern.",
+    "pattern_continue": "Observe a cyclic pattern prefix and predict the full remaining suffix.",
+    "delayed_copy": "Copy the prefix again after a fixed delay, rewarding retention over local matching.",
+    "first_repeat": "Output the first value whose second occurrence appears in the sequence.",
+    "running_max": "Emit the running maximum after each new digit arrives.",
+    "sum_threshold": "Predict whether the total sum crosses a length-scaled threshold.",
+    "bracket_depth": "Output the maximum nesting depth of a bracket sequence.",
+    "addsub_40": "Perform 40-digit addition or subtraction and emit the full decimal answer.",
+    "mixed_digits": "Round-robin mix of reverse_digits and copy_digits.",
+    "mixed_v3": "Round-robin mix of reverse/copy plus longer-horizon symbolic tasks.",
+    "mixed_all_digits": "Round-robin mix of all digit/bracket toy tasks except addsub_40.",
+}
+
+TASK_OPERATION_GROUPS = {
+    "mixed_digits": ["reverse_digits", "copy_digits"],
+    "mixed_v3": [
+        "reverse_digits",
+        "copy_digits",
+        "pattern_complete",
+        "pattern_continue",
+        "delayed_copy",
+        "first_repeat",
+        "running_max",
+        "sum_threshold",
+        "bracket_depth",
+    ],
+    "mixed_all_digits": [
+        "reverse_digits",
+        "copy_digits",
+        "parity_digits",
+        "cumsum_mod10",
+        "majority_vote",
+        "count_ones",
+        "pattern_complete",
+        "pattern_continue",
+        "delayed_copy",
+        "first_repeat",
+        "running_max",
+        "sum_threshold",
+        "bracket_depth",
+    ],
 }
 
 
@@ -444,6 +522,7 @@ def build_split(task: str, size: int, min_len: int, max_len: int, seed: int) -> 
                 "reverse_digits",
                 "copy_digits",
                 "pattern_complete",
+                "pattern_continue",
                 "delayed_copy",
                 "first_repeat",
                 "running_max",
@@ -466,6 +545,7 @@ def build_split(task: str, size: int, min_len: int, max_len: int, seed: int) -> 
                 "majority_vote",
                 "count_ones",
                 "pattern_complete",
+                "pattern_continue",
                 "delayed_copy",
                 "first_repeat",
                 "running_max",
@@ -479,36 +559,62 @@ def build_split(task: str, size: int, min_len: int, max_len: int, seed: int) -> 
     return Dataset.from_list(rows)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Create toy sequence datasets")
-    parser.add_argument("--task", type=str, choices=sorted(TASK_BUILDERS), default="reverse_digits")
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--train_size", type=int, default=50000)
-    parser.add_argument("--val_size", type=int, default=5000)
-    parser.add_argument("--test_size", type=int, default=5000)
-    parser.add_argument("--ood_size", type=int, default=5000)
-    parser.add_argument("--train_min_len", type=int, default=4)
-    parser.add_argument("--train_max_len", type=int, default=20)
-    parser.add_argument("--ood_min_len", type=int, default=21)
-    parser.add_argument("--ood_max_len", type=int, default=40)
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+def format_task_intro(task: str) -> str:
+    if task not in TASK_BUILDERS:
+        raise KeyError(f"Unknown task: {task}")
+    description = TASK_DESCRIPTIONS[task]
+    ops = TASK_OPERATION_GROUPS.get(task, [task])
+    op_lines = "\n".join(f"- {name}: {TASK_DESCRIPTIONS[name]}" for name in ops)
+    return "\n".join(
+        [
+            f"task={task}",
+            f"description={description}",
+            "operations:",
+            op_lines,
+        ]
+    )
 
-    output_dir = Path(args.output) if args.output else Path("data") / args.task
+
+def main(
+    task: str = typer.Option("reverse_digits", help=f"One of: {', '.join(sorted(TASK_BUILDERS))}"),
+    output: str | None = typer.Option(None),
+    train_size: int = typer.Option(50000),
+    val_size: int = typer.Option(5000),
+    test_size: int = typer.Option(5000),
+    ood_size: int = typer.Option(5000),
+    train_min_len: int = typer.Option(4),
+    train_max_len: int = typer.Option(120),
+    ood_min_len: int = typer.Option(121),
+    ood_max_len: int = typer.Option(200),
+    seed: int = typer.Option(42),
+    print_task_intro: bool = typer.Option(False, "--print-task-intro/--no-print-task-intro"),
+    intro_only: bool = typer.Option(False, "--intro-only/--no-intro-only"),
+) -> None:
+    if task not in TASK_BUILDERS:
+        raise typer.BadParameter(f"Unknown task {task!r}. Choose from {sorted(TASK_BUILDERS)!r}.")
+
+    if print_task_intro or intro_only:
+        print(format_task_intro(task))
+        if intro_only:
+            return
+
+    output_dir = Path(output) if output else Path("data") / task
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = DatasetDict(
         {
-            "train": build_split(args.task, args.train_size, args.train_min_len, args.train_max_len, args.seed + 1),
-            "validation": build_split(args.task, args.val_size, args.train_min_len, args.train_max_len, args.seed + 2),
-            "test": build_split(args.task, args.test_size, args.train_min_len, args.train_max_len, args.seed + 3),
-            "ood": build_split(args.task, args.ood_size, args.ood_min_len, args.ood_max_len, args.seed + 4),
+            "train": build_split(task, train_size, train_min_len, train_max_len, seed + 1),
+            "validation": build_split(task, val_size, train_min_len, train_max_len, seed + 2),
+            "test": build_split(task, test_size, train_min_len, train_max_len, seed + 3),
+            "ood": build_split(task, ood_size, ood_min_len, ood_max_len, seed + 4),
         }
     )
     dataset.save_to_disk(str(output_dir))
-    print(f"task={args.task}")
+    print(f"task={task}")
     print(f"saved={output_dir}")
+    if not print_task_intro:
+        print("hint=use --print-task-intro to show the task description alongside dataset generation")
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)

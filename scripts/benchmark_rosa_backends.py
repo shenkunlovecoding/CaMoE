@@ -71,13 +71,47 @@ def _benchmark_case(
 
 
 def _default_backends(bits: int) -> list[str]:
-    common = ["wind", "soft", "sufa", "scan", "soft_exact", "soft_exact_serial"]
+    common = [
+        "hard_symbolic_multibit",
+        "soft_match",
+        "soft_suffix",
+        "soft_suffix_scan",
+        "soft_exact_dp",
+        "soft_exact_dp_serial",
+    ]
     if torch.cuda.is_available():
-        common.extend(["soft_exact_cuda", "soft_exact_triton"])
-    if bits == 1:
-        common.append("soft_qkv1bit")
+        common.extend(["soft_exact_dp_cuda", "soft_exact_dp_triton"])
+    if bits > 1:
+        common.extend(
+            [
+                "soft_qkv_multibit",
+                "soft_qkv_multibit_serial",
+                "soft_qkv_multibit_unmatched",
+                "soft_qkv_multibit_unmatched_serial",
+                "hard_qkv_multibit",
+            ]
+        )
         if torch.cuda.is_available():
-            common.extend(["soft_qkv1bit_cuda", "soft_qkv1bit_triton"])
+            common.extend(
+                [
+                    "soft_qkv_multibit_cuda",
+                    "soft_qkv_multibit_triton",
+                    "soft_qkv_multibit_unmatched_cuda",
+                    "soft_qkv_multibit_unmatched_triton",
+                ]
+            )
+    if bits == 1:
+        common.append("soft_qkv_binary")
+        common.append("soft_qkv_binary_bipolar")
+        if torch.cuda.is_available():
+            common.extend(
+                [
+                    "soft_qkv_binary_cuda",
+                    "soft_qkv_binary_triton",
+                    "soft_qkv_binary_bipolar_cuda",
+                    "soft_qkv_binary_bipolar_triton",
+                ]
+            )
     return common
 
 

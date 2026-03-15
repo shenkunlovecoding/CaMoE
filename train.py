@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import time
 from contextlib import nullcontext
-from typing import Iterator
+from types import SimpleNamespace
+from typing import Iterator, Literal
 
 import torch
+import typer
 from datasets import Dataset, DatasetDict, load_from_disk
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
 from camoe.backbone import init_rwkv7_cuda
-from camoe.config import CaMoEConfig, get_config
+from camoe.config import CaMoEConfig, ROSA_BACKEND_CHOICES, get_config
 from camoe.model import CaMoE_Model
 
 try:
@@ -155,157 +156,128 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train prediction-market CaMoE model")
-    parser.add_argument("--scale", default="0.4b", choices=["0.1b", "0.4b"])
-    parser.add_argument("--data", required=True, help="Path to a HuggingFace dataset saved with load_from_disk")
-    parser.add_argument("--save_dir", default="checkpoints/v23")
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--seq_len", type=int, default=None)
-    parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--critic_lr", type=float, default=None)
-    parser.add_argument("--critic_update_interval", type=int, default=None)
-    parser.add_argument("--bet_fraction", type=float, default=None)
-    parser.add_argument("--price_lr", type=float, default=None)
-    parser.add_argument("--price_temperature", type=float, default=None)
-    parser.add_argument("--liquidity_floor", type=float, default=None)
-    parser.add_argument("--reward_scale", type=float, default=None)
-    parser.add_argument("--reward_eps", type=float, default=None)
-    parser.add_argument("--reward_hidden_dim", type=int, default=None)
-    parser.add_argument("--uniform_warmup_steps", type=int, default=None)
-    parser.add_argument("--market_ramp_steps", type=int, default=None)
-    parser.add_argument("--routing_noise_std", type=float, default=None)
-    parser.add_argument("--exploration_epsilon", type=float, default=None)
-    parser.add_argument("--n_deepembed_experts", type=int, default=None)
-    parser.add_argument("--n_slim_deepembed_experts", type=int, default=None)
-    parser.add_argument("--deepembed_mode", type=str, default=None, choices=["1x", "4x"])
-    parser.add_argument("--deepembed_expand", type=int, default=None)
-    parser.add_argument("--slim_deepembed_rank", type=int, default=None)
-    parser.add_argument("--n_rosa_experts", type=int, default=None)
-    parser.add_argument(
-        "--rosa_backend",
-        type=str,
-        default=None,
-        choices=[
-            "wind",
-            "soft",
-            "sufa",
-            "scan",
-            "soft_exact",
-            "soft_exact_serial",
-            "soft_exact_cuda",
-            "soft_exact_triton",
-            "soft_qkv1bit",
-            "soft_qkv1bit_triton",
-            "soft_qkv1bit_cuda",
-        ],
+def main(
+    scale: Literal["0.1b", "0.4b"] = typer.Option("0.4b"),
+    data: str = typer.Option(..., help="Path to a HuggingFace dataset saved with load_from_disk"),
+    save_dir: str = typer.Option("checkpoints/v23"),
+    resume: str | None = typer.Option(None),
+    device: str = typer.Option("cuda"),
+    batch_size: int | None = typer.Option(None),
+    seq_len: int | None = typer.Option(None),
+    steps: int | None = typer.Option(None),
+    lr: float | None = typer.Option(None),
+    critic_lr: float | None = typer.Option(None),
+    critic_update_interval: int | None = typer.Option(None),
+    bet_fraction: float | None = typer.Option(None),
+    price_lr: float | None = typer.Option(None),
+    price_temperature: float | None = typer.Option(None),
+    liquidity_floor: float | None = typer.Option(None),
+    reward_scale: float | None = typer.Option(None),
+    reward_eps: float | None = typer.Option(None),
+    reward_hidden_dim: int | None = typer.Option(None),
+    uniform_warmup_steps: int | None = typer.Option(None),
+    market_ramp_steps: int | None = typer.Option(None),
+    routing_noise_std: float | None = typer.Option(None),
+    exploration_epsilon: float | None = typer.Option(None),
+    n_deepembed_experts: int | None = typer.Option(None),
+    n_slim_deepembed_experts: int | None = typer.Option(None),
+    deepembed_mode: Literal["1x", "4x"] | None = typer.Option(None),
+    deepembed_expand: int | None = typer.Option(None),
+    slim_deepembed_rank: int | None = typer.Option(None),
+    n_rosa_experts: int | None = typer.Option(None),
+    rosa_backend: str | None = typer.Option(
+        None,
+        help=f"Canonical backends: {', '.join(ROSA_BACKEND_CHOICES)}. Old aliases still work.",
+    ),
+    rosa_hard_backend: str | None = typer.Option(
+        None,
+        help=f"Canonical backends: {', '.join(ROSA_BACKEND_CHOICES)}. Old aliases still work.",
+    ),
+    rosa_hard_switch_step: int | None = typer.Option(None),
+    rosa_bits: int | None = typer.Option(None),
+    slim_rosa_heads: int | None = typer.Option(None),
+    rosa_truncation_length: int | None = typer.Option(None),
+    rosa_native_mode: bool | None = typer.Option(None, "--rosa-native-mode/--no-rosa-native-mode"),
+    rosa_use_gate: bool | None = typer.Option(None, "--rosa-use-gate/--no-rosa-use-gate"),
+    market_alpha_start: float | None = typer.Option(None),
+    market_alpha_end: float | None = typer.Option(None),
+    routing_entropy_reg: float | None = typer.Option(None),
+    critic_shadow_prewarm: bool | None = typer.Option(None, "--critic-shadow-prewarm/--no-critic-shadow-prewarm"),
+    critic_shadow_market: bool | None = typer.Option(None, "--critic-shadow-market/--no-critic-shadow-market"),
+    routing_ste: bool | None = typer.Option(None, "--routing-ste/--no-routing-ste"),
+    ste_temperature_start: float | None = typer.Option(None),
+    ste_temperature_mid: float | None = typer.Option(None),
+    ste_temperature_end: float | None = typer.Option(None),
+    ste_midpoint_steps: int | None = typer.Option(None),
+    ste_anneal_steps: int | None = typer.Option(None),
+    compile_enabled: bool | None = typer.Option(None, "--compile/--no-compile"),
+    gradient_checkpointing: bool | None = typer.Option(
+        None,
+        "--gradient-checkpointing/--no-gradient-checkpointing",
+    ),
+    log_interval: int = typer.Option(100),
+    save_interval: int = typer.Option(1000),
+    num_workers: int = typer.Option(0),
+    amp: bool = typer.Option(False, "--amp/--no-amp"),
+) -> None:
+    args = SimpleNamespace(
+        scale=scale,
+        data=data,
+        save_dir=save_dir,
+        resume=resume,
+        device=device,
+        log_interval=log_interval,
+        save_interval=save_interval,
+        num_workers=num_workers,
+        amp=amp,
     )
-    parser.add_argument("--rosa_bits", type=int, default=None)
-    parser.add_argument("--slim_rosa_heads", type=int, default=None)
-    parser.add_argument("--rosa_truncation_length", type=int, default=None)
-    parser.add_argument("--market_alpha_start", type=float, default=None)
-    parser.add_argument("--market_alpha_end", type=float, default=None)
-    parser.add_argument("--routing_entropy_reg", type=float, default=None)
-    parser.add_argument("--critic_shadow_prewarm", type=int, default=None, choices=[0, 1])
-    parser.add_argument("--critic_shadow_market", type=int, default=None, choices=[0, 1])
-    parser.add_argument("--routing_ste", type=int, default=None, choices=[0, 1])
-    parser.add_argument("--ste_temperature_start", type=float, default=None)
-    parser.add_argument("--ste_temperature_mid", type=float, default=None)
-    parser.add_argument("--ste_temperature_end", type=float, default=None)
-    parser.add_argument("--ste_midpoint_steps", type=int, default=None)
-    parser.add_argument("--ste_anneal_steps", type=int, default=None)
-    parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--no_gradient_checkpointing", action="store_true")
-    parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--save_interval", type=int, default=1000)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--amp", action="store_true")
-    args = parser.parse_args()
 
-    config = get_config(args.scale)
-    if args.batch_size is not None:
-        config.batch_size = args.batch_size
-    if args.seq_len is not None:
-        config.seq_len = args.seq_len
-    if args.steps is not None:
-        config.total_steps = args.steps
-    if args.lr is not None:
-        config.lr = args.lr
-    if args.critic_lr is not None:
-        config.critic_lr = args.critic_lr
-    if args.critic_update_interval is not None:
-        config.critic_update_interval = args.critic_update_interval
-    if args.bet_fraction is not None:
-        config.bet_fraction = args.bet_fraction
-    if args.price_lr is not None:
-        config.price_lr = args.price_lr
-    if args.price_temperature is not None:
-        config.price_temperature = args.price_temperature
-    if args.liquidity_floor is not None:
-        config.liquidity_floor = args.liquidity_floor
-    if args.reward_scale is not None:
-        config.reward_scale = args.reward_scale
-    if args.reward_eps is not None:
-        config.reward_eps = args.reward_eps
-    if args.reward_hidden_dim is not None:
-        config.reward_hidden_dim = args.reward_hidden_dim
-    if args.uniform_warmup_steps is not None:
-        config.uniform_warmup_steps = args.uniform_warmup_steps
-    if args.market_ramp_steps is not None:
-        config.market_ramp_steps = args.market_ramp_steps
-    if args.routing_noise_std is not None:
-        config.routing_noise_std = args.routing_noise_std
-    if args.exploration_epsilon is not None:
-        config.exploration_epsilon = args.exploration_epsilon
-    if args.n_deepembed_experts is not None:
-        config.n_deepembed_experts = args.n_deepembed_experts
-    if args.n_slim_deepembed_experts is not None:
-        config.n_slim_deepembed_experts = args.n_slim_deepembed_experts
-    if args.deepembed_mode is not None:
-        config.deepembed_mode = args.deepembed_mode
-    if args.deepembed_expand is not None:
-        config.deepembed_expand = args.deepembed_expand
-    if args.slim_deepembed_rank is not None:
-        config.slim_deepembed_rank = args.slim_deepembed_rank
-    if args.n_rosa_experts is not None:
-        config.n_rosa_experts = args.n_rosa_experts
-    if args.rosa_backend is not None:
-        config.rosa_backend = args.rosa_backend
-    if args.rosa_bits is not None:
-        config.rosa_bits = args.rosa_bits
-    if args.slim_rosa_heads is not None:
-        config.slim_rosa_heads = args.slim_rosa_heads
-    if args.rosa_truncation_length is not None:
-        config.rosa_truncation_length = args.rosa_truncation_length
-    if args.market_alpha_start is not None:
-        config.market_alpha_start = args.market_alpha_start
-    if args.market_alpha_end is not None:
-        config.market_alpha_end = args.market_alpha_end
-    if args.routing_entropy_reg is not None:
-        config.routing_entropy_reg = args.routing_entropy_reg
-    if args.critic_shadow_prewarm is not None:
-        config.critic_shadow_prewarm = bool(args.critic_shadow_prewarm)
-    if args.critic_shadow_market is not None:
-        config.critic_shadow_market = bool(args.critic_shadow_market)
-    if args.routing_ste is not None:
-        config.routing_ste = bool(args.routing_ste)
-    if args.ste_temperature_start is not None:
-        config.ste_temperature_start = args.ste_temperature_start
-    if args.ste_temperature_mid is not None:
-        config.ste_temperature_mid = args.ste_temperature_mid
-    if args.ste_temperature_end is not None:
-        config.ste_temperature_end = args.ste_temperature_end
-    if args.ste_midpoint_steps is not None:
-        config.ste_midpoint_steps = args.ste_midpoint_steps
-    if args.ste_anneal_steps is not None:
-        config.ste_anneal_steps = args.ste_anneal_steps
-    if args.no_compile:
-        config.enable_compile = False
-    if args.no_gradient_checkpointing:
-        config.enable_gradient_checkpointing = False
+    config = get_config(scale).with_overrides(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        total_steps=steps,
+        lr=lr,
+        critic_lr=critic_lr,
+        critic_update_interval=critic_update_interval,
+        bet_fraction=bet_fraction,
+        price_lr=price_lr,
+        price_temperature=price_temperature,
+        liquidity_floor=liquidity_floor,
+        reward_scale=reward_scale,
+        reward_eps=reward_eps,
+        reward_hidden_dim=reward_hidden_dim,
+        uniform_warmup_steps=uniform_warmup_steps,
+        market_ramp_steps=market_ramp_steps,
+        routing_noise_std=routing_noise_std,
+        exploration_epsilon=exploration_epsilon,
+        n_deepembed_experts=n_deepembed_experts,
+        n_slim_deepembed_experts=n_slim_deepembed_experts,
+        deepembed_mode=deepembed_mode,
+        deepembed_expand=deepembed_expand,
+        slim_deepembed_rank=slim_deepembed_rank,
+        n_rosa_experts=n_rosa_experts,
+        rosa_backend=rosa_backend,
+        rosa_hard_backend=rosa_hard_backend,
+        rosa_hard_switch_step=rosa_hard_switch_step,
+        rosa_bits=rosa_bits,
+        slim_rosa_heads=slim_rosa_heads,
+        rosa_truncation_length=rosa_truncation_length,
+        rosa_native_mode=rosa_native_mode,
+        rosa_use_gate=rosa_use_gate,
+        market_alpha_start=market_alpha_start,
+        market_alpha_end=market_alpha_end,
+        routing_entropy_reg=routing_entropy_reg,
+        critic_shadow_prewarm=critic_shadow_prewarm,
+        critic_shadow_market=critic_shadow_market,
+        routing_ste=routing_ste,
+        ste_temperature_start=ste_temperature_start,
+        ste_temperature_mid=ste_temperature_mid,
+        ste_temperature_end=ste_temperature_end,
+        ste_midpoint_steps=ste_midpoint_steps,
+        ste_anneal_steps=ste_anneal_steps,
+        enable_compile=compile_enabled,
+        enable_gradient_checkpointing=gradient_checkpointing,
+    )
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     amp_enabled = bool(args.amp and device.type == "cuda")
@@ -382,6 +354,7 @@ def main() -> None:
                 training=True,
                 uniform=uniform,
                 market_weight=market_weight,
+                current_step=step,
             )
         result["loss_scalar"].backward()
         clip_grad_norm_(expert_params, config.grad_clip)
@@ -429,9 +402,14 @@ def main() -> None:
                     "Market/RoutingEntropy": float(routing_entropy),
                     "Market/Weight": float(market_weight),
                     "Market/STETemperature": float(ste_temperature),
+                    "ROSA/HardSwitchStep": float(config.rosa_hard_switch_step or -1),
                     "Runtime/CompileEnabled": float(config.enable_compile),
                     "Runtime/GradientCheckpointing": float(config.enable_gradient_checkpointing),
                 }
+                if config.n_rosa_experts > 0 and model.blocks and model.blocks[0].rosa_expert is not None:
+                    logs["ROSA/UsingHardBackend"] = float(
+                        model.blocks[0].rosa_expert.effective_backend(step) == (config.rosa_hard_backend or "")
+                    )
                 logs.update(metrics)
                 swanlab.log(logs, step=step)
 
@@ -458,4 +436,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)

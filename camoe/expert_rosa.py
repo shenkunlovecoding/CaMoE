@@ -7,8 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .expert_base import BaseExpert
+from .config import normalize_rosa_backend
 from .rosa_soft_adapter import rosa_soft
-from .soft_rosa_adapter import soft_rosa_exact, soft_rosa_qkv1bit
+from .soft_rosa_adapter import (
+    soft_rosa_exact,
+    soft_rosa_exact_with_aux,
+    soft_rosa_qkv1bit,
+    soft_rosa_qkv1bit_with_aux,
+)
 from .wind_rosa_adapter import wind_rosa
 
 
@@ -34,26 +40,39 @@ class StraightThroughSign(torch.autograd.Function):
 
 class ROSAExpert(BaseExpert):
     """
-    Sequence-aware Slim Wind ROSA expert with neuro-symbolic fusion.
+    Sequence-aware Slim Wind ROSA expert.
 
-    Improvements over the original slim ROSA path:
-    1. Depthwise causal Conv1D smooths symbols into local n-gram-like features.
-    2. Straight-through binarization keeps the symbolic path discrete but trainable.
-    3. ROSA retrieval modulates a continuous stream through a GLU-like fusion path.
+    Native mode follows a Pengbo-style minimal ROSA block:
+    LayerNorm -> token shift -> q/k/v projections -> ROSA -> output projection.
+
+    Non-native mode keeps an extra continuous fusion branch on top of the same
+    token-shifted symbolic source.
     """
 
     _SUPPORTED_BACKENDS = {
-        "wind",
-        "soft",
-        "sufa",
-        "scan",
-        "soft_exact",
-        "soft_exact_serial",
-        "soft_exact_cuda",
-        "soft_exact_triton",
-        "soft_qkv1bit",
-        "soft_qkv1bit_triton",
-        "soft_qkv1bit_cuda",
+        "hard_symbolic_multibit",
+        "soft_match",
+        "soft_suffix",
+        "soft_suffix_scan",
+        "soft_exact_dp",
+        "soft_exact_dp_serial",
+        "soft_exact_dp_cuda",
+        "soft_exact_dp_triton",
+        "soft_qkv_multibit",
+        "soft_qkv_multibit_serial",
+        "soft_qkv_multibit_cuda",
+        "soft_qkv_multibit_triton",
+        "soft_qkv_multibit_unmatched",
+        "soft_qkv_multibit_unmatched_serial",
+        "soft_qkv_multibit_unmatched_cuda",
+        "soft_qkv_multibit_unmatched_triton",
+        "hard_qkv_multibit",
+        "soft_qkv_binary",
+        "soft_qkv_binary_bipolar",
+        "soft_qkv_binary_bipolar_cuda",
+        "soft_qkv_binary_bipolar_triton",
+        "soft_qkv_binary_triton",
+        "soft_qkv_binary_cuda",
     }
 
     def __init__(
@@ -63,6 +82,10 @@ class ROSAExpert(BaseExpert):
         bits_per_symbol: int = 8,
         backend: str = "wind",
         truncation_length: int = 8,
+        native_mode: bool = False,
+        use_gate: bool = True,
+        hard_backend: str | None = None,
+        hard_switch_step: int | None = None,
         sequence_length: int | None = None,
         capital_init: float = 1.0,
         capital_floor: float = 0.01,
@@ -73,6 +96,8 @@ class ROSAExpert(BaseExpert):
             capital_floor=capital_floor,
             capital_ceiling=capital_ceiling,
         )
+        backend = normalize_rosa_backend(backend)
+        hard_backend = None if hard_backend is None else normalize_rosa_backend(hard_backend)
         if backend not in self._SUPPORTED_BACKENDS:
             raise ValueError(
                 f"ROSAExpert supports backend in {sorted(self._SUPPORTED_BACKENDS)!r}, got {backend!r}"
@@ -85,13 +110,18 @@ class ROSAExpert(BaseExpert):
         self.bits_per_symbol = int(bits_per_symbol)
         self.backend = str(backend)
         self.truncation_length = int(truncation_length)
+        self.native_mode = bool(native_mode)
+        self.use_gate = bool(use_gate)
+        self.hard_backend = None if hard_backend is None else str(hard_backend)
+        self.hard_switch_step = None if hard_switch_step is None else int(hard_switch_step)
         self.sequence_length = None if sequence_length is None else int(sequence_length)
         hidden = self.slim_heads * self.bits_per_symbol
 
         self.norm = nn.LayerNorm(dim)
-
-        # Local symbolic smoothing makes retrieval less brittle to token-level noise.
-        self.symbol_smoother = nn.Conv1d(dim, dim, kernel_size=3, padding=0, groups=dim)
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        self.x_q = nn.Parameter(torch.zeros(1, 1, dim))
+        self.x_k = nn.Parameter(torch.zeros(1, 1, dim))
+        self.x_v = nn.Parameter(torch.zeros(1, 1, dim))
 
         self.wq = nn.Linear(dim, hidden, bias=False)
         self.wk = nn.Linear(dim, hidden, bias=False)
@@ -121,26 +151,37 @@ class ROSAExpert(BaseExpert):
     def _compute_symbol_logits(
         self,
         x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         x, _ = self._ensure_btd(x)
         _batch, steps, _dim = x.shape
         h = self.norm(x)
+        xx = self.time_shift(h) - h
+        q_source = h + xx * self.x_q
+        k_source = h + xx * self.x_k
+        v_source = h + xx * self.x_v
 
-        # Causal padding on the left preserves autoregressive semantics.
-        h_pad = F.pad(h.transpose(1, 2), (2, 0))
-        h_smooth = self.symbol_smoother(h_pad).transpose(1, 2)
+        q_logits = self.wq(q_source)
+        k_logits = self.wk(k_source)
+        v_logits = self.wv(v_source)
+        return h, q_logits, k_logits, v_logits, xx, steps
 
-        q_logits = self.wq(h_smooth)
-        k_logits = self.wk(h_smooth)
-        v_logits = self.wv(h_smooth)
-        return h, q_logits, k_logits, v_logits, steps
+    def effective_backend(self, current_step: int | None = None) -> str:
+        if (
+            self.hard_backend is not None
+            and self.hard_switch_step is not None
+            and current_step is not None
+            and current_step >= self.hard_switch_step
+        ):
+            return self.hard_backend
+        return self.backend
 
     def forward(self, x: torch.Tensor, **ctx) -> torch.Tensor:
-        del ctx
+        current_step = ctx.pop("current_step", None)
         x, squeezed = self._ensure_btd(x)
-        h, q_logits, k_logits, v_logits, steps = self._compute_symbol_logits(x)
+        h, q_logits, k_logits, v_logits, _xx, steps = self._compute_symbol_logits(x)
+        backend = self.effective_backend(current_step)
 
-        if self.backend == "wind":
+        if backend in {"hard_symbolic_multibit", "hard_qkv_multibit"}:
             q = StraightThroughSign.apply(q_logits)
             k = StraightThroughSign.apply(k_logits)
             v = StraightThroughSign.apply(v_logits)
@@ -152,8 +193,39 @@ class ROSAExpert(BaseExpert):
                 bits_per_symbol=self.bits_per_symbol,
                 truncation_length=self.truncation_length,
             )
-        elif self.backend.startswith("soft_exact"):
-            exact_backend = self.backend.removeprefix("soft_exact").lstrip("_") or "auto"
+        elif backend.startswith("soft_qkv_multibit"):
+            ua_mode = backend.startswith("soft_qkv_multibit_unmatched")
+            stem = "soft_qkv_multibit_unmatched" if ua_mode else "soft_qkv_multibit"
+            exact_backend = backend.removeprefix(stem).lstrip("_") or "auto"
+            q = StraightThroughSign.apply(q_logits)
+            k = StraightThroughSign.apply(k_logits)
+            v = StraightThroughSign.apply(v_logits)
+            padded_q, padded_k, padded_v = self._maybe_pad_sequence(q, k, v)
+            if ua_mode:
+                out, aux = soft_rosa_exact_with_aux(
+                    padded_q,
+                    padded_k,
+                    padded_v,
+                    bits_per_symbol=self.bits_per_symbol,
+                    truncation_length=self.truncation_length,
+                    scan_backend=exact_backend,
+                )
+                # Make unmatched positions explicitly collapse toward 0 while keeping
+                # soft, differentiable behavior for weak-but-valid matches.
+                match_strength = 1.0 - torch.exp(-aux["chosen_ell"].clamp_min(0.0))
+                match_strength = match_strength.repeat_interleave(self.bits_per_symbol, dim=-1)
+                out = out * match_strength.to(dtype=out.dtype)
+            else:
+                out = soft_rosa_exact(
+                    padded_q,
+                    padded_k,
+                    padded_v,
+                    bits_per_symbol=self.bits_per_symbol,
+                    truncation_length=self.truncation_length,
+                    scan_backend=exact_backend,
+                )
+        elif backend.startswith("soft_exact_dp"):
+            exact_backend = backend.removeprefix("soft_exact_dp").lstrip("_") or "auto"
             padded_q, padded_k, padded_v = self._maybe_pad_sequence(q_logits, k_logits, v_logits)
             out = soft_rosa_exact(
                 padded_q,
@@ -163,23 +235,38 @@ class ROSAExpert(BaseExpert):
                 truncation_length=self.truncation_length,
                 scan_backend=exact_backend,
             )
-        elif self.backend.startswith("soft_qkv1bit"):
+        elif backend.startswith("soft_qkv_binary"):
             if self.bits_per_symbol != 1:
                 raise ValueError(
-                    f"{self.backend!r} requires bits_per_symbol == 1, got {self.bits_per_symbol}."
+                    f"{backend!r} requires bits_per_symbol == 1, got {self.bits_per_symbol}."
                 )
-            backend_name = self.backend.removeprefix("soft_qkv1bit").lstrip("_") or "auto"
+            qkv1bit_mode = "bipolar" if backend.startswith("soft_qkv_binary_bipolar") else "plain"
+            stem = "soft_qkv_binary_bipolar" if qkv1bit_mode == "bipolar" else "soft_qkv_binary"
+            backend_name = backend.removeprefix(stem).lstrip("_") or "auto"
             q = StraightThroughSign.apply(q_logits)
             k = StraightThroughSign.apply(k_logits)
             v = StraightThroughSign.apply(v_logits)
             padded_q, padded_k, padded_v = self._maybe_pad_sequence(q, k, v)
-            out = soft_rosa_qkv1bit(
-                padded_q,
-                padded_k,
-                padded_v,
-                truncation_length=self.truncation_length,
-                backend=backend_name,
-            )
+            if qkv1bit_mode == "bipolar":
+                out, aux = soft_rosa_qkv1bit_with_aux(
+                    padded_q,
+                    padded_k,
+                    padded_v,
+                    truncation_length=self.truncation_length,
+                    backend=backend_name,
+                )
+                matched = (aux["best_j"] >= 0).to(dtype=out.dtype)
+                # Experimental RWKV8-style semantics:
+                # matched 1 => +e, matched 0 => -e, unmatched => 0.
+                out = torch.where(matched > 0, out * 2.0 - 1.0, torch.zeros_like(out))
+            else:
+                out = soft_rosa_qkv1bit(
+                    padded_q,
+                    padded_k,
+                    padded_v,
+                    truncation_length=self.truncation_length,
+                    backend=backend_name,
+                )
         else:
             padded_q, padded_k, padded_v = self._maybe_pad_sequence(q_logits, k_logits, v_logits)
             out = rosa_soft(
@@ -187,16 +274,22 @@ class ROSAExpert(BaseExpert):
                 padded_k,
                 padded_v,
                 bits_per_symbol=self.bits_per_symbol,
-                mode=self.backend,
+                mode=backend,
                 truncation_length=self.truncation_length,
             )
         out = out[:, :steps, :]
         out = out.to(h.dtype) * self.symbol_scale.to(h.dtype)
 
-        gate = F.silu(self.wo(out))
-        continuous_v = self.continuous_proj(h)
-        fused = gate * continuous_v
-        out = self.output_proj(fused + continuous_v)
+        symbolic = self.wo(out)
+        if self.native_mode:
+            out = symbolic
+        else:
+            continuous_v = self.continuous_proj(h)
+            if self.use_gate:
+                fused = F.silu(symbolic) * continuous_v + continuous_v
+            else:
+                fused = symbolic + continuous_v
+            out = self.output_proj(fused)
 
         if squeezed:
             return out.squeeze(0)
@@ -212,7 +305,7 @@ class ROSAExpert(BaseExpert):
         top_k: int = 5,
     ) -> dict[str, object]:
         x, _ = self._ensure_btd(x.detach())
-        _, q_logits, k_logits, v_logits, steps = self._compute_symbol_logits(x)
+        _, q_logits, k_logits, v_logits, _xx, steps = self._compute_symbol_logits(x)
 
         if valid_mask is None:
             valid = torch.ones(x.size(0), steps, dtype=torch.bool, device=x.device)
@@ -275,6 +368,10 @@ class ROSAExpert(BaseExpert):
 
         return {
             "backend": self.backend,
+            "hard_backend": self.hard_backend,
+            "hard_switch_step": self.hard_switch_step,
+            "native_mode": self.native_mode,
+            "use_gate": self.use_gate,
             "bits_per_symbol": self.bits_per_symbol,
             "heads": self.slim_heads,
             "valid_tokens": int(valid.sum().item()),

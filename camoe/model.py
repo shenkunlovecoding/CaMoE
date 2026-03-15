@@ -84,6 +84,7 @@ class CaMoE_Model(nn.Module):
         training: bool = True,
         uniform: bool = False,
         market_weight: float = 1.0,
+        current_step: int | None = None,
     ) -> dict[str, torch.Tensor]:
         del critic_alpha
         batch, steps = input_ids.shape
@@ -107,6 +108,7 @@ class CaMoE_Model(nn.Module):
                 sequence_state=seq_state,
                 ffn_state=ffn_state,
                 token_ids=input_ids,
+                current_step=current_step,
             )
 
         x = self.ln_out(x)
@@ -376,6 +378,10 @@ class CaMoE_Model(nn.Module):
                 bits_per_symbol=self.config.rosa_bits,
                 backend=self.config.rosa_backend,
                 truncation_length=self.config.rosa_truncation_length,
+                native_mode=self.config.rosa_native_mode,
+                use_gate=self.config.rosa_use_gate,
+                hard_backend=self.config.rosa_hard_backend,
+                hard_switch_step=self.config.rosa_hard_switch_step,
                 sequence_length=self.config.seq_len,
                 capital_init=self.config.expert_capital_init,
                 capital_floor=self.config.capital_floor,

@@ -15,12 +15,28 @@ def _load_triton_backend():
     return qkv1bit_forward_triton
 
 
+def _load_triton_backward():
+    try:
+        from .qkv1bit_triton import qkv1bit_backward_triton
+    except ImportError:
+        from qkv1bit_triton import qkv1bit_backward_triton
+    return qkv1bit_backward_triton
+
+
 def _load_cuda_backend():
     try:
         from .qkv1bit_cuda import qkv1bit_forward_cuda
     except ImportError:
         from qkv1bit_cuda import qkv1bit_forward_cuda
     return qkv1bit_forward_cuda
+
+
+def _load_cuda_backward():
+    try:
+        from .qkv1bit_cuda import qkv1bit_backward_cuda
+    except ImportError:
+        from qkv1bit_cuda import qkv1bit_backward_cuda
+    return qkv1bit_backward_cuda
 
 
 def _as_bits(x: Tensor) -> Tensor:
@@ -207,15 +223,48 @@ class _QKV1BitRosaFunction(torch.autograd.Function):
         q_bits = _as_bits(query)
         k_bits = _as_bits(key)
         v_bits = _as_bits(value)
-        out = qkv1bit_forward(q_bits, k_bits, v_bits, K=K, backend=backend)
-        ctx.save_for_backward(q_bits, k_bits, v_bits)
+        use_kernel_backward = q_bits.is_cuda and backend in {"triton", "cuda"}
+        if use_kernel_backward:
+            out, aux = qkv1bit_forward(q_bits, k_bits, v_bits, K=K, backend=backend, return_aux=True)
+            ctx.save_for_backward(q_bits, k_bits, v_bits, out.to(torch.uint8), aux["best_j"].to(torch.long))
+        else:
+            out = qkv1bit_forward(q_bits, k_bits, v_bits, K=K, backend=backend)
+            ctx.save_for_backward(q_bits, k_bits, v_bits)
         ctx.K = int(K)
         ctx.backend = backend
+        ctx.use_kernel_backward = use_kernel_backward
         return out.to(torch.float32)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        q_bits, k_bits, v_bits = ctx.saved_tensors
+        if ctx.use_kernel_backward:
+            q_bits, k_bits, v_bits, out_bits, best_j = ctx.saved_tensors
+            try:
+                if ctx.backend == "triton":
+                    dq, dk, dv = _load_triton_backward()(
+                        q_bits,
+                        k_bits,
+                        v_bits,
+                        out_bits,
+                        best_j,
+                        grad_output.to(torch.float32),
+                        K=ctx.K,
+                    )
+                else:
+                    dq, dk, dv = _load_cuda_backward()(
+                        q_bits,
+                        k_bits,
+                        v_bits,
+                        out_bits,
+                        best_j,
+                        grad_output.to(torch.float32),
+                        K=ctx.K,
+                    )
+                return dq, dk, dv, None, None
+            except Exception:
+                pass
+        if not ctx.use_kernel_backward:
+            q_bits, k_bits, v_bits = ctx.saved_tensors
         dq, dk, dv = finite_diff_bwd_all_channels(
             q_bits,
             k_bits,

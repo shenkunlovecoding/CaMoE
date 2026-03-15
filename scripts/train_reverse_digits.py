@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import argparse
 import html
 import random
 import sys
 import time
 from pathlib import Path
-from typing import Iterable
+from types import SimpleNamespace
+from typing import Iterable, Literal
 
 import torch
+import typer
 from datasets import Dataset, DatasetDict, load_from_disk
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -23,7 +24,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
 
-from camoe.config import CaMoEConfig
+from camoe.config import CaMoEConfig, ROSA_BACKEND_CHOICES
 from camoe.model import CaMoE_Model
 from camoe.expert_rosa import ROSAExpert
 from camoe.reverse_baselines import (
@@ -123,6 +124,7 @@ OPERATION_NAME_BY_ID = {
     10: "sum_threshold",
     11: "bracket_depth",
     12: "addsub_40",
+    13: "pattern_continue",
 }
 
 
@@ -342,66 +344,70 @@ def infer_max_sequence_length(*datasets: Dataset) -> int:
     return max_length
 
 
-def build_config(args: argparse.Namespace, seq_len: int) -> CaMoEConfig:
+def build_config(options: SimpleNamespace, seq_len: int) -> CaMoEConfig:
     return CaMoEConfig(
         vocab_size=32,
-        dim=args.dim,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
+        dim=options.dim,
+        n_layers=options.n_layers,
+        n_heads=options.n_heads,
         n_experts=2,
-        n_deepembed_experts=args.n_deepembed_experts,
-        n_slim_deepembed_experts=args.n_slim_deepembed_experts,
+        n_deepembed_experts=options.n_deepembed_experts,
+        n_slim_deepembed_experts=options.n_slim_deepembed_experts,
         n_rosa_experts=1,
         ffn_expand=4,
         tie_weights=True,
-        rosa_backend=args.rosa_backend,
-        rosa_bits=args.rosa_bits,
-        slim_rosa_heads=args.slim_rosa_heads,
-        rosa_truncation_length=args.rosa_truncation_length,
-        deepembed_mode=args.deepembed_mode,
-        deepembed_expand=args.deepembed_expand,
-        slim_deepembed_rank=args.slim_deepembed_rank,
-        auction_noise_std=args.auction_noise_std,
-        routing_noise_std=args.routing_noise_std,
-        exploration_epsilon=args.exploration_epsilon,
-        bet_fraction=args.bet_fraction,
-        price_lr=args.price_lr,
-        price_temperature=args.price_temperature,
-        liquidity_floor=args.liquidity_floor,
-        market_alpha_start=args.market_alpha_start,
-        market_alpha_end=args.market_alpha_end,
-        routing_ste=bool(args.routing_ste),
-        ste_temperature_start=args.ste_temperature_start,
-        ste_temperature_mid=args.ste_temperature_mid,
-        ste_temperature_end=args.ste_temperature_end,
-        ste_midpoint_steps=args.ste_midpoint_steps,
-        ste_anneal_steps=args.ste_anneal_steps,
-        market_ramp_steps=args.market_ramp_steps,
+        rosa_backend=options.rosa_backend,
+        rosa_hard_backend=options.rosa_hard_backend,
+        rosa_hard_switch_step=options.rosa_hard_switch_step,
+        rosa_bits=options.rosa_bits,
+        slim_rosa_heads=options.slim_rosa_heads,
+        rosa_truncation_length=options.rosa_truncation_length,
+        rosa_native_mode=bool(options.rosa_native_mode),
+        rosa_use_gate=bool(options.rosa_use_gate),
+        deepembed_mode=options.deepembed_mode,
+        deepembed_expand=options.deepembed_expand,
+        slim_deepembed_rank=options.slim_deepembed_rank,
+        auction_noise_std=options.auction_noise_std,
+        routing_noise_std=options.routing_noise_std,
+        exploration_epsilon=options.exploration_epsilon,
+        bet_fraction=options.bet_fraction,
+        price_lr=options.price_lr,
+        price_temperature=options.price_temperature,
+        liquidity_floor=options.liquidity_floor,
+        market_alpha_start=options.market_alpha_start,
+        market_alpha_end=options.market_alpha_end,
+        routing_ste=bool(options.routing_ste),
+        ste_temperature_start=options.ste_temperature_start,
+        ste_temperature_mid=options.ste_temperature_mid,
+        ste_temperature_end=options.ste_temperature_end,
+        ste_midpoint_steps=options.ste_midpoint_steps,
+        ste_anneal_steps=options.ste_anneal_steps,
+        market_ramp_steps=options.market_ramp_steps,
         enable_compile=False,
         enable_gradient_checkpointing=False,
         expert_capital_init=1.0,
         critic_capital_init=0.5,
         ema_decay=0.95,
         capital_floor=0.25,
-        capital_ceiling=args.capital_ceiling,
-        depreciation=args.depreciation,
+        capital_ceiling=options.capital_ceiling,
+        depreciation=options.depreciation,
         critic_hidden_dim=None,
-        reward_hidden_dim=args.reward_hidden_dim,
-        critic_update_interval=args.critic_update_interval,
-        critic_lr=args.critic_lr,
-        reward_scale=args.reward_scale,
-        reward_eps=args.reward_eps,
-        routing_entropy_reg=args.routing_entropy_reg,
-        critic_shadow_prewarm=bool(args.critic_shadow_prewarm),
-        critic_shadow_market=bool(args.critic_shadow_market),
-        uniform_warmup_steps=args.uniform_warmup_steps,
-        prewarm_steps=args.prewarm_steps,
-        market_warmup_steps=args.market_warmup_steps,
-        critic_warmup_steps=args.critic_warmup_steps,
-        lr=args.lr,
-        batch_size=args.batch_size,
+        reward_hidden_dim=options.reward_hidden_dim,
+        critic_update_interval=options.critic_update_interval,
+        critic_lr=options.critic_lr,
+        reward_scale=options.reward_scale,
+        reward_eps=options.reward_eps,
+        routing_entropy_reg=options.routing_entropy_reg,
+        critic_shadow_prewarm=bool(options.critic_shadow_prewarm),
+        critic_shadow_market=bool(options.critic_shadow_market),
+        uniform_warmup_steps=options.uniform_warmup_steps,
+        prewarm_steps=options.prewarm_steps,
+        market_warmup_steps=options.market_warmup_steps,
+        critic_warmup_steps=options.critic_warmup_steps,
+        lr=options.lr,
+        batch_size=options.batch_size,
         seq_len=seq_len,
-        total_steps=args.steps,
+        total_steps=options.steps,
         grad_clip=1.0,
         ignore_index=IGNORE_INDEX,
     )
@@ -416,6 +422,7 @@ def evaluate_model(
     ste_temperature: float = 0.3,
     uniform: bool = False,
     market_weight: float = 1.0,
+    current_step: int | None = None,
 ) -> dict[str, float]:
     model.eval()
     loss_sum = 0.0
@@ -440,6 +447,7 @@ def evaluate_model(
                     training=False,
                     uniform=uniform,
                     market_weight=market_weight,
+                    current_step=current_step,
                 )
             else:
                 result = model(batch["input_ids"], batch["targets"])
@@ -541,6 +549,7 @@ def render_route_preview(
     ste_temperature: float,
     uniform: bool,
     market_weight: float,
+    current_step: int | None = None,
 ) -> None:
     model.eval()
     with torch.no_grad():
@@ -552,6 +561,7 @@ def render_route_preview(
             training=False,
             uniform=uniform,
             market_weight=market_weight,
+            current_step=current_step,
         )
     diagnostics = model.get_market_diagnostics()
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -726,6 +736,7 @@ def emit_inner_language_log(
     ste_temperature: float,
     uniform: bool,
     market_weight: float,
+    current_step: int | None = None,
 ) -> dict[str, float]:
     rosa_experts = _iter_rosa_experts(model)
     if not rosa_experts:
@@ -752,6 +763,7 @@ def emit_inner_language_log(
                 training=False,
                 uniform=uniform,
                 market_weight=market_weight,
+                current_step=current_step,
             )
         else:
             model(batch["input_ids"], batch["targets"])
@@ -820,37 +832,81 @@ def market_logs_from_batch(
     metrics = model.market_metrics(token_mask=batch["supervised_mask"], valid_mask=batch["valid_mask"])
     logs: dict[str, float] = {}
     for layer_idx, block in enumerate(model.blocks):
-        expert_types = [expert.expert_type for expert in block.experts]
-        for expert_idx, expert_type in enumerate(expert_types):
-            logs[f"market/layer_{layer_idx}/capital_{expert_type}"] = metrics.get(
-                f"layer_{layer_idx}/expert_{expert_idx}/capital",
+        market_specs: list[tuple[str, list[str]]] = []
+        if block.has_sequence_market:
+            market_specs.append(("sequence", [expert.expert_type for expert in block.sequence_experts()]))
+        market_specs.append(("ffn", [expert.expert_type for expert in block.experts]))
+
+        for market_name, expert_types in market_specs:
+            prefix = f"{market_name}/layer_{layer_idx}"
+            logs[f"market/{market_name}/layer_{layer_idx}/wallet_mean"] = metrics.get(
+                f"{prefix}/wallet_mean",
                 0.0,
             )
-            logs[f"market/layer_{layer_idx}/winner_share_{expert_type}_answer"] = metrics.get(
-                f"layer_{layer_idx}/expert_{expert_idx}/winner_share_answer",
+            logs[f"market/{market_name}/layer_{layer_idx}/wallet_gini"] = metrics.get(
+                f"{prefix}/wallet_gini",
                 0.0,
             )
-            logs[f"market/layer_{layer_idx}/bid_{expert_type}_prefix"] = metrics.get(
-                f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_prefix",
+            logs[f"market/{market_name}/layer_{layer_idx}/price_max"] = metrics.get(
+                f"{prefix}/price_max",
                 0.0,
             )
-            logs[f"market/layer_{layer_idx}/bid_{expert_type}_answer"] = metrics.get(
-                f"layer_{layer_idx}/expert_{expert_idx}/bid_mean_answer",
+            logs[f"market/{market_name}/layer_{layer_idx}/routing_entropy"] = metrics.get(
+                f"{prefix}/routing_entropy",
                 0.0,
             )
-            logs[f"market/layer_{layer_idx}/critic_pos_{expert_type}_answer"] = metrics.get(
-                f"layer_{layer_idx}/expert_{expert_idx}/position_mean_answer",
+            logs[f"market/{market_name}/layer_{layer_idx}/routing_entropy_answer"] = metrics.get(
+                f"{prefix}/routing_entropy_answer",
                 0.0,
             )
-        logs[f"market/layer_{layer_idx}/capital_gini"] = metrics.get(f"layer_{layer_idx}/capital_gini", 0.0)
-        logs[f"market/layer_{layer_idx}/routing_entropy_all"] = metrics.get(
-            f"layer_{layer_idx}/routing_entropy_all",
-            0.0,
-        )
-        logs[f"market/layer_{layer_idx}/routing_entropy_answer"] = metrics.get(
-            f"layer_{layer_idx}/routing_entropy_answer",
-            0.0,
-        )
+            logs[f"market/{market_name}/layer_{layer_idx}/pred_reward_mean"] = metrics.get(
+                f"{prefix}/pred_reward_mean",
+                0.0,
+            )
+            logs[f"market/{market_name}/layer_{layer_idx}/expected_profit_mean"] = metrics.get(
+                f"{prefix}/expected_profit_mean",
+                0.0,
+            )
+            logs[f"market/{market_name}/layer_{layer_idx}/realized_reward_mean"] = metrics.get(
+                f"{prefix}/realized_reward_mean",
+                0.0,
+            )
+            logs[f"market/{market_name}/layer_{layer_idx}/token_profit_mean"] = metrics.get(
+                f"{prefix}/token_profit_mean",
+                0.0,
+            )
+            logs[f"market/{market_name}/layer_{layer_idx}/exploration_rate"] = metrics.get(
+                f"{prefix}/exploration_rate",
+                0.0,
+            )
+
+            for expert_idx, expert_type in enumerate(expert_types):
+                expert_prefix = f"{prefix}/expert_{expert_idx}"
+                expert_label = (
+                    expert_type
+                    if expert_types.count(expert_type) == 1
+                    else f"{expert_type}_{expert_idx}"
+                )
+                logs[f"market/{market_name}/layer_{layer_idx}/wallet_{expert_label}"] = metrics.get(
+                    f"{expert_prefix}/wallet",
+                    0.0,
+                )
+                logs[f"market/{market_name}/layer_{layer_idx}/price_{expert_label}"] = metrics.get(
+                    f"{expert_prefix}/price",
+                    0.0,
+                )
+                logs[f"market/{market_name}/layer_{layer_idx}/q_{expert_label}"] = metrics.get(
+                    f"{expert_prefix}/q",
+                    0.0,
+                )
+                logs[f"market/{market_name}/layer_{layer_idx}/winner_share_{expert_label}"] = metrics.get(
+                    f"{expert_prefix}/winner_share",
+                    0.0,
+                )
+                logs[f"market/{market_name}/layer_{layer_idx}/winner_share_{expert_label}_answer"] = metrics.get(
+                    f"{expert_prefix}/winner_share_answer",
+                    0.0,
+                )
     op_ids = batch.get("operation_id")
     if op_ids is not None and (op_ids >= 0).any():
         for op_id, op_name in OPERATION_NAME_BY_ID.items():
@@ -862,16 +918,29 @@ def market_logs_from_batch(
                 valid_mask=batch["valid_mask"] * sample_mask,
             )
             for layer_idx, block in enumerate(model.blocks):
-                expert_types = [expert.expert_type for expert in block.experts]
-                logs[f"market/{op_name}/layer_{layer_idx}/routing_entropy_answer"] = op_metrics.get(
-                    f"layer_{layer_idx}/routing_entropy_answer",
-                    0.0,
-                )
-                for expert_idx, expert_type in enumerate(expert_types):
-                    logs[f"market/{op_name}/layer_{layer_idx}/winner_share_{expert_type}_answer"] = op_metrics.get(
-                        f"layer_{layer_idx}/expert_{expert_idx}/winner_share_answer",
+                market_specs = []
+                if block.has_sequence_market:
+                    market_specs.append(("sequence", [expert.expert_type for expert in block.sequence_experts()]))
+                market_specs.append(("ffn", [expert.expert_type for expert in block.experts]))
+
+                for market_name, expert_types in market_specs:
+                    prefix = f"{market_name}/layer_{layer_idx}"
+                    logs[f"market/{op_name}/{market_name}/layer_{layer_idx}/routing_entropy_answer"] = op_metrics.get(
+                        f"{prefix}/routing_entropy_answer",
                         0.0,
                     )
+                    for expert_idx, expert_type in enumerate(expert_types):
+                        expert_label = (
+                            expert_type
+                            if expert_types.count(expert_type) == 1
+                            else f"{expert_type}_{expert_idx}"
+                        )
+                        logs[
+                            f"market/{op_name}/{market_name}/layer_{layer_idx}/winner_share_{expert_label}_answer"
+                        ] = op_metrics.get(
+                            f"{prefix}/expert_{expert_idx}/winner_share_answer",
+                            0.0,
+                        )
     return logs
 
 
@@ -1014,97 +1083,86 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train small toy-sequence ROSA/CaMoE models")
-    parser.add_argument("--data_dir", type=str, default="data/reverse_digits")
-    parser.add_argument("--task_filter", type=str, default="reverse_digits")
-    parser.add_argument("--mode", choices=["normal", "debug", "single-debug"], default="normal")
-    parser.add_argument("--debug_sequence_expert_idx", type=int, default=0)
-    parser.add_argument("--debug_ffn_expert_idx", type=int, default=0)
-    parser.add_argument(
-        "--model_kind",
-        choices=["timemix_rosa_ffn", "timemix_ffn", "pure_rosa_ffn", "camoe"],
-        default="camoe",
-    )
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--eval_batch_size", type=int, default=256)
-    parser.add_argument("--steps", type=int, default=10000)
-    parser.add_argument("--eval_interval", type=int, default=250)
-    parser.add_argument("--log_interval", type=int, default=50)
-    parser.add_argument("--inner_language_log_interval", type=int, default=0)
-    parser.add_argument("--save_interval", type=int, default=1000)
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--critic_lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--critic_update_interval", type=int, default=8)
-    parser.add_argument("--bet_fraction", type=float, default=0.05)
-    parser.add_argument("--price_lr", type=float, default=0.02)
-    parser.add_argument("--price_temperature", type=float, default=1.0)
-    parser.add_argument("--liquidity_floor", type=float, default=0.02)
-    parser.add_argument("--reward_scale", type=float, default=5.0)
-    parser.add_argument("--reward_eps", type=float, default=1e-8)
-    parser.add_argument("--reward_hidden_dim", type=int, default=None)
-    parser.add_argument("--uniform_warmup_steps", type=int, default=1500)
-    parser.add_argument("--market_ramp_steps", type=int, default=1000)
-    parser.add_argument("--routing_noise_std", type=float, default=0.05)
-    parser.add_argument("--exploration_epsilon", type=float, default=0.02)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n_layers", type=int, default=2)
-    parser.add_argument("--dim", type=int, default=64)
-    parser.add_argument("--n_heads", type=int, default=4)
-    parser.add_argument("--n_deepembed_experts", type=int, default=0)
-    parser.add_argument("--n_slim_deepembed_experts", type=int, default=0)
-    parser.add_argument("--deepembed_mode", type=str, default="1x", choices=["1x", "4x"])
-    parser.add_argument("--deepembed_expand", type=int, default=4)
-    parser.add_argument("--slim_deepembed_rank", type=int, default=32)
-    parser.add_argument("--slim_rosa_heads", type=int, default=8)
-    parser.add_argument(
-        "--rosa_backend",
-        type=str,
-        default="wind",
-        choices=[
-            "wind",
-            "soft",
-            "sufa",
-            "scan",
-            "soft_exact",
-            "soft_exact_serial",
-            "soft_exact_cuda",
-            "soft_exact_triton",
-            "soft_qkv1bit",
-            "soft_qkv1bit_triton",
-            "soft_qkv1bit_cuda",
-        ],
-    )
-    parser.add_argument("--rosa_bits", type=int, default=8)
-    parser.add_argument("--rosa_truncation_length", type=int, default=8)
-    parser.add_argument("--auction_noise_std", type=float, default=0.05)
-    parser.add_argument("--market_alpha_start", type=float, default=0.0)
-    parser.add_argument("--market_alpha_end", type=float, default=1.0)
-    parser.add_argument("--routing_entropy_reg", type=float, default=0.0)
-    parser.add_argument("--critic_shadow_prewarm", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--critic_shadow_market", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--routing_ste", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--ste_temperature_start", type=float, default=2.0)
-    parser.add_argument("--ste_temperature_mid", type=float, default=1.0)
-    parser.add_argument("--ste_temperature_end", type=float, default=0.3)
-    parser.add_argument("--ste_midpoint_steps", type=int, default=1500)
-    parser.add_argument("--ste_anneal_steps", type=int, default=4000)
-    parser.add_argument("--depreciation", type=float, default=1e-3)
-    parser.add_argument("--capital_ceiling", type=float, default=10.0)
-    parser.add_argument("--prewarm_steps", type=int, default=1500)
-    parser.add_argument("--market_warmup_steps", type=int, default=1500)
-    parser.add_argument("--critic_warmup_steps", type=int, default=1000)
-    parser.add_argument("--save_dir", type=str, default="checkpoints/reverse_digits")
-    parser.add_argument("--artifact_dir", type=str, default="artifacts/reverse_digits")
-    parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--stop_on_val_exact", action="store_true")
-    parser.add_argument("--stop_on_val_exact_threshold", type=float, default=0.0)
-    parser.add_argument("--max_eval_length", type=int, default=20)
-    parser.add_argument("--no_swanlab", action="store_true")
-    args = parser.parse_args()
+def main(
+    data_dir: str = typer.Option("data/reverse_digits"),
+    task_filter: str = typer.Option("reverse_digits"),
+    mode: Literal["normal", "debug", "single-debug"] = typer.Option("normal"),
+    debug_sequence_expert_idx: int = typer.Option(0),
+    debug_ffn_expert_idx: int = typer.Option(0),
+    model_kind: Literal["timemix_rosa_ffn", "timemix_ffn", "pure_rosa_ffn", "camoe"] = typer.Option("camoe"),
+    device: str = typer.Option("cuda"),
+    batch_size: int = typer.Option(128),
+    eval_batch_size: int = typer.Option(256),
+    steps: int = typer.Option(10000),
+    eval_interval: int = typer.Option(250),
+    log_interval: int = typer.Option(50),
+    inner_language_log_interval: int = typer.Option(0),
+    save_interval: int = typer.Option(1000),
+    num_workers: int = typer.Option(0),
+    lr: float = typer.Option(1e-3),
+    critic_lr: float = typer.Option(3e-4),
+    weight_decay: float = typer.Option(0.01),
+    critic_update_interval: int = typer.Option(8),
+    bet_fraction: float = typer.Option(0.05),
+    price_lr: float = typer.Option(0.02),
+    price_temperature: float = typer.Option(1.0),
+    liquidity_floor: float = typer.Option(0.02),
+    reward_scale: float = typer.Option(5.0),
+    reward_eps: float = typer.Option(1e-8),
+    reward_hidden_dim: int | None = typer.Option(None),
+    uniform_warmup_steps: int = typer.Option(1500),
+    market_ramp_steps: int = typer.Option(1000),
+    routing_noise_std: float = typer.Option(0.05),
+    exploration_epsilon: float = typer.Option(0.02),
+    seed: int = typer.Option(42),
+    n_layers: int = typer.Option(2),
+    dim: int = typer.Option(64),
+    n_heads: int = typer.Option(4),
+    n_deepembed_experts: int = typer.Option(0),
+    n_slim_deepembed_experts: int = typer.Option(0),
+    deepembed_mode: Literal["1x", "4x"] = typer.Option("1x"),
+    deepembed_expand: int = typer.Option(4),
+    slim_deepembed_rank: int = typer.Option(32),
+    slim_rosa_heads: int = typer.Option(8),
+    rosa_backend: str = typer.Option(
+        "hard_symbolic_multibit",
+        help=f"Canonical backends: {', '.join(ROSA_BACKEND_CHOICES)}. Old aliases still work.",
+    ),
+    rosa_hard_backend: str | None = typer.Option(
+        None,
+        help=f"Canonical backends: {', '.join(ROSA_BACKEND_CHOICES)}. Old aliases still work.",
+    ),
+    rosa_hard_switch_step: int | None = typer.Option(None),
+    rosa_bits: int = typer.Option(8),
+    rosa_truncation_length: int = typer.Option(8),
+    rosa_native_mode: bool = typer.Option(False, "--rosa-native-mode/--no-rosa-native-mode"),
+    rosa_use_gate: bool = typer.Option(True, "--rosa-use-gate/--no-rosa-use-gate"),
+    auction_noise_std: float = typer.Option(0.05),
+    market_alpha_start: float = typer.Option(0.0),
+    market_alpha_end: float = typer.Option(1.0),
+    routing_entropy_reg: float = typer.Option(0.0),
+    critic_shadow_prewarm: bool = typer.Option(True, "--critic-shadow-prewarm/--no-critic-shadow-prewarm"),
+    critic_shadow_market: bool = typer.Option(True, "--critic-shadow-market/--no-critic-shadow-market"),
+    routing_ste: bool = typer.Option(True, "--routing-ste/--no-routing-ste"),
+    ste_temperature_start: float = typer.Option(2.0),
+    ste_temperature_mid: float = typer.Option(1.0),
+    ste_temperature_end: float = typer.Option(0.3),
+    ste_midpoint_steps: int = typer.Option(1500),
+    ste_anneal_steps: int = typer.Option(4000),
+    depreciation: float = typer.Option(1e-3),
+    capital_ceiling: float = typer.Option(10.0),
+    prewarm_steps: int = typer.Option(1500),
+    market_warmup_steps: int = typer.Option(1500),
+    critic_warmup_steps: int = typer.Option(1000),
+    save_dir: str = typer.Option("checkpoints/reverse_digits"),
+    artifact_dir: str = typer.Option("artifacts/reverse_digits"),
+    resume: str = typer.Option(""),
+    stop_on_val_exact: bool = typer.Option(False, "--stop-on-val-exact/--no-stop-on-val-exact"),
+    stop_on_val_exact_threshold: float = typer.Option(0.0),
+    max_eval_length: int = typer.Option(20),
+    no_swanlab: bool = typer.Option(False, "--no-swanlab/--swanlab"),
+) -> None:
+    args = SimpleNamespace(**locals())
 
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -1248,6 +1306,7 @@ def main() -> None:
                 training=True,
                 uniform=uniform,
                 market_weight=market_weight,
+                current_step=step,
             )
             result["loss_scalar"].backward()
             clip_grad_norm_(expert_params, config.grad_clip)
@@ -1314,6 +1373,10 @@ def main() -> None:
                 logs["train/ste_temperature"] = float(ste_temperature)
                 logs["train/exploration_epsilon"] = float(dynamic_eps)
                 logs["train/market_weight"] = float(market_weight)
+                if model.blocks and model.blocks[0].rosa_expert is not None:
+                    logs["train/rosa_using_hard_backend"] = float(
+                        model.blocks[0].rosa_expert.effective_backend(step) == (config.rosa_hard_backend or "")
+                    )
                 logs.update(market_logs_from_batch(model, batch))
             print(
                 f"step={step} task={task_name} kind={args.model_kind} phase={phase} "
@@ -1333,6 +1396,7 @@ def main() -> None:
                 ste_temperature=ste_temperature,
                 uniform=(phase == "uniform_warmup"),
                 market_weight=market_weight,
+                current_step=step,
             )
             ood_metrics = evaluate_model(
                 model,
@@ -1343,6 +1407,7 @@ def main() -> None:
                 ste_temperature=ste_temperature,
                 uniform=(phase == "uniform_warmup"),
                 market_weight=market_weight,
+                current_step=step,
             )
             eval_logs = {
                 "val/loss": val_metrics["loss"],
@@ -1389,6 +1454,7 @@ def main() -> None:
                     ste_temperature=ste_temperature,
                     uniform=(phase == "uniform_warmup"),
                     market_weight=market_weight,
+                    current_step=step,
                 )
                 preview_logs = preview_route_stats(model, preview_batch)
                 if preview_logs:
@@ -1411,6 +1477,7 @@ def main() -> None:
                     ste_temperature=ste_temperature,
                     uniform=(phase == "uniform_warmup"),
                     market_weight=market_weight,
+                    current_step=step,
                 )
                 eval_logs.update(inner_logs)
             if HAS_SWANLAB and not args.no_swanlab:
@@ -1447,4 +1514,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    typer.run(main)

@@ -11,6 +11,8 @@ from typing import Callable
 
 import torch
 
+from .kernel_init import announce_kernel_init
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 _SCAN_CPU_WARNING_EMITTED = False
@@ -102,6 +104,9 @@ def rosa_soft(
     q_bhtd = _reshape_btd_to_bhtd(q, bits_per_symbol)
     k_bhtd = _reshape_btd_to_bhtd(k, bits_per_symbol)
     v_bhtd = _reshape_btd_to_bhtd(v, bits_per_symbol)
+
+    if q.device.type == "cuda":
+        announce_kernel_init("rosa_soft", backend)
 
     if backend == "soft":
         out = rosa_soft_ops(

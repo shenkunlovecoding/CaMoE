@@ -7,6 +7,63 @@ from typing import Any, Mapping
 
 VERSION = "v23.0"
 
+ROSA_BACKEND_CHOICES = (
+    "hard_symbolic_multibit",
+    "soft_match",
+    "soft_suffix",
+    "soft_suffix_scan",
+    "soft_exact_dp",
+    "soft_exact_dp_serial",
+    "soft_exact_dp_cuda",
+    "soft_exact_dp_triton",
+    "soft_qkv_multibit",
+    "soft_qkv_multibit_serial",
+    "soft_qkv_multibit_cuda",
+    "soft_qkv_multibit_triton",
+    "soft_qkv_multibit_unmatched",
+    "soft_qkv_multibit_unmatched_serial",
+    "soft_qkv_multibit_unmatched_cuda",
+    "soft_qkv_multibit_unmatched_triton",
+    "hard_qkv_multibit",
+    "soft_qkv_binary",
+    "soft_qkv_binary_bipolar",
+    "soft_qkv_binary_bipolar_cuda",
+    "soft_qkv_binary_bipolar_triton",
+    "soft_qkv_binary_triton",
+    "soft_qkv_binary_cuda",
+)
+
+ROSA_BACKEND_ALIASES = {
+    "wind": "hard_symbolic_multibit",
+    "soft": "soft_match",
+    "sufa": "soft_suffix",
+    "scan": "soft_suffix_scan",
+    "soft_exact": "soft_exact_dp",
+    "soft_exact_serial": "soft_exact_dp_serial",
+    "soft_exact_cuda": "soft_exact_dp_cuda",
+    "soft_exact_triton": "soft_exact_dp_triton",
+    "soft_qkv_multibit_exp": "soft_qkv_multibit",
+    "soft_qkv_multibit_exp_serial": "soft_qkv_multibit_serial",
+    "soft_qkv_multibit_exp_cuda": "soft_qkv_multibit_cuda",
+    "soft_qkv_multibit_exp_triton": "soft_qkv_multibit_triton",
+    "soft_qkv_multibit_exp_ua": "soft_qkv_multibit_unmatched",
+    "soft_qkv_multibit_exp_ua_serial": "soft_qkv_multibit_unmatched_serial",
+    "soft_qkv_multibit_exp_ua_cuda": "soft_qkv_multibit_unmatched_cuda",
+    "soft_qkv_multibit_exp_ua_triton": "soft_qkv_multibit_unmatched_triton",
+    "hard_multibit_exp": "hard_qkv_multibit",
+    "soft_qkv1bit": "soft_qkv_binary",
+    "soft_qkv1bit_exp": "soft_qkv_binary_bipolar",
+    "soft_qkv1bit_exp_cuda": "soft_qkv_binary_bipolar_cuda",
+    "soft_qkv1bit_exp_triton": "soft_qkv_binary_bipolar_triton",
+    "soft_qkv1bit_triton": "soft_qkv_binary_triton",
+    "soft_qkv1bit_cuda": "soft_qkv_binary_cuda",
+}
+
+
+def normalize_rosa_backend(value: str) -> str:
+    normalized = str(value).strip().lower()
+    return ROSA_BACKEND_ALIASES.get(normalized, normalized)
+
 
 @dataclass
 class CaMoEConfig:
@@ -23,15 +80,23 @@ class CaMoEConfig:
     n_slim_deepembed_experts: int = 0
     ffn_expand: int = 4
     tie_weights: bool = True
-    # Slim Wind ROSA sequence branch
+    # Slim ROSA sequence branch
     n_rosa_experts: int = 1
-    rosa_backend: str = "wind"
+    rosa_backend: str = "hard_symbolic_multibit"
     # Bits per symbolic channel. `4` yields an explicit 4-bit ROSA.
     rosa_bits: int = 8
     # Symbolic channel count after the slim projection. This can be much smaller than dim.
     slim_rosa_heads: int | None = None
-    # Wind ROSA truncation length K.
+    # ROSA truncation length K.
     rosa_truncation_length: int = 8
+    # Use a simpler ROSA path closer to the native RWKV8-style stacking recipe.
+    rosa_native_mode: bool = False
+    # Whether the ROSA symbolic branch should modulate the continuous stream via a gate.
+    rosa_use_gate: bool = True
+    # Optional training schedule: start with the configured soft backend and
+    # switch to this backend once the internal symbolic language stabilizes.
+    rosa_hard_backend: str | None = None
+    rosa_hard_switch_step: int | None = None
 
     # Expertized DeepEmbed
     deepembed_mode: str = "1x"
@@ -102,6 +167,9 @@ class CaMoEConfig:
     version: str = VERSION
 
     def __post_init__(self) -> None:
+        self.rosa_backend = normalize_rosa_backend(self.rosa_backend)
+        if self.rosa_hard_backend is not None:
+            self.rosa_hard_backend = normalize_rosa_backend(self.rosa_hard_backend)
         if self.dim % self.n_heads != 0:
             raise ValueError(f"dim={self.dim} must be divisible by n_heads={self.n_heads}.")
         if self.n_experts < 0 or self.n_deepembed_experts < 0 or self.n_slim_deepembed_experts < 0:
@@ -110,25 +178,12 @@ class CaMoEConfig:
             raise ValueError("prediction-market routing requires at least 2 FFN-market experts.")
         if self.n_rosa_experts not in (0, 1):
             raise ValueError("The current implementation supports either 0 or 1 sequence ROSA expert per layer.")
-        if self.rosa_backend not in {
-            "wind",
-            "soft",
-            "sufa",
-            "scan",
-            "soft_exact",
-            "soft_exact_serial",
-            "soft_exact_cuda",
-            "soft_exact_triton",
-            "soft_qkv1bit",
-            "soft_qkv1bit_triton",
-            "soft_qkv1bit_cuda",
-        }:
+        if self.rosa_backend not in ROSA_BACKEND_CHOICES:
             raise ValueError(
-                "rosa_backend must be one of {'wind', 'soft', 'sufa', 'scan', "
-                "'soft_exact', 'soft_exact_serial', 'soft_exact_cuda', "
-                "'soft_exact_triton', 'soft_qkv1bit', 'soft_qkv1bit_triton', "
-                "'soft_qkv1bit_cuda'}."
+                f"rosa_backend must be one of {ROSA_BACKEND_CHOICES!r}."
             )
+        if self.rosa_hard_backend is not None and self.rosa_hard_backend not in ROSA_BACKEND_CHOICES:
+            raise ValueError("rosa_hard_backend must be a valid ROSA backend when provided.")
         if self.slim_rosa_heads is not None and self.slim_rosa_heads <= 0:
             raise ValueError("slim_rosa_heads must be positive when provided.")
         if self.rosa_bits <= 0:
@@ -183,6 +238,10 @@ class CaMoEConfig:
             raise ValueError("ste_midpoint_steps must be <= ste_anneal_steps.")
         if self.market_ramp_steps < 0:
             raise ValueError("market_ramp_steps must be non-negative.")
+        if self.rosa_hard_switch_step is not None and self.rosa_hard_switch_step < 0:
+            raise ValueError("rosa_hard_switch_step must be non-negative when provided.")
+        if self.rosa_hard_backend is None and self.rosa_hard_switch_step is not None:
+            raise ValueError("rosa_hard_switch_step requires rosa_hard_backend to be set.")
 
     @property
     def head_size(self) -> int:
@@ -198,6 +257,11 @@ class CaMoEConfig:
 
     def copy(self) -> "CaMoEConfig":
         return replace(self)
+
+    def with_overrides(self, **updates: Any) -> "CaMoEConfig":
+        payload = self.to_dict()
+        payload.update({key: value for key, value in updates.items() if value is not None})
+        return type(self).from_mapping(payload)
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)

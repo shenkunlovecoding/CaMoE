@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import load
 
+from .kernel_init import announce_kernel_init
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 WIND_ROSA_DIR = ROOT_DIR / "wind_rosa"
@@ -232,6 +234,11 @@ def load_wind_rosa(spec: WindRosaSpec) -> None:
             f"-D_C_={spec.bits_per_symbol}",
             f"-D_K_={spec.truncation_length}",
         ],
+    )
+    announce_kernel_init(
+        "wind_rosa",
+        "cuda",
+        detail=f"T={spec.sequence_length} bits={spec.bits_per_symbol} K={spec.truncation_length}",
     )
     _LOADED_SPEC = spec
 
